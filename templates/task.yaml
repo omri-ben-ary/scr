@@ -1,0 +1,19 @@
+id: T-0000
+title: ""
+queue: scribers
+kind: prove
+status: proposed
+workload: quantum-insertion
+scope: {files: [], decls: [], may_touch_statements: false}
+done_when:
+  mechanical: []
+  judgment: []
+budget: {max_attempts: 3, max_tokens: 2000000, max_wall_hours: 6}
+priority: {omri_weight: 0, verifiability: 1.0, risk: 0.2}
+blocked_by: []
+origin: null
+related: []
+supersedes: []
+unlocks: {on_success: [], on_failure: []}
+attempts: 0
+tokens_used: 0
