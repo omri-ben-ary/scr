@@ -58,11 +58,15 @@ class State:
         c = self.compute()
         prev = self.read_snapshot()
         g: Graph = c.pop("_graph")
+        if prev and prev.get("state_root") == c["state_root"]:
+            parent = prev.get("parent_state_root", ZERO)   # nothing changed: keep the chain link
+        else:
+            parent = prev["state_root"] if prev else ZERO
         snap = {
             "schema": "scriptorium/state/v1",
             "ts": now_iso(),
             "git_head_at_snapshot": git_head(self.root),
-            "parent_state_root": prev["state_root"] if prev else ZERO,
+            "parent_state_root": parent,
             **c,
         }
         if note:
