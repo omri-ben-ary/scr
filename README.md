@@ -9,8 +9,8 @@ artifact; `docs/hashing.md` is the verification scheme.
 ## Install
 
 ```sh
-pip install -e .            # gives you the `scr` command (Python ≥3.10, PyYAML)
-scr install-hooks           # pre-commit: refresh derived views + verify
+uv sync                     # creates .venv with the `scr` command (Python ≥3.10, PyYAML); or: pip install -e .
+uv run scr install-hooks    # pre-commit: refresh derived views + verify (pins the venv interpreter)
 ```
 
 ## Layout
@@ -80,5 +80,5 @@ log yields exactly the statuses and edges in the records; invariants hold;
 ## Tests
 
 ```sh
-python -m pytest -q tests
+uv run pytest -q tests
 ```

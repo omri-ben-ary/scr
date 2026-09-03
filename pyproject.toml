@@ -14,3 +14,6 @@ scr = "scr.cli:main"
 
 [tool.setuptools]
 packages = ["scr"]
+
+[dependency-groups]
+dev = ["pytest>=8"]

@@ -22,10 +22,12 @@ from .store import KINDS, QUEUES, RepoError, Store, find_root
 
 HOOK = """#!/bin/sh
 # scriptorium pre-commit: refresh derived views + snapshot, then verify.
+# Uses the interpreter that ran `scr install-hooks`, so a venv need not be active.
 set -e
-scr refresh --quiet
+PY="{python}"
+"$PY" -m scr refresh --quiet
 git add state/STATE.json graph/graph.json queues/scribers.md queues/omri.md 2>/dev/null || true
-scr verify --quiet
+"$PY" -m scr verify --quiet
 """
 
 
@@ -325,7 +327,8 @@ def cmd_install_hooks(args):
     if not hooks.exists():
         raise RepoError("not a git repo (run git init first)")
     p = hooks / "pre-commit"
-    p.write_text(HOOK, encoding="utf-8")
+    py = Path(sys.executable).as_posix()   # forward slashes work in Git Bash on Windows too
+    p.write_text(HOOK.replace("{python}", py), encoding="utf-8")
     p.chmod(0o755)
     print(f"installed {p}")
 
