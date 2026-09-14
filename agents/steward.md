@@ -40,3 +40,25 @@ Route its exit code like any other check:
 - **3** — uncommitted changes to tracked files. The Scriber left work behind: `escalated` → `omri_queue`. This is a judgment call, not a mechanical one.
 
 Why it never deletes: an unguarded `delete the worktree` step let `quantum-insertion` reach 95 GB across 14 worktrees, 7 of them merged and dead, while one worktree held a mission folder that existed in no commit anywhere. See the doc for the two bugs — a `rm -rf` that accepted `../..`, and a "tidy" `git worktree remove` that emptied the quarantine while its own verification reported OK.
+
+## Phase C through loopy (optional, `kind: prove` tasks only)
+
+loopy-prover (`../quantum-insertion/missions/LOOPY/README.md`) may close the `sorry`s of one
+frozen target instead of the scriber's own prover rounds. Use it only when the task's
+statements are frozen (TARGETS.md written and, if `may_touch_statements`, already through
+Gate 1) and the remaining work is proof search. Run it through the hook so the run is an event:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File hooks\loopy_phase_c.ps1 -Task <id> `
+    -File QuantumInsertion/Foo/Bar.lean -Target <decl> [-Worktree <name>] [-- --max-iterations 3]
+```
+
+The hook (1) `scr verify`, (2) logs `system loopy_start`, (3) runs the workload's
+`run_loopy.ps1`, which confines loopy's commits to branch `loopy/<name>` and archives
+`.loopy/` under `missions/LOOPY/runs/<stamp>-<name>/`, (4) logs `system loopy_end` with the
+exit code, commit range and the archived run folder, (5) appends a line to the task's
+`log.md`. Treat `loopy/<name>` as the Scriber's scratch: review the diff, run
+`done_when_checker` and `statement_diff` on the *resulting* tree, then cherry-pick/squash onto
+the task branch. loopy's own `report_*.md` are input to review.md, never a check. Never merge
+`loopy/<name>` directly. Budget: add loopy's `TOTAL USAGE` line (in the run log) to
+`--tokens` at `merged`.
