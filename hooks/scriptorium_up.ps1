@@ -7,7 +7,7 @@
   powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1 -NoRegister
 #>
 [CmdletBinding()]
-param([switch]$NoRegister, [switch]$NoUI, [switch]$UIOnly, [int]$Port = 8765)
+param([switch]$NoRegister, [switch]$NoUI, [switch]$UIOnly, [switch]$RestartUI, [int]$Port = 8765)
 $ErrorActionPreference = 'Continue'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $scr = Join-Path $Root '.venv\Scripts\scr.exe'
@@ -24,6 +24,14 @@ if (-not $UIOnly) {
   if (-not $running) { Start-Process powershell -ArgumentList '-ExecutionPolicy', 'Bypass', '-File', "$Root\hooks\steward_watch.ps1", '-Unattended' -WindowStyle Minimized; Write-Host "watcher started (minimized window)" } else { Write-Host "watcher already running" }
 }
 if (-not $NoUI) {
+  if ($RestartUI) {
+    # the UI loads its Python once; after a code update it must be restarted (a closed console window
+    # does not stop a UI that was started minimized by this script or by the logon task)
+    $old = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'scr(\.exe)? ui' })
+    $old += @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Get-CimInstance Win32_Process -Filter "ProcessId = $($_.OwningProcess)" })
+    foreach ($p in ($old | Sort-Object ProcessId -Unique)) { if ($p) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "stopped old UI pid $($p.ProcessId)" } }
+    Start-Sleep 1
+  }
   $uiRunning = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'scr(\.exe)? ui' }
   if (-not $uiRunning) { Start-Process $scr -ArgumentList 'ui', '--port', "$Port", '--no-browser' -WindowStyle Minimized; Start-Sleep 2 }
   Start-Process "http://127.0.0.1:$Port/"

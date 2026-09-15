@@ -17,3 +17,6 @@ tasks/*/review-session-*.txt
 tasks/*/review-session-*.txt.err
 tasks/*/commit-msg.txt
 tasks/*/pr-body.md
+# update bundles dropped at the root by hand
+*.zip
+_to_delete*

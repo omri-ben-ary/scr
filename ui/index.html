@@ -32,6 +32,7 @@
   .stat b { color: var(--ink); font-size: 16px; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
   .dot.bad { background: var(--danger); }
+  .stat.bad { color: var(--danger); font-weight: 600; } .stat.bad code { font-weight: 400; user-select: all; }
   header .spacer { flex: 1; }
 
   main { display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr) minmax(320px, 420px); gap: 0; height: calc(100% - 58px); }
@@ -100,6 +101,7 @@
   <span class="stat">needs you <b id="nNeeds">–</b></span>
   <span class="stat">watcher tick <b id="tick">–</b></span>
   <span class="spacer"></span>
+  <span class="stat bad" id="stale" hidden role="alert">UI code changed on disk — restart it: <code>powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1 -UIOnly -RestartUI</code></span>
   <button id="refresh" title="Refresh (r)">Refresh</button>
 </header>
 
@@ -160,6 +162,7 @@ async function refresh() {
   $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency;
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length;
   $('#tick').textContent = STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'not running';
+  $('#stale').hidden = !STATE.code_stale;
   renderNeeds(); renderLists();
 }
 

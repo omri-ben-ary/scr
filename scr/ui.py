@@ -168,7 +168,7 @@ def state(root: Path) -> dict:
         "trusted_branch": wl.get("trusted_branch"), "main_branch": wl.get("main_branch", "master"),
         "concurrency": int(limits.get("concurrency", 3)),
         "verify_ok": rc == 0, "verify_out": vout[-400:], "state_root": (snap.get("state_root") or "")[:12],
-        "last_watch_tick": last_tick,
+        "last_watch_tick": last_tick, "code_stale": code_stale(), "pid": os.getpid(),
         "needs": sorted(needs, key=lambda x: {"chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}[x["type"]]),
         "running": running, "ready": ready, "recent": recent,
         "counts": {s: sum(1 for t in tasks.values() if t.status == s) for s in
@@ -299,6 +299,15 @@ def _ps(root: Path, script: str, timeout: int = 3600) -> tuple[int, str]:
 
 
 _CHORE_CACHE: dict = {"ts": 0.0, "items": []}
+
+# Code files whose on-disk change means "restart the UI": Python is loaded once per process, so an
+# update shipped while the server runs is silently not in effect (seen 2026-09-15).
+_CODE_FILES = [Path(__file__).parent / n for n in ("ui.py", "state.py", "cli.py", "store.py", "graph.py", "events.py")]
+_CODE_MTIME = max((f.stat().st_mtime for f in _CODE_FILES if f.exists()), default=0.0)
+
+
+def code_stale() -> bool:
+    return max((f.stat().st_mtime for f in _CODE_FILES if f.exists()), default=0.0) > _CODE_MTIME + 1
 
 
 def chores(root: Path, check: bool = True, max_age: float = 240.0) -> list[dict]:
