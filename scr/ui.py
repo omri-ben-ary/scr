@@ -339,9 +339,11 @@ def run_chore(root: Path, cid: str) -> dict:
     c = next((x for x in items if x["id"] == cid), None)
     if not c or not c.get("run"):
         return {"ok": False, "error": "no such runnable chore"}
+    # Log the event BEFORE running: a chore that commits the tree must include its own event,
+    # otherwise the tree is dirty again one line after the commit (seen 2026-09-15).
+    _scr(root, "omri", "event", "system", "--name", "chore", "--note", f"{cid}: run via UI", "--quiet")
     rc, out = _ps(root, c["run"])
     invalidate_chores()
-    _scr(root, "omri", "event", "system", "--name", "chore", "--note", f"{cid}: exit {rc}", "--quiet")
     ok = rc == 0
     if c.get("done"):
         drc, _ = _ps(root, c["done"], timeout=300)

@@ -2,3 +2,18 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .venv/
+# UI / watcher working files (not part of the hash tree; Observer reports under reports/daily|weekly ARE tracked)
+reports/chat/
+reports/steward_watch.log
+reports/steward_watch.state.txt
+reports/ui.acks.txt
+reports/concierge-*.txt
+reports/intake-*.txt
+tasks/*/session-*.txt
+tasks/*/session-*.txt.err
+tasks/*/brief.txt
+tasks/*/review-brief.txt
+tasks/*/review-session-*.txt
+tasks/*/review-session-*.txt.err
+tasks/*/commit-msg.txt
+tasks/*/pr-body.md
