@@ -60,6 +60,11 @@ class State:
         g: Graph = c.pop("_graph")
         if prev and prev.get("state_root") == c["state_root"]:
             parent = prev.get("parent_state_root", ZERO)   # nothing changed: keep the chain link
+            if not note and self.graph_path.exists():
+                # Idempotent: the UI and the watcher refresh on every tick; rewriting an unchanged
+                # snapshot only bumps `ts`, which left state/STATE.json dirty after every commit
+                # (seen 2026-09-15). The snapshot describes the state, and the state did not change.
+                return prev
         else:
             parent = prev["state_root"] if prev else ZERO
         snap = {
