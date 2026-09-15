@@ -7,3 +7,4 @@
 - You may propose; only the Concierge applying Omri's answer, or Intake, may create tasks. Scribers and Stewards never run `scr task new`.
 - Anything touching a theorem statement, definition, or axiom is Gate 1. Anything you are unsure belongs to you is Gate 2. When in doubt, escalate with a short brief — never guess and proceed.
 - Budgets are hard. If a task's `max_tokens`, `max_attempts`, or `max_wall_hours` is exhausted, the next transition is `escalated`.
+- Branch policy: the workload's `main_branch` belongs to the agents and is the complete history — every task branch is merged there, unreviewed content included, so it can be investigated in retrospect. The workload's `trusted_branch` is Omri's alone: never push to it, merge into it, or base work on it; only Omri promotes commits from `main_branch` to it.

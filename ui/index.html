@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scriptorium</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #f7f6f2; --panel: #ffffff; --ink: #1c1b18; --muted: #5f5c55; --line: #d9d6cf;
+    --accent: #1f5fbf; --accent-ink: #ffffff; --warn: #b4540a; --danger: #a8231f; --ok: #1e7f4f;
+    --gate: #6b2fa0; --help: #b4540a; --decision: #1f5fbf; --system: #5f5c55;
+    --radius: 10px; --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; --mono: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15161a; --panel: #1f2126; --ink: #ecebe6; --muted: #a7a49c; --line: #34373e; --accent: #7fb0ff; --accent-ink: #0d1626; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 16px/1.5 var(--font); }
+  a { color: var(--accent); }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 8px 14px; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible, [tabindex]:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button.small { padding: 4px 10px; font-size: 14px; }
+  textarea, input[type=text] { width: 100%; font: inherit; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); }
+  .sr-only { position: absolute; left: -9999px; }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 18px; margin: 0 16px 0 0; letter-spacing: .02em; }
+  .stat { display: flex; gap: 6px; align-items: baseline; color: var(--muted); font-size: 14px; }
+  .stat b { color: var(--ink); font-size: 16px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
+  .dot.bad { background: var(--danger); }
+  header .spacer { flex: 1; }
+
+  main { display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr) minmax(320px, 420px); gap: 0; height: calc(100% - 58px); }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; height: auto; } .col { max-height: none !important; } }
+  .col { overflow: auto; padding: 16px; border-right: 1px solid var(--line); max-height: calc(100vh - 58px); }
+  .col:last-child { border-right: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; }
+  h2:first-child { margin-top: 0; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--system); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px; }
+  .card[data-type=gate] { border-left-color: var(--gate); }
+  .card[data-type=help] { border-left-color: var(--help); }
+  .card[data-type=decision] { border-left-color: var(--decision); }
+  .card[data-type=chore] { border-left-color: var(--ok); }
+  .badge.chore { background: var(--ok); }
+  .out { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
+  .card.selected { box-shadow: 0 0 0 2px var(--accent); }
+  .card .top { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
+  .badge { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; color: #fff; background: var(--system); }
+  .badge.gate { background: var(--gate); } .badge.help { background: var(--help); } .badge.decision { background: var(--decision); }
+  .card .title { font-weight: 600; margin: 4px 0 6px; }
+  .card .text { font-size: 14px; color: var(--muted); white-space: pre-wrap; }
+  .card .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 14px; }
+  .row .id { font-family: var(--mono); color: var(--accent); cursor: pointer; }
+  .row .st { font-size: 12px; color: var(--muted); }
+  .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
+
+  #detail { padding-right: 20px; }
+  #detail .hd { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  #detail .hd .id { font-family: var(--mono); color: var(--accent); }
+  #detail .hd .status { font-size: 13px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .tabs { display: flex; gap: 4px; margin: 14px 0 10px; border-bottom: 1px solid var(--line); }
+  .tabs button { border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: none; padding: 8px 12px; }
+  .tabs button[aria-selected=true] { border-bottom-color: var(--accent); font-weight: 600; }
+  .md { max-width: 90ch; }
+  .md pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 13px; }
+  .md code { font-family: var(--mono); font-size: .92em; }
+  .md table { border-collapse: collapse; font-size: 14px; } .md td, .md th { border: 1px solid var(--line); padding: 4px 8px; }
+  .md blockquote { border-left: 4px solid var(--line); margin: 0; padding-left: 12px; color: var(--muted); }
+  .answerbox { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin: 10px 0 16px; }
+  .answerbox .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .ev { font-size: 13px; font-family: var(--mono); padding: 4px 0; border-bottom: 1px dashed var(--line); white-space: pre-wrap; }
+  .ev .ts { color: var(--muted); }
+
+  #chat { display: flex; flex-direction: column; height: 100%; }
+  #chatlog { flex: 1; overflow: auto; padding-bottom: 8px; }
+  .msg { margin: 8px 0; padding: 10px 12px; border-radius: 10px; max-width: 95%; font-size: 15px; }
+  .msg.user { background: var(--accent); color: var(--accent-ink); margin-left: auto; }
+  .msg.assistant { background: var(--panel); border: 1px solid var(--line); }
+  .msg .who { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .7; margin-bottom: 4px; }
+  #chatform { display: flex; gap: 8px; align-items: flex-end; padding-top: 8px; border-top: 1px solid var(--line); }
+  #chatform textarea { min-height: 64px; resize: vertical; }
+  .thinking { color: var(--muted); font-style: italic; }
+  .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 999px; font-size: 14px; opacity: 0; transition: opacity .2s; }
+  .toast.show { opacity: 1; }
+  kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<header role="banner">
+  <h1>Scriptorium</h1>
+  <span class="stat"><span class="dot" id="verifyDot" aria-hidden="true"></span><span id="verifyText">verifying…</span></span>
+  <span class="stat">running <b id="nRunning">–</b> / cap <b id="cap">–</b></span>
+  <span class="stat">ready <b id="nReady">–</b></span>
+  <span class="stat">needs you <b id="nNeeds">–</b></span>
+  <span class="stat">watcher tick <b id="tick">–</b></span>
+  <span class="spacer"></span>
+  <button id="refresh" title="Refresh (r)">Refresh</button>
+</header>
+
+<main>
+  <section class="col" aria-label="Needs you">
+    <h2>Needs you</h2>
+    <div id="needs"></div>
+    <h2>Add an idea to the Inbox</h2>
+    <form id="inboxForm">
+      <label class="sr-only" for="inboxText">One line: what should become a task</label>
+      <input type="text" id="inboxText" placeholder="One line — Intake turns it into a task tonight">
+      <div style="margin-top:6px"><button class="small primary" type="submit">Add to Inbox</button></div>
+    </form>
+    <h2>Running</h2>
+    <div id="running"></div>
+    <h2>Ready (next dispatch)</h2>
+    <div id="ready"></div>
+    <h2>Recently closed</h2>
+    <div id="recent"></div>
+  </section>
+
+  <section class="col" id="detail" aria-live="polite" aria-label="Task detail">
+    <div class="empty">Select an item on the left, or ask the assistant on the right. <br><br>Keys: <kbd>r</kbd> refresh · <kbd>1</kbd>–<kbd>5</kbd> tabs · <kbd>/</kbd> focus chat</div>
+  </section>
+
+  <section class="col" id="chat" aria-label="Assistant">
+    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+      <h2 style="margin:0">Assistant <span id="chatScope" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <button class="small" id="chatGeneral" title="Switch to the general thread">General thread</button>
+    </div>
+    <div id="chatlog" role="log" aria-live="polite"></div>
+    <form id="chatform">
+      <label class="sr-only" for="chatText">Message to the assistant</label>
+      <textarea id="chatText" placeholder="Ask about this task, the history, or the mathematics… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button class="primary" type="submit" id="chatSend">Send</button>
+    </form>
+  </section>
+</main>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const md = s => (window.marked ? marked.parse(s || '', { mangle: false, headerIds: false }) : `<pre>${esc(s)}</pre>`);
+const api = async (path, body) => {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
+  return r.json();
+};
+const toast = m => { const t = $('#toast'); t.textContent = m; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2600); };
+const fmtTs = ts => ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
+let STATE = null, CURRENT = null, TAB = 'spec', THREAD = 'general';
+
+async function refresh() {
+  STATE = await api('/api/state');
+  $('#verifyDot').className = 'dot' + (STATE.verify_ok ? '' : ' bad');
+  $('#verifyText').textContent = STATE.verify_ok ? `verified · ${STATE.state_root}` : 'VERIFY FAILED';
+  $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency;
+  $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length;
+  $('#tick').textContent = STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'not running';
+  renderNeeds(); renderLists();
+}
+
+function renderNeeds() {
+  const box = $('#needs'); box.innerHTML = '';
+  if (!STATE.needs.length) { box.innerHTML = '<div class="empty">Nothing needs you. The operation is running by itself.</div>'; return; }
+  for (const n of STATE.needs) {
+    const c = document.createElement('article'); c.className = 'card'; c.dataset.type = n.type; c.tabIndex = 0;
+    c.setAttribute('role', 'button'); c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
+    const label = { gate: 'Gate', help: 'Help', decision: n.kind || 'Decide', system: n.title, chore: n.kind === 'manual' ? 'Do' : 'Run' }[n.type] || n.type;
+    let text = n.text || (n.waiting && n.waiting.length ? `${n.waiting.length} task(s) wait on this` : '');
+    if (n.age_h != null) text += (text ? ' · ' : '') + `${n.age_h} h old`;
+    c.innerHTML = `<div class="top"><span class="badge ${n.type}">${esc(label)}</span><span>${esc(n.id)}</span>${n.ts ? `<span>${fmtTs(n.ts)}</span>` : ''}</div>
+      <div class="title">${esc(n.type === 'system' ? (n.text || n.title) : n.title)}</div>
+      ${n.type !== 'system' ? `<div class="text">${esc(text)}</div>` : ''}
+      <div class="actions"></div>`;
+    const acts = $('.actions', c);
+    if (n.type === 'chore') {
+      c.onclick = null; c.removeAttribute('role'); c.tabIndex = -1;
+      if (n.has_run) {
+        const b = document.createElement('button'); b.className = 'small primary'; b.textContent = 'Run';
+        b.onclick = async e => { e.stopPropagation(); b.disabled = true; b.textContent = 'Running…';
+          let out = $('.out', c); if (!out) { out = document.createElement('div'); out.className = 'out'; c.appendChild(out); }
+          out.textContent = 'working — this can take a few minutes for git/PR steps…';
+          const r = await api('/api/chore', { id: n.id });
+          out.textContent = (r.output || r.error || '') + (r.ok ? '\n\n✔ done' : '\n\n✖ not done yet (exit ' + r.exit + ') — read the output; Run again when fixed');
+          b.disabled = false; b.textContent = 'Run'; if (r.ok) setTimeout(refresh, 1500); };
+        acts.appendChild(b);
+      }
+      if (n.link) { const a = document.createElement('a'); a.href = n.link; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open link'; a.style.alignSelf = 'center'; acts.appendChild(a); }
+      const d = document.createElement('button'); d.className = 'small'; d.textContent = n.kind === 'manual' ? 'Mark done' : 'Dismiss';
+      d.onclick = async e => { e.stopPropagation(); await api('/api/ack', { h: 'chore:' + n.id }); refresh(); };
+      acts.appendChild(d);
+    } else if (n.type === 'system') {
+      const b = document.createElement('button'); b.className = 'small'; b.textContent = 'Acknowledge';
+      b.onclick = async e => { e.stopPropagation(); await api('/api/ack', { h: n.h }); refresh(); };
+      acts.appendChild(b);
+      if (n.id !== '-') { const o = document.createElement('button'); o.className = 'small'; o.textContent = 'Open task'; o.onclick = e => { e.stopPropagation(); openTask(n.id); }; acts.appendChild(o); }
+    } else {
+      const o = document.createElement('button'); o.className = 'small primary'; o.textContent = 'Open & answer';
+      o.onclick = e => { e.stopPropagation(); openTask(n.id, n); }; acts.appendChild(o);
+      const d = document.createElement('button'); d.className = 'small'; d.textContent = 'Discuss';
+      d.onclick = e => { e.stopPropagation(); openTask(n.id, n); setThread(n.id); $('#chatText').focus(); }; acts.appendChild(d);
+    }
+    c.onclick = () => openTask(n.id, n);
+    c.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTask(n.id, n); } };
+    box.appendChild(c);
+  }
+}
+
+function renderLists() {
+  const mk = (el, rows, fmt) => { el.innerHTML = rows.length ? '' : '<div class="empty">—</div>'; for (const r of rows) { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = fmt(r); $('.id', d).onclick = () => openTask(r.id); el.appendChild(d); } };
+  mk($('#running'), STATE.running, r => `<span class="id">${r.id}</span><span class="st">${r.status}${r.started ? ' · since ' + fmtTs(r.started) : ''}</span><span style="flex:1;font-size:13px">${esc(r.title.slice(0, 70))}</span>`);
+  mk($('#ready'), STATE.ready, r => `<span class="id">${r.id}</span><span class="st">${r.kind}</span><span style="flex:1;font-size:13px">${esc(r.title.slice(0, 70))}</span>`);
+  mk($('#recent'), STATE.recent, r => `<span class="id">${r.id}</span><span class="st">${r.to} · ${fmtTs(r.ts)}</span><span style="flex:1;font-size:13px">${esc(r.title.slice(0, 60))}</span>`);
+}
+
+async function openTask(id, need) {
+  const d = await api('/api/task/' + id); CURRENT = d; CURRENT.need = need;
+  document.querySelectorAll('.card').forEach(c => c.classList.toggle('selected', c.getAttribute('aria-label')?.includes(id)));
+  renderDetail();
+  if (THREAD === 'general' || THREAD !== id) setThread(id, true);
+}
+
+function renderDetail() {
+  const d = CURRENT, rec = d.rec, box = $('#detail');
+  const need = d.need;
+  let answer = '';
+  if (need && need.type !== 'system') {
+    const opts = (need.options || []).map(o => `<button class="small" data-opt="${esc(o)}">${esc(o)}</button>`).join('');
+    const kind = need.type; // decision | help | gate
+    answer = `<div class="answerbox" role="group" aria-label="Answer">
+      <div style="font-weight:600;margin-bottom:6px">${kind === 'help' ? 'Answer the HELP request' : kind === 'gate' ? 'Gate decision' : 'Your answer'}</div>
+      ${need.text ? `<div class="text" style="margin-bottom:8px;font-size:14px;color:var(--muted)">${esc(need.text)}</div>` : ''}
+      <div class="opts">${opts}</div>
+      <label class="sr-only" for="ansText">Answer text</label>
+      <textarea id="ansText" rows="2" placeholder="${kind === 'gate' ? 'accept / return <feedback> / reject <reason>' : 'Type an answer, or pick an option above'}"></textarea>
+      <div style="margin-top:8px;display:flex;gap:8px"><button class="primary" id="ansSend">Apply answer</button><span class="empty" id="ansNote">Recorded in the task log and the event chain; the Concierge applies the consequences.</span></div>
+    </div>`;
+  }
+  const tabs = ['spec', 'report', 'review', 'log', 'events'];
+  box.innerHTML = `<div class="hd"><span class="id">${esc(d.id)}</span><span class="status">${esc(rec.status)}</span><span class="status">${esc(rec.kind)}</span>
+      ${rec.scope?.may_touch_statements ? '<span class="status" style="border-color:var(--gate);color:var(--gate)">may touch statements</span>' : ''}</div>
+    <h3 style="margin:8px 0 4px;font-size:18px">${esc(rec.title)}</h3>
+    <div class="empty" style="padding:0 0 6px">${d.blocked_by.length ? 'blocked by ' + d.blocked_by.join(', ') + ' · ' : ''}${d.blocks.length ? 'unblocks ' + d.blocks.join(', ') + ' · ' : ''}budget ${rec.budget?.max_attempts} att / ${(rec.budget?.max_tokens / 1e6).toFixed(1)}M tok / ${rec.budget?.max_wall_hours} h · attempts ${rec.attempts} · tokens ${rec.tokens_used}${d.worktree ? ' · <span style="font-family:var(--mono);font-size:12px">' + esc(d.worktree) + '</span>' : ''}</div>
+    ${answer}
+    <div class="tabs" role="tablist">${tabs.map((t, i) => `<button role="tab" data-tab="${t}" aria-selected="${t === TAB}" title="key ${i + 1}">${t}</button>`).join('')}</div>
+    <div id="tabbody" class="md" role="tabpanel"></div>`;
+  box.querySelectorAll('[role=tab]').forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderDetail(); });
+  box.querySelectorAll('[data-opt]').forEach(b => b.onclick = () => { $('#ansText').value = b.dataset.opt; $('#ansText').focus(); });
+  const send = $('#ansSend'); if (send) send.onclick = async () => {
+    const v = $('#ansText').value.trim(); if (!v) return toast('Type or pick an answer first');
+    send.disabled = true; $('#ansNote').textContent = 'Applying…';
+    const r = await api('/api/answer', { task: d.id, answer: v, kind: need.type });
+    toast(r.ok ? 'Answer recorded' : 'Failed: ' + r.error); send.disabled = false;
+    await refresh(); const again = STATE.needs.find(n => n.id === d.id && n.type === need.type); openTask(d.id, again);
+  };
+  const body = $('#tabbody');
+  if (TAB === 'events') {
+    body.innerHTML = d.events.length ? d.events.slice().reverse().map(e => `<div class="ev"><span class="ts">${fmtTs(e.ts)}</span> <b>${esc(e.kind)}</b> ${esc(e.actor || '')} ${e.from != null || e.to ? esc((e.from || '·') + ' → ' + (e.to || '')) : ''}${e.name ? ' ' + esc(e.name) : ''}${e.edge ? ' ' + esc(e.edge + ' ' + e.from + '→' + e.to) : ''}${e.field ? ' ' + esc(e.field + '=' + JSON.stringify(e.value)) : ''}${e.note ? '\n   ' + esc(e.note) : ''}</div>`).join('') : '<div class="empty">no events</div>';
+  } else {
+    const txt = d.docs[TAB];
+    body.innerHTML = txt && txt.trim() ? md(txt) : '<div class="empty">empty</div>';
+  }
+}
+
+// ---- chat ---------------------------------------------------------------------------------
+async function setThread(id, keepFocus) {
+  THREAD = id; $('#chatScope').textContent = id === 'general' ? '· general' : '· ' + id;
+  const log = $('#chatlog'); log.innerHTML = '';
+  const rows = await api('/api/chat/' + id);
+  for (const r of rows) addMsg(r.role, r.text);
+  if (!rows.length) addMsg('assistant', id === 'general' ? 'Ask me anything about the operation: which tasks are where, what a report found, why a task was returned, or a theory question about FGGS, the N_k law or the greedy algorithm. I read the records and the repo to answer.' : `This thread is about ${id}. I will read its spec, report, review and log before answering.`);
+  log.scrollTop = log.scrollHeight;
+}
+function addMsg(role, text) {
+  const m = document.createElement('div'); m.className = 'msg ' + role;
+  m.innerHTML = `<div class="who">${role === 'user' ? 'you' : 'assistant'}</div>` + (role === 'user' ? esc(text).replace(/\n/g, '<br>') : `<div class="md">${md(text)}</div>`);
+  $('#chatlog').appendChild(m); $('#chatlog').scrollTop = $('#chatlog').scrollHeight; return m;
+}
+$('#chatform').onsubmit = async e => {
+  e.preventDefault(); const t = $('#chatText'); const v = t.value.trim(); if (!v) return;
+  t.value = ''; addMsg('user', v);
+  const th = document.createElement('div'); th.className = 'thinking'; th.textContent = 'thinking… (the agent reads files; this can take a minute)'; $('#chatlog').appendChild(th);
+  $('#chatSend').disabled = true;
+  try { const r = await api('/api/chat', { thread: THREAD, message: v, task: THREAD === 'general' ? null : THREAD }); th.remove(); addMsg('assistant', r.reply || r.error || '(no reply)'); }
+  catch (err) { th.remove(); addMsg('assistant', 'Request failed: ' + err); }
+  $('#chatSend').disabled = false; t.focus();
+};
+$('#chatText').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#chatform').requestSubmit(); } };
+$('#chatGeneral').onclick = () => setThread('general');
+
+// ---- inbox / keys / polling ----------------------------------------------------------------
+$('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; await api('/api/inbox', { text: v }); $('#inboxText').value = ''; toast('Added to the Inbox'); };
+$('#refresh').onclick = refresh;
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input,textarea')) return;
+  if (e.key === 'r') refresh();
+  if (e.key === '/') { e.preventDefault(); $('#chatText').focus(); }
+  if (CURRENT && /^[1-5]$/.test(e.key)) { TAB = ['spec', 'report', 'review', 'log', 'events'][+e.key - 1]; renderDetail(); }
+});
+refresh(); setThread('general');
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>

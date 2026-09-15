@@ -46,7 +46,11 @@ foreach ($t in $Tasks) {
   Write-Host "`n=== $t -> $wt ($br)" -ForegroundColor Cyan
   if (-not (Test-Path $wt)) {
     $exists = [bool]((git -C $Repo branch --list $br) -join '').Trim()
-    if ($exists) { git -C $Repo worktree add $wt $br } else { git -C $Repo worktree add -b $br $wt $main }
+    # Base new branches on origin/<main> (fetched now), not the local checkout's <main>: on 2026-09-14
+    # the local master was 13 commits behind and T-0030 had to fast-forward by hand.
+    git -C $Repo fetch --quiet origin 2>$null
+    $base = if ((git -C $Repo rev-parse --verify --quiet "origin/$main")) { "origin/$main" } else { $main }
+    if ($exists) { git -C $Repo worktree add $wt $br } else { git -C $Repo worktree add -b $br $wt $base; Write-Host "  based on $base @ $((git -C $Repo rev-parse --short $base).Trim())" }
     if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $t" }
   } else { Write-Host "  exists, reusing" }
 

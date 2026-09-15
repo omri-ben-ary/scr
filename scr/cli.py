@@ -127,6 +127,32 @@ def cmd_task_set(args):
     refresh(root, args.quiet)
 
 
+BRIEF_TEMPLATE = """Use the scriber agent. This is Scriptorium task {id}: {title}
+Your brief is {spec} — read it in full; its Scope and Definition of done are binding, and anything
+outside Scope is read-only. Work only inside this worktree ({worktree}); never commit, never switch
+branch. Keep an honest run log in {log} (append-only; put any question for the Steward on a line
+starting `HELP:` and keep working on what does not depend on it). When done, write {report} using the
+template already there — fill "Statement changes" truthfully (any entry routes to Gate 1) and the
+`unlocks` block. Budget: {attempts} attempt(s), {tokens:,} tokens, {hours} h wall.{stmt}"""
+
+
+def cmd_task_brief(args):
+    root, store, log = _ctx(args)
+    t = store.get(args.id)
+    d = t.dir
+    wl = (store.config("workloads") or {}).get(t.rec.get("workload") or "", {})
+    wt = t.rec.get("worktree") or f"{wl.get('worktrees', '../worktrees')}/{t.id}"
+    wt_abs = (root / wt).resolve()
+    b = t.rec.get("budget") or {}
+    stmt = ("\n\nThis task may need NEW or CHANGED statements (may_touch_statements: true). Freeze them in the "
+            "mission's TARGETS.md and HALT there once for Omri's approval (Gate 1) before proving anything."
+            if (t.rec.get("scope") or {}).get("may_touch_statements") else "")
+    print(BRIEF_TEMPLATE.format(
+        id=t.id, title=t.rec.get("title", ""), spec=(d / "spec.md").resolve(), worktree=wt_abs,
+        log=(d / "log.md").resolve(), report=(d / "report.md").resolve(),
+        attempts=b.get("max_attempts", 3), tokens=int(b.get("max_tokens", 0)), hours=b.get("max_wall_hours", 6), stmt=stmt))
+
+
 def cmd_task_field(args):
     root, store, log = _ctx(args)
     t = store.get(args.id)
@@ -249,7 +275,9 @@ def cmd_dispatch(args):
             log.append("state", task=tid, **{"from": t.status}, to="ready", actor="scr")
         old = t.rec["status"]
         lifecycle.apply(t.rec, "dispatched")
-        t.rec["worktree"] = f"../worktrees/{tid}"
+        wl = (store.config("workloads") or {}).get(t.rec.get("workload") or "", {})
+        wt_root = wl.get("worktrees") or "../worktrees"
+        t.rec["worktree"] = f"{wt_root}/{tid}"
         t.rec["branch"] = f"task/{tid}"
         t.save()
         log.append("state", task=tid, **{"from": old}, to="dispatched", actor=args.actor, note=f"attempt {t.rec['attempts']}")
@@ -333,6 +361,12 @@ def cmd_install_hooks(args):
     print(f"installed {p}")
 
 
+def cmd_ui(args):
+    from .ui import serve
+    root, _, _ = _ctx(args)
+    serve(root, args.port, not args.no_browser)
+
+
 def cmd_checkin(args):
     root, store, log = _ctx(args)
     log.append("checkin", actor="omri", op=args.op, note=args.note)
@@ -369,6 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
     st = t.add_parser("set", parents=[common], help="status transition")
     st.add_argument("id"); st.add_argument("status"); st.add_argument("--note"); st.add_argument("--tokens", type=int); st.add_argument("--force", action="store_true")
     st.set_defaults(fn=cmd_task_set)
+    br = t.add_parser("brief", parents=[common], help="print the standard scriber launch prompt for a task")
+    br.add_argument("id"); br.set_defaults(fn=cmd_task_brief)
     f = t.add_parser("field", parents=[common], help="set a record field (dotted path), logged")
     f.add_argument("id"); f.add_argument("field"); f.add_argument("value"); f.add_argument("--note"); f.set_defaults(fn=cmd_task_field)
 
@@ -398,6 +434,8 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("history", parents=[common], help="snapshot chain across git commits"); h.add_argument("-n", type=int, default=20); h.set_defaults(fn=cmd_history)
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)
     sub.add_parser("install-hooks", parents=[common], help="pre-commit: refresh + verify").set_defaults(fn=cmd_install_hooks)
+    ui = sub.add_parser("ui", parents=[common], help="serve the Scriptorium UI on localhost (Omri's entry point)")
+    ui.add_argument("--port", type=int, default=8765); ui.add_argument("--no-browser", action="store_true"); ui.set_defaults(fn=cmd_ui)
     return p
 
 

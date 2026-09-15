@@ -52,6 +52,43 @@ scr checkin open / close                    # Omri's minutes
 Every `scr` call takes `--actor`; use it. The log is only as informative as the
 actors are honest about who they are.
 
+## Running a batch (the automated path)
+
+```sh
+scr verify && scr --actor prioritizer dispatch --allow-statements   # pick the conflict-free set (cap: limits.yaml concurrency)
+powershell -ExecutionPolicy Bypass -File hooks\launch_dispatched.ps1  # worktrees + brief + in_progress + one Claude session per task
+powershell -ExecutionPolicy Bypass -File hooks\steward_watch.ps1     # leave open: checkpoints, scope drift, HELP: lines, submissions
+```
+
+`scr task brief <id>` renders the launch prompt from the record (spec.md is the brief — never
+hand-write prompts). `launch_dispatched.ps1 -Mode headless` runs sessions detached (`claude -p`)
+for unattended nights; the default opens a Windows Terminal tab per task so you can watch.
+`steward_watch.ps1` is the mechanical half of the Steward for every running task at once; add
+`-AutoReview` to have a headless Steward session fill review.md on each submission (the
+accepted/returned/escalated decision stays yours unless `-AutoDecide`). Phase C of a Lean task
+can go through loopy: `hooks\loopy_phase_c.ps1`. Retire finished worktrees with
+`hooks\retire_worktree.sh` (quarantine, never delete).
+
+## Unattended operation (the normal mode)
+
+```
+powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1
+```
+
+starts the UI at http://127.0.0.1:8765/ (your entry point: what needs you, every task's record and
+history, and an assistant that reads the records and the repo) and the watcher in `-Unattended`
+mode, and registers both at logon. Unattended = every mechanical decision is taken by the system:
+submissions are reviewed by a headless Steward (`-AutoReview`), accepted when the checks are
+mechanical and the statement diff is empty (`-AutoDecide`), landed as PRs and merged into the
+agents' `main_branch` (`-AutoLand`), Inbox lines and report `unlocks` become tasks (`-AutoIntake`),
+and the queue is refilled up to `concurrency` (`-AutoDispatch`). What still reaches you, in the UI:
+the five gates — new/changed statements, direction decisions, stuck tasks, config changes, seeding.
+
+Branch policy: `main_branch` (master) is the agents' branch and the full history log; the
+`trusted_branch` (trusted) holds sources of truth and only you push to it (protect it on GitHub:
+require a PR + your review, restrict who can push). `hooks\sweep_worktrees.ps1 -Merge` commits and
+lands any uncommitted mission work so nothing exists only in a worktree.
+
 ## Lifecycle
 
 `proposed → triaged → (blocked) → ready → dispatched → in_progress ⇄ checkpoint →
