@@ -55,7 +55,8 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
             out.append(f"  headless pid {pid}; transcript {tr}")
         else:
             ps1 = t.dir / "launch.ps1"     # a script, not an inline command: wt splits command lines on ';'
-            ps1.write_text("\ufeff" + f"Set-Location -LiteralPath '{wt}'\nclaude {('--model ' + model) if model else ''} (Get-Content -Raw -Encoding UTF8 '{bf}')\n", encoding="utf-8")
+            from .discuss import ps_quote
+            ps1.write_text("\ufeff" + f"Set-Location -LiteralPath {ps_quote(str(wt))}\nclaude {('--model ' + model) if model else ''} (Get-Content -Raw -Encoding UTF8 {ps_quote(str(bf))})\n", encoding="utf-8")
             if os.name == "nt" and shutil.which("wt"):
                 subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", tid, "-d", str(wt), "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)])
             elif os.name == "nt":

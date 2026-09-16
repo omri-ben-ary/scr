@@ -429,3 +429,120 @@ def test_cascade_runs_on_the_land_path(world):
     log.append("state", task="T-0001", **{"from": "ready"}, to="merged", actor="t")
     assert lifecycle.cascade(store, log, "T-0001", "merged") == ["T-0002"]
     assert Store(root).get("T-0002").status == "ready"
+
+
+def test_discuss_launcher_survives_apostrophes(world, monkeypatch):
+    """The Windows launcher script must be valid PowerShell whatever the first message or paths contain."""
+    from scr import discuss as d
+    root, _, _ = world
+    assert d.ps_quote("Omri's") == "'Omri''s'"
+    # simulate Windows launch path without wt/claude: build the .ps1 the same way and parse it for unbalanced quotes
+    s = d.build(root, "general")
+    bf = root / ".scr" / "discuss" / "x.md"; bf.parent.mkdir(parents=True, exist_ok=True); bf.write_text(s.brief)
+    ff = bf.with_suffix(".first.txt"); ff.write_text("then wait for Omri's instruction.")
+    line = f"$first = (Get-Content -Raw -Encoding UTF8 {d.ps_quote(str(ff))}).Trim()"
+    assert line.count("'") % 2 == 0
+    for ln in (f"Set-Location -LiteralPath {d.ps_quote(str(root / 'it''s here'))}",):
+        assert ln.count("'") % 2 == 0
+
+
+# ---- hotfix: external fixes to the tooling become recorded, reviewed tasks --------------------------------
+def test_hotfix_lifecycle(world, monkeypatch):
+    from scr import hotfix
+    root, _, _ = world
+    # a fast, always-green test command for the scriptorium workload
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "tests": f"{sys.executable} -c \"print('ok')\""}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+    git(root, "add", "-A"); git(root, "commit", "-q", "-m", "workload")
+    assert hotfix.status(root) is None
+    # 1. an external agent edits the tooling and the next scr call journals it -> a hotfix opens itself
+    (root / "scr").mkdir(exist_ok=True); (root / "scr" / "broken.py").write_text("x = 1\n")
+    scr(root, "--actor", "x", "event", "system", "--name", "poke", "--quiet")
+    st = hotfix.status(root)
+    assert st and st["status"] == "in_progress" and "scr/broken.py" in st["files"], st
+    tid = st["id"]
+    t = Store(root).get(tid)
+    assert t.rec["workload"] == "scriptorium" and "tooling changed outside a task" in t.rec["title"]
+    assert "[journal]" in (t.dir / "log.md").read_text() and git(root, "status", "--porcelain") == ""
+    assert "0 errors" in scr(root, "verify").stdout
+    # 2. more edits attach to the same hotfix, not a new one
+    (root / "scr" / "broken.py").write_text("x = 2\n")
+    scr(root, "--actor", "x", "event", "system", "--name", "poke2", "--quiet")
+    assert hotfix.status(root)["id"] == tid
+    # 3. close: tests run, report written, submitted
+    r = scr(root, "--actor", "hotfix:agent", "hotfix", "close", "--summary", "was x=1; now x=2", "--unlock", "add a regression test | none existed")
+    assert "submitted" in r.stdout, r.stdout + r.stderr
+    t = Store(root).get(tid)
+    assert t.status == "submitted" and hotfix.status(root) is None
+    rep = (t.dir / "report.md").read_text()
+    assert "was x=1" in rep and "Tests: PASS" in rep and "add a regression test" in rep
+    assert "0 errors" in scr(root, "verify").stdout
+    # 4. the watcher lands a tooling task without a worktree: accepted -> merged
+    from scr.watch import Watcher
+    scr(root, "--actor", "steward:" + tid, "task", "set", tid, "accepted")
+    Watcher(root, quiet=True, auto_land=True).tick()
+    assert Store(root).get(tid).status == "merged"
+    # 5. an explicit open from the UI/CLI, then a failing test command escalates instead of submitting
+    r = scr(root, "--actor", "hotfix:omri", "hotfix", "open", "Discuss button fails to launch")
+    tid2 = r.stdout.split()[0]
+    assert tid2.startswith("T-") and hotfix.status(root)["id"] == tid2
+    assert "Toolsmith" in (root / ".scr" / "hotfix" / f"{tid2}.md").read_text()
+    wl["scriptorium"]["tests"] = f"{sys.executable} -c \"import sys; sys.exit(1)\""
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+    r = scr(root, "--actor", "hotfix:agent", "hotfix", "close", tid2, "--summary", "tried", check=False)
+    assert r.returncode == 1 and Store(root).get(tid2).status == "omri_queue"
+
+
+def test_discuss_hotfix_is_toolsmith_in_root(world):
+    from scr.discuss import build
+    root, _, _ = world
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "tests": "true"}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+    s = build(root, "hotfix")
+    assert s.role == "toolsmith" and s.cwd == root and "hotfix close" in s.brief
+
+
+def test_hotfix_file_requests_from_an_agent_without_a_shell(world):
+    """Claude-in-Cowork drops files: pending.json before editing, close.json when done."""
+    from scr import hotfix
+    root, _, _ = world
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "tests": f"{sys.executable} -c \"print('ok')\""}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl)); git(root, "add", "-A"); git(root, "commit", "-q", "-m", "wl")
+    (root / ".scr" / "hotfix").mkdir(parents=True, exist_ok=True)
+    (root / ".scr" / "hotfix" / "pending.json").write_text(json.dumps({"who": "claude-cowork", "symptom": "Discuss launcher parse error"}))
+    (root / "scr").mkdir(exist_ok=True); (root / "scr" / "discuss_fix.py").write_text("ok = True\n")
+    scr(root, "--actor", "steward-watch", "event", "system", "--name", "tick", "--quiet")     # any journaling call
+    st = hotfix.status(root)
+    assert st and "Discuss launcher parse error" in st["title"] and "scr/discuss_fix.py" in st["files"]
+    assert not (root / ".scr" / "hotfix" / "pending.json").exists()
+    (root / ".scr" / "hotfix" / "close.json").write_text(json.dumps({"who": "claude-cowork", "summary": "quoted the first message", "unlocks": ["lint launchers | catch this class"]}))
+    from scr.watch import Watcher
+    Watcher(root, quiet=True).tick()
+    t = Store(root).get(st["id"])
+    assert t.status == "submitted" and "quoted the first message" in (t.dir / "report.md").read_text()
+    assert hotfix.status(root) is None and git(root, "status", "--porcelain") == ""
+
+
+def test_hotfix_requests_dropped_together_with_the_fix(world):
+    """Cowork drops pending.json, close.json and the edited files in one go; one tick sorts it out."""
+    from scr import hotfix
+    from scr.watch import Watcher
+    root, _, _ = world
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "tests": f"{sys.executable} -c \"print('ok')\""}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl)); git(root, "add", "-A"); git(root, "commit", "-q", "-m", "wl")
+    (root / ".scr" / "hotfix").mkdir(parents=True, exist_ok=True)
+    (root / ".scr" / "hotfix" / "pending.json").write_text(json.dumps({"who": "claude-cowork", "symptom": "launcher quoting"}))
+    (root / ".scr" / "hotfix" / "close.json").write_text(json.dumps({"who": "claude-cowork", "summary": "ps_quote everywhere"}))
+    (root / "scr").mkdir(exist_ok=True); (root / "scr" / "fix.py").write_text("ok = True\n")
+    Watcher(root, quiet=True).tick()
+    tasks = [t for t in Store(root).load_all().values() if t.rec.get("workload") == "scriptorium"]
+    assert len(tasks) == 1, [t.rec["title"] for t in tasks]
+    t = tasks[0]
+    assert t.status == "submitted" and "launcher quoting" in t.rec["title"] and "scr/fix.py" in t.rec["scope"]["files"]
+    assert "ps_quote everywhere" in (t.dir / "report.md").read_text()
+    assert hotfix.status(root) is None and not (root / ".scr" / "hotfix" / "close.json").exists()
+    assert git(root, "status", "--porcelain") == ""

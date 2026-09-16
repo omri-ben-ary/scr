@@ -76,8 +76,8 @@ def journal(root: Path, actor: str, summary: str, push: bool = False, force_refr
         return None
     try:
         with _Lock(root):
+            from .cli import refresh           # local import: cli imports this module
             if force_refresh:
-                from .cli import refresh       # local import: cli imports this module
                 refresh(root, quiet=True)
             if not g.dirty():
                 return None
@@ -91,6 +91,20 @@ def journal(root: Path, actor: str, summary: str, push: bool = False, force_refr
                 pass
             msg = f"[{actor}] {summary.strip()[:160]}\n\nstate_root {root_hash}; {len(changed)} file(s):\n" + "\n".join(f"  {c}" for c in changed[:40])
             sha = g.commit_all(msg)
+            if sha:
+                try:
+                    from .hotfix import journal_note, poll_requests, tooling_paths
+                    if tooling_paths(changed) and journal_note(root, sha, changed, actor):
+                        # the hotfix record itself changed (log.md, maybe a new task dir): fold it into a second commit
+                        refresh(root, quiet=True)
+                        if g.dirty():
+                            g.commit_all(f"[hotfix] record for {sha}\n\n(auto: tooling changed in {sha})")
+                    if poll_requests(root):
+                        refresh(root, quiet=True)
+                        if g.dirty():
+                            g.commit_all(f"[hotfix] external request honoured after {sha}")
+                except Exception as e:  # noqa: BLE001 — bookkeeping must never block the journal
+                    _log(root, f"hotfix bookkeeping failed after {sha}: {e}")
             if sha and push:
                 r = g.push(g.branch(), set_upstream=True)
                 if not r.ok:

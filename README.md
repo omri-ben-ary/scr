@@ -108,6 +108,17 @@ Branch policy: `main_branch` (master) is the agents' branch and the full history
 require a PR + your review, restrict who can push). `scr sweep --merge` commits and
 lands any uncommitted mission work so nothing exists only in a worktree.
 
+## Fixing Scriptorium itself (hotfix)
+
+Tooling breaks sometimes and the fix has to land in the live checkout, not in a worktree. That is a
+**hotfix**, and it is a task like any other: *Fix a bug…* in the UI (or `scr hotfix open "<symptom>"`,
+or just editing — the journal opens a hotfix the moment a tooling path is committed with none open)
+creates the record and a Toolsmith session; every journal commit while it is open is appended to the
+record; `scr hotfix close --summary ... [--unlock "title | why"]` runs the tests, writes the report and
+submits it; the watcher's Steward reviews the diff and proposes follow-ups, which Intake turns into
+tasks; accepted → merged. An external agent without a shell here (Claude in Cowork) uses two files:
+`.scr/hotfix/pending.json` before editing and `.scr/hotfix/close.json` when done. See `agents/toolsmith.md`.
+
 ## Lifecycle
 
 `proposed → triaged → (blocked) → ready → dispatched → in_progress ⇄ checkpoint →

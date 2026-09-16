@@ -181,6 +181,13 @@ def state(root: Path) -> dict:
         grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"
         needs.append(grp)
     needs += chore_cards(root, acked)
+    from . import hotfix as _hx
+    hx = _hx.status(root)
+    if hx:
+        needs.insert(0, {"key": f"hotfix:{hx['id']}", "id": hx["id"], "kind": "hotfix", "type": "hotfix", "title": hx["title"], "status": hx["status"],
+                         "text": "A tooling fix is in progress in the live checkout. Files so far: " + (", ".join(hx["files"]) or "(none yet)") +
+                                 ". When the fix is done, close it: the tests run, a report is written and the Steward reviews it.",
+                         "options": []})
     running = [{"id": t.id, "status": t.status, "title": t.rec.get("title", ""), "kind": t.rec.get("kind"),
                 "attempts": t.rec.get("attempts", 0), "tokens": t.rec.get("tokens_used", 0), "started": _started(root, t.id)}
                for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted", "accepted"}]
@@ -211,7 +218,7 @@ def state(root: Path) -> dict:
         "journal": {"head": head, "dirty": len(gj.dirty()) if head else 0, "last_failure": last_failure(root)},
         "last_watch_tick": last_tick, "pid": os.getpid(), "paused": paused(root),
         "watcher_running": bool(__import__("scr.run", fromlist=["pids_matching"]).pids_matching(__import__("scr.admin", fromlist=["WATCH_PATTERN"]).WATCH_PATTERN)),
-        "needs": sorted(needs, key=lambda x: {"chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}[x["type"]]),
+        "needs": sorted(needs, key=lambda x: {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}[x["type"]]),
         "running": running, "ready": ready, "recent": recent,
         "jobs": JOBS.list(),
         "counts": {s: sum(1 for t in tasks.values() if t.status == s) for s in
@@ -350,6 +357,20 @@ def run_action(root: Path, data: dict) -> dict:
     if kind == "inbox":
         from .answers import add_inbox
         return JOBS.start("inbox", "inbox", data["text"][:60], lambda: add_inbox(root, data["text"]))
+    if kind == "hotfix_open":
+        symptom = (data.get("symptom") or "").strip() or "opened from the UI"
+        def _open():
+            rc, out = scr_cmd(root, "hotfix:omri", "hotfix", "open", symptom)
+            from .discuss import discuss
+            tid = out.split()[0] if out.startswith("T-") else None
+            return {"ok": rc == 0, "output": out + "\n" + "\n".join(discuss(root, f"hotfix:{tid}" if tid else "hotfix"))}
+        return JOBS.start("hotfix", "hotfix:new", f"fix a bug: {symptom[:50]}", _open)
+    if kind == "hotfix_close":
+        tid, summary = data.get("id"), (data.get("summary") or "").strip() or "closed from the UI"
+        def _close():
+            rc, out = scr_cmd(root, "hotfix:omri", "hotfix", "close", *( [tid] if tid else []), "--summary", summary, timeout=3600)
+            return {"ok": rc == 0, "output": out}
+        return JOBS.start("hotfix", f"hotfix:{tid}", f"close hotfix {tid}", _close)
     if kind == "ack":
         key = data["key"]
         return JOBS.start("ack", key, f"dismiss {key}", lambda: _ack(root, key))

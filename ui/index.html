@@ -49,6 +49,7 @@
   .card[data-type=help] { border-left-color: var(--help); }
   .card[data-type=decision] { border-left-color: var(--decision); }
   .card[data-type=chore] { border-left-color: var(--ok); }
+  .card[data-type=hotfix] { border-left-color: var(--danger); } .badge.hotfix { background: var(--danger); }
   .card.selected { box-shadow: 0 0 0 2px var(--accent); }
   .card.running { border-style: dashed; }
   .card.running::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: linear-gradient(90deg, var(--accent) 0 40%, transparent 40% 100%); background-size: 200% 100%; animation: slide 1.2s linear infinite; border-radius: 0 0 var(--radius) 0; }
@@ -106,6 +107,7 @@
   <button id="pauseBtn" class="small" title="Pause: the watcher keeps running but does nothing until you resume">Pause</button>
   <button id="quitBtn" class="small" title="Stop the UI and the watcher; start again from the Scriptorium shortcut">Quit</button>
   <span class="spacer"></span>
+  <button id="fixBug" title="Something in Scriptorium itself is broken: open a recorded hotfix and a Toolsmith session that fixes it in place">Fix a bug…</button>
   <button id="planTasks" class="primary" title="Open a planning session with Intake + Prioritizer: talk, and it turns the conversation into task records">Add tasks…</button>
   <button id="discussGeneral" title="Open a discussion session not tied to one ticket">Discuss…</button>
   <button id="refresh" title="Refresh (r)">Refresh</button>
@@ -226,7 +228,9 @@ function renderNeeds() {
     if (running) {
       const s = document.createElement('span'); s.className = 'status'; s.textContent = `in progress since ${fmtTs(job.started)}…`; act.append(s);
     } else {
-      if (n.type === 'chore') {
+      if (n.type === 'hotfix') {
+        act.append(actionButton('Close hotfix…', 'primary', () => { const sm = prompt('What was wrong, what changed, what to watch (goes into the report):'); if (sm !== null) start({ kind: 'hotfix_close', id: n.id, summary: sm }, n.key); }));
+      } else if (n.type === 'chore') {
         if (n.runnable) act.append(actionButton('Run', 'primary', () => start({ kind: 'chore', id: n.id, title: n.title }, n.key)));
         act.append(actionButton('Mark done', '', () => start({ kind: 'ack', key: n.key }, n.key)));
       } else if (n.type === 'system') {
@@ -235,7 +239,7 @@ function renderNeeds() {
         for (const o of (n.options || [])) act.append(actionButton(o, 'primary', () => answer(n, o)));
         act.append(actionButton('Answer…', '', () => { select(n.id); setTimeout(() => $('#answerText') && $('#answerText').focus(), 50); }));
       }
-      const discussItem = n.type === 'chore' ? 'chore:' + n.id : (n.type === 'system' ? 'event:' + n.h : n.id);
+      const discussItem = n.type === 'chore' ? 'chore:' + n.id : (n.type === 'system' ? 'event:' + n.h : (n.type === 'hotfix' ? 'hotfix:' + n.id : n.id));
       act.append(actionButton('Discuss', '', () => start({ kind: 'discuss', item: discussItem }, 'discuss:' + discussItem)));
     }
     c.append(act);
@@ -309,6 +313,7 @@ async function answer(need, text) {
 $('#refresh').onclick = refresh;
 $('#discussGeneral').onclick = () => start({ kind: 'discuss', item: 'general' }, 'discuss:general');
 $('#planTasks').onclick = () => start({ kind: 'discuss', item: 'plan' }, 'discuss:plan');
+$('#fixBug').onclick = () => { const sm = prompt('What is broken? (one line; the Toolsmith session opens with it)'); if (sm !== null && sm.trim()) start({ kind: 'hotfix_open', symptom: sm.trim() }, 'hotfix:new'); };
 $('#pauseBtn').onclick = () => start({ kind: STATE && STATE.paused ? 'resume' : 'pause' }, 'system:pause');
 $('#quitBtn').onclick = async () => { await start({ kind: 'quit' }, 'system:quit'); setTimeout(() => { document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; }, 1500); };
 $('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; $('#inboxText').value = ''; await start({ kind: 'inbox', text: v }, 'inbox'); };

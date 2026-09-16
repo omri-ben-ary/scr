@@ -459,6 +459,31 @@ def cmd_config(args):
     refresh(root, args.quiet)
 
 
+def cmd_hotfix(args):
+    root, _, _ = _ctx(args)
+    from . import hotfix
+    who = args.actor.split(":", 1)[1] if args.actor.startswith("hotfix:") else args.actor
+    if args.op == "open":
+        symptom = " ".join(x for x in (args.id, args.text) if x)     # `hotfix open "<symptom>"`: the text lands in the id slot
+        if not symptom:
+            raise RepoError("hotfix open needs the symptom as text")
+        r = hotfix.open_hotfix(root, symptom, who=who)
+        print(f"{r['id']} {'already open' if r.get('already_open') else 'opened'}; brief: {r['brief']}")
+        if args.discuss:
+            from .discuss import discuss
+            _print(discuss(root, f"hotfix:{r['id']}"))
+    elif args.op == "close":
+        r = hotfix.close_hotfix(root, args.id, args.summary or "closed", who=who, unlocks=args.unlock or [])
+        print(r["output"])
+        sys.exit(0 if r["ok"] else 1)
+    elif args.op == "test":
+        rc, out = hotfix.run_tests(root)
+        print(out); sys.exit(rc)
+    elif args.op == "status":
+        st = hotfix.status(root)
+        print(json.dumps(st, indent=1) if st else "no hotfix open")
+
+
 def cmd_answer(args):
     root, _, _ = _ctx(args)
     from .answers import apply
@@ -594,6 +619,10 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
     ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
+    hx = sub.add_parser("hotfix", parents=[common], help="fix the tooling in place, as a recorded task: open <symptom> | close [id] --summary | test | status")
+    hx.add_argument("op", choices=["open", "close", "test", "status"]); hx.add_argument("id", nargs="?"); hx.add_argument("text", nargs="?")
+    hx.add_argument("--summary"); hx.add_argument("--unlock", action="append", help='"<title> | <why>" (repeatable)'); hx.add_argument("--discuss", action="store_true", help="open the Toolsmith session too")
+    hx.set_defaults(fn=cmd_hotfix)
     pl = sub.add_parser("plan", parents=[common], help="open a planning session (Intake + Prioritizer) to turn a conversation into tasks"); pl.add_argument("--print-only", action="store_true"); pl.set_defaults(fn=cmd_discuss, item="plan")
     dc = sub.add_parser("discuss", parents=[common], help="open a Claude Code session preloaded with a ticket's context"); dc.add_argument("item"); dc.add_argument("--print-only", action="store_true"); dc.set_defaults(fn=cmd_discuss)
     ui = sub.add_parser("ui", parents=[common], help="serve the Scriptorium UI on localhost (Omri's entry point)")
@@ -603,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
 MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire",
-            "spawn", "launch", "chore", "update", "migrate", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan"}
+            "spawn", "launch", "chore", "update", "migrate", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix"}
 
 
 def main(argv=None):

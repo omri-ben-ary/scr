@@ -73,6 +73,10 @@ ROLES = {
                "{root}/agents/prioritizer.md and {root}/agents/_common.md when Omri's request calls for it). You turn a "
                "conversation about what to work on next into well-formed task records with real scope, mechanical "
                "done-conditions and edges, deduplicated against the open graph, and you say what you would dispatch first and why."),
+    "toolsmith": ("Toolsmith", "You are the Toolsmith of the Scriptorium research operation: you fix the operation's OWN tooling "
+                  "(scr/, ui/, tests/, agents/, templates/, config/) in place, in the live checkout {root}, as a recorded hotfix task. "
+                  "You reproduce before you change, you change minimally, you add the test that would have caught it, and you close "
+                  "the hotfix yourself with `scr hotfix close`. This is the ONE session kind that edits tooling."),
     "operator": ("Operator", "You are the operator's assistant for the Scriptorium research operation (read {root}/agents/_common.md "
                  "when Omri's request calls for it). You know the records, the event log and the chores; you explain and "
                  "you execute exactly what Omri decides."),
@@ -94,6 +98,11 @@ How this session runs (Omri's rule, 2026-09-16):
   say when something is not in the records.
 - You act only on what he decides, with scr, as the brief's last section says. Nothing is created, changed or
   dismissed before he concludes, and nothing but records is ever changed."""
+
+
+def ps_quote(text: str) -> str:
+    """A PowerShell single-quoted literal: the only escape is doubling the quote."""
+    return "'" + text.replace("'", "''") + "'"
 
 
 @dataclass
@@ -259,6 +268,19 @@ def build(root: Path, item: str) -> Session:
     repo = wl.repo
     scr = " ".join(f'"{a}"' if " " in a else a for a in scr_exe(root))
     conclude = CONCLUDE.format(scr=scr, root=root)
+    if item.startswith("hotfix:") or item == "hotfix":
+        from . import hotfix as hx
+        tid = item[7:] if item.startswith("hotfix:") else None
+        if not tid:
+            st = hx.status(root)
+            if not st:
+                r = hx.open_hotfix(root, "opened from the UI (describe the symptom to the Toolsmith)", who="omri")
+                tid = r["id"]
+            else:
+                tid = st["id"]
+        t = store.get(tid)
+        body = hx.fixer_brief(root, tid, t.rec.get("title", "")) + "\n\n" + _task_context(root, tid)
+        return Session(item, "toolsmith", root, body, f"hotfix {tid}", repo=root)
     if item.startswith("chore:"):
         from .chores import load
         c = next((x for x in load(root) if x["id"] == item[6:]), None)
@@ -306,8 +328,15 @@ def agent_name(role: str) -> str:
     return f"scriptorium-{role}"
 
 
+TOOLSMITH_FLOW = """Scriptorium root: {root}. Your brief: {brief} — read it in full now; it names the hotfix record and the rules.
+Open with three lines: who you are, the hotfix id and symptom, and what you will look at first. Then reproduce, fix,
+test, and close the hotfix with `scr hotfix close` as the brief says. Ask Omri only when the symptom is ambiguous."""
+
+
 def _system_prompt(root: Path, s: Session, brief_file: Path) -> str:
     name, text = ROLES[s.role]
+    if s.role == "toolsmith":
+        return text.format(root=root) + "\n\n" + TOOLSMITH_FLOW.format(root=root, brief=brief_file)
     return text.format(root=root) + "\n\n" + FLOW.format(root=root, repo=s.repo or workload(root).repo, brief=brief_file)
 
 
@@ -323,8 +352,9 @@ def install_agents(root: Path, agents_dir: Path | None = None) -> list[Path]:
         body = (f"---\nname: {agent_name(role)}\ndescription: Scriptorium {name} — interactive session opened by the Scriptorium UI's Discuss button; "
                 f"waits for Omri, then works from the ticket's brief. Written by scr discuss; do not hand-edit.\n---\n"
                 f"{text.format(root=root)}\n\nScriptorium root: {root}. Workload repo: {repo}. The session's brief and flow rules arrive "
-                f"in the appended system prompt; follow them. You never implement a fix in a Discuss session: your only "
-                f"output is a task list Omri approves, recorded with scr.\n")
+                f"in the appended system prompt; follow them. "
+                + ("You DO implement: this is the one session kind that edits the tooling, as a recorded hotfix.\n" if role == "toolsmith" else
+                   "You never implement a fix in a Discuss session: your only output is a task list Omri approves, recorded with scr.\n"))
         if _read(p) != body:
             p.write_text(body, encoding="utf-8")
         out.append(p)
@@ -357,16 +387,24 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
         return out + ["claude (Claude Code CLI) not on PATH — open a terminal in that folder and paste the brief"]
     first = (f"Say in two lines who you are and what your brief covers (read only the first section of {bf} for that), "
              "then wait for Omri's instruction.")
+    if s.role == "toolsmith":
+        first = f"Read {bf} in full now, then begin as it says."
     add_dirs = [str(root), str(s.repo or workload(root).repo)]
     agent_flag = f"--agent {agent} " if agent else ""
     if os.name == "nt":
         # A launcher SCRIPT, not an inline command: Windows Terminal splits its command line on ';'
         # (seen 2026-09-16: it tried to run `" claude ...` as a program). The system prompt is read
         # from a file inside the script, so nothing long ever sits on a command line.
+        # Every free-text value goes through a FILE or through ps_quote(): a single quote inside a
+        # single-quoted PowerShell string ends it ("Omri's" — parser error TerminatorExpectedAtEndOfString,
+        # seen 2026-09-16 after a local edit of this very message).
+        ff = bf.with_suffix(".first.txt")
+        ff.write_text(first, encoding="utf-8")
         ps1 = bf.with_suffix(".launch.ps1")
-        ps1.write_text("﻿" + f"Set-Location -LiteralPath '{s.cwd}'\n"
-                       f"$sys = Get-Content -Raw -Encoding UTF8 '{sp}'\n"
-                       f"claude {agent_flag}--permission-mode acceptEdits --add-dir '{add_dirs[0]}' --add-dir '{add_dirs[1]}' --append-system-prompt $sys '{first}'\n",
+        ps1.write_text("\ufeff" + f"Set-Location -LiteralPath {ps_quote(str(s.cwd))}\n"
+                       f"$sys = Get-Content -Raw -Encoding UTF8 {ps_quote(str(sp))}\n"
+                       f"$first = (Get-Content -Raw -Encoding UTF8 {ps_quote(str(ff))}).Trim()\n"
+                       f"claude {agent_flag}--permission-mode acceptEdits --add-dir {ps_quote(add_dirs[0])} --add-dir {ps_quote(add_dirs[1])} --append-system-prompt $sys $first\n",
                        encoding="utf-8")
         title = (f"{ROLES[s.role][0]}: {s.title}").replace(";", ",").replace('"', "'")
         if shutil.which("wt"):

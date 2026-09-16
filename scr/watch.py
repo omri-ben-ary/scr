@@ -124,6 +124,12 @@ class Watcher:
             self.log("paused (resume from the UI)")
             return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
         self.touch_log()
+        try:
+            from .hotfix import poll_requests
+            for line in poll_requests(self.root):
+                self.log(line)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"hotfix requests: {e}")
         sha = journal(self.root, "steward-watch", "tick: docs/records changed", push=self.push)
         if sha:
             self.log(f"journaled {sha}")
@@ -144,7 +150,9 @@ class Watcher:
             flags: list[str] = []
             scope = (t.rec.get("scope") or {}).get("files") or []
 
-            if wt.exists():
+            if t.rec.get("workload") == "scriptorium":
+                flags.append("tooling")          # lives in the checkout; the journal records its commits
+            elif wt.exists():
                 if ok:
                     try:
                         c = checkpoint_commit(self.root, t.id, push=self.push)
@@ -230,6 +238,12 @@ class Watcher:
             for t in [t for t in tasks.values() if t.status == "accepted"]:
                 if not self.flag(f"land:{t.id}"):
                     continue
+                if t.rec.get("workload") == "scriptorium":
+                    # the fix is already on main (the tree journals itself): accepted -> merged, no PR, no worktree
+                    self.scr(f"steward:{t.id}", "task", "set", t.id, "merged", "--note", "tooling task: change already on main (journal)", "--quiet")
+                    self.log(f"{t.id} tooling task -> merged")
+                    merged_now += 1
+                    continue
                 self.log(f"{t.id} auto-land: commit/push/PR/merge")
                 try:
                     res = land(self.root, t.id, merge=True)
@@ -276,6 +290,8 @@ class Watcher:
     def start_review(self, t) -> None:
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
+        if t.rec.get("workload") == "scriptorium":
+            return self.start_tooling_review(t)
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): accepted only if the statement diff is EMPTY and every "
                   "mechanical check passes; otherwise returned or escalated. Never merge a branch yourself; never edit Lean."
                   if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")
@@ -294,6 +310,34 @@ class Watcher:
         if pid:
             self.log(f"{t.id} review session started (pid {pid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid}", "--quiet")
+        else:
+            self.log(f"{t.id} cannot start review: claude not on PATH"); self.unflag(f"review:{t.id}")
+
+    def start_tooling_review(self, t) -> None:
+        """A hotfix / tooling task: the 'worktree' is the checkout itself; the review reads the commits the
+        record's log.md names, runs the tests, judges the fix, and proposes follow-ups in review.md."""
+        decide = (f"Then apply the decision with scr (--actor steward:{t.id}): `task set {t.id} accepted` if the tests pass and the fix "
+                  f"addresses the symptom (the watcher marks it merged: the change is already on main); otherwise `returned` with feedback "
+                  f"or `escalated` then `omri_queue`. Never run git here; never edit the tooling in this session — a further fix is a new "
+                  f"`scr hotfix open`."
+                  if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")
+        brief = (f"You are the Steward reviewing a TOOLING task of the Scriptorium itself: {t.id} — {t.rec.get('title', '')} "
+                 f"(see {self.root / 'agents' / 'steward.md'}, section \"On submission\", adapted: no Lean, no statement diff).\n"
+                 f"Record: {t.dir}  (spec.md = the symptom; log.md lists the journal commits that make up the fix; report.md = the fixer's summary "
+                 f"and test output; write review.md there).\n"
+                 f"Checkout: {self.root} (this IS the task's tree; `git log --oneline -20` and `git show <sha>` for the commits named in log.md are read-only and fine).\n"
+                 f"Do: (1) read spec, report, log; (2) `git show` each commit; (3) run `{self.root / '.venv' / 'Scripts' / 'scr.exe'} hotfix test`; "
+                 f"(4) judge: does the change fix the symptom, is it minimal, is there a test that would have caught it, what else has the same bug class; "
+                 f"(5) fill review.md and add an `unlocks` block of follow-up tasks (title, why, files) — regression tests, root cause, the same pattern "
+                 f"elsewhere — which Intake turns into records; (6) end with a Decision line: accepted | returned (feedback) | escalated (reason).\n{decide}\n"
+                 f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; the tree journals itself.\n")
+        bf = t.dir / "review-brief.txt"
+        bf.write_text(brief, encoding="utf-8")
+        tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode)
+        if pid:
+            self.log(f"{t.id} tooling review session started (pid {pid}) -> {tr}")
+            self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid} (tooling)", "--quiet")
         else:
             self.log(f"{t.id} cannot start review: claude not on PATH"); self.unflag(f"review:{t.id}")
 
