@@ -617,6 +617,14 @@ MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "swe
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Records and briefs carry ⊆, ×, → and Hebrew; a cp1255 console (the default when stdout is a pipe on
+    # this machine) raised UnicodeEncodeError on `scr discuss --print-only` (2026-09-16). Never crash on output.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
     args = build_parser().parse_args(argv)
     try:
         args.fn(args)
