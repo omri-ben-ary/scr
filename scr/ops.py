@@ -91,21 +91,24 @@ def _share_lake(repo: Path, wt: Path, out: list[str]) -> None:
 def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, wl_name: str | None = None) -> list[str]:
     """One worktree per dispatched/running task (or the ids given), branch task/<id> from origin/<main>."""
     store = Store(root)
-    wl = workload(root, store, wl_name)
     tasks = store.load_all()
     if not tids:
         tids = [t.id for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint"}]
     out: list[str] = []
     if not tids:
         return ["nothing dispatched"]
-    wl.wt_root.mkdir(parents=True, exist_ok=True)
-    g = Git(wl.repo)
-    g.fetch()
-    base = f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
+    prepared: dict[str, tuple[Git, str]] = {}      # per workload: its repo's Git and the spawn base
     for tid in tids:
         t = tasks.get(tid)
         if not t:
             out.append(f"{tid}: no record"); continue
+        wl = workload(root, store, wl_name) if wl_name else workload_for(root, store, t)
+        if wl.name not in prepared:
+            wl.wt_root.mkdir(parents=True, exist_ok=True)
+            g0 = Git(wl.repo)
+            g0.fetch()
+            prepared[wl.name] = (g0, f"origin/{wl.main}" if g0.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main)
+        g, base = prepared[wl.name]
         wt = task_worktree(wl, t)
         br = f"task/{tid}"
         out.append(f"=== {tid} -> {wt} ({br})")
