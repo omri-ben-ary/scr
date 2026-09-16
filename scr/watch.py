@@ -27,7 +27,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import checkpoint_commit, in_scope, land, retire, task_worktree, workload
+from .ops import checkpoint_commit, in_scope, land, retire, task_worktree, workload, workload_for
 from .run import scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -136,7 +136,8 @@ class Watcher:
         running = [t for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint"}]
 
         for t in running:
-            wt = task_worktree(self.wl, t)
+            wl = workload_for(self.root, self.store, t)     # the task's own workload, not the default
+            wt = task_worktree(wl, t)
             log_md = t.dir / "log.md"
             newest = max([x for x in (self.newest_change(wt), datetime.fromtimestamp(log_md.stat().st_mtime, tz=timezone.utc) if log_md.exists() else None) if x], default=None)
             idle = int((now - newest).total_seconds() // 60) if newest else -1
@@ -159,7 +160,7 @@ class Watcher:
                 # rule). Never the local main: that can sit far behind origin and then every file merged since
                 # looks like drift (2026-09-16: 465 false files on T-0029 -> 583 alarm cards).
                 if not changed:
-                    base = f"origin/{self.wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{self.wl.main}") else self.wl.main
+                    base = f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
                     r = g.run("diff", "--name-only", f"{base}...HEAD")
                     changed = [l.strip() for l in r.out.splitlines() if l.strip()] if r.ok else []
                 drift = [p for p in changed if scope and not in_scope(p, scope)]
@@ -273,14 +274,15 @@ class Watcher:
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "needs": self.needs}
 
     def start_review(self, t) -> None:
-        wt = task_worktree(self.wl, t)
+        wl = workload_for(self.root, self.store, t)
+        wt = task_worktree(wl, t)
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): accepted only if the statement diff is EMPTY and every "
                   "mechanical check passes; otherwise returned or escalated. Never merge a branch yourself; never edit Lean."
                   if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")
         brief = (f"You are the Steward for Scriptorium task {t.id} (see {self.root / 'agents' / 'steward.md'} — follow its \"On submission\" section exactly).\n"
                  f"Record: {t.dir}  (spec.md, report.md, log.md; write review.md there).\n"
                  f"Worktree: {wt}   Workload config: {self.root / 'config' / 'workloads.yaml'} (done_when_checker, statement_diff, allowed_axioms, main_branch).\n"
-                 f"Run the mechanical checks from the worktree, run statement_diff against {self.wl.main}, fill review.md completely, and end with a "
+                 f"Run the mechanical checks from the worktree, run statement_diff against {wl.main}, fill review.md completely, and end with a "
                  f"Decision line: accepted | returned (feedback) | escalated (Gate N, reason).\n{decide}\n"
                  f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; never run git in the scriptorium folder (it journals itself).\n")
         bf = t.dir / "review-brief.txt"

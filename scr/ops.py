@@ -296,6 +296,10 @@ def sweep(root: Path, merge: bool = False, dry_run: bool = False, wl_name: str |
 
 # ---- retire (quarantine, never delete) ---------------------------------------------------
 def retire(root: Path, name: str, execute: bool = False, wl_name: str | None = None) -> dict:
+    if wl_name is None:                 # a task's worktree lives under ITS workload's root
+        _st = Store(root)
+        if name in _st.load_all():
+            wl_name = _st.get(name).rec.get("workload")
     wl = workload(root, None, wl_name)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", "..") or ".." in name or name.startswith("-"):
         raise RepoError(f"illegal worktree name: {name}")

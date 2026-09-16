@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .events import EventLog
-from .ops import task_worktree, workload
+from .ops import task_worktree, workload, workload_for
 from .run import claude_bin, scr_exe
 from .store import Store
 
@@ -103,6 +103,7 @@ class Session:
     cwd: Path
     brief: str
     title: str
+    repo: Path | None = None     # the ticket's own workload repo (None = the default workload)
 
 
 def _read(p: Path, limit: int = 60_000) -> str:
@@ -242,12 +243,14 @@ def _event_context(root: Path, store: Store, wl, item: str) -> Session:
         body = "# System alarm\n```json\n" + (json.dumps(e, indent=1) if e else "(unknown event)") + "\n```"
         tid = e.get("task") if e else None
         title = f"alarm {h[:8]}"
-    cwd = root
+    cwd, repo = root, None
     if tid and tid in store.load_all():
         body += "\n\n" + _task_context(root, tid)
-        wt = task_worktree(wl, store.get(tid))
-        cwd = wt if wt.exists() else wl.repo
-    return Session(item, "steward", cwd, body, title)
+        t = store.get(tid)
+        wl_t = workload_for(root, store, t)
+        wt = task_worktree(wl_t, t)
+        cwd, repo = (wt if wt.exists() else wl_t.repo), wl_t.repo
+    return Session(item, "steward", cwd, body, title, repo=repo)
 
 
 def build(root: Path, item: str) -> Session:
@@ -265,7 +268,7 @@ def build(root: Path, item: str) -> Session:
         item = item[6:]
     if item.startswith(("event:", "events:")):
         s = _event_context(root, store, wl, item)
-        return Session(s.item, s.role, s.cwd, s.brief + conclude, s.title)
+        return Session(s.item, s.role, s.cwd, s.brief + conclude, s.title, repo=s.repo)
     if item == "plan":
         body = ("# Planning session: what should the operation work on next?\n"
                 "Omri will say what he wants — directions, results, things that bother him — and you turn that into a LIST of "
@@ -281,16 +284,18 @@ def build(root: Path, item: str) -> Session:
     # a task id
     t = store.get(item)
     body = _task_context(root, item)
-    wt = task_worktree(wl, t)
+    wl_t = workload_for(root, store, t)          # the ticket's own workload (scriptorium tooling tasks live in the scriptorium)
+    repo_t = wl_t.repo
+    wt = task_worktree(wl_t, t)
     if t.rec.get("queue") == "omri":
-        role, cwd = "concierge", repo
+        role, cwd = "concierge", repo_t
     elif t.status in ("escalated", "omri_queue") or _open_help(root, t):
-        role, cwd = "steward", (wt if wt.exists() else repo)
+        role, cwd = "steward", (wt if wt.exists() else repo_t)
     else:
-        role, cwd = "steward", (wt if wt.exists() else repo)
+        role, cwd = "steward", (wt if wt.exists() else repo_t)
     if cwd == wt:
-        body += f"\n\n## Where you are\nThis session runs inside the task's worktree `{wt}` (branch task/{item}); the Lean and the mission files are here."
-    return Session(item, role, cwd, body + conclude, f"{item} {t.rec.get('title', '')[:40]}")
+        body += f"\n\n## Where you are\nThis session runs inside the task's worktree `{wt}` (branch task/{item}); the code and the mission files are here."
+    return Session(item, role, cwd, body + conclude, f"{item} {t.rec.get('title', '')[:40]}", repo=repo_t)
 
 
 def brief(root: Path, item: str) -> str:
@@ -303,7 +308,7 @@ def agent_name(role: str) -> str:
 
 def _system_prompt(root: Path, s: Session, brief_file: Path) -> str:
     name, text = ROLES[s.role]
-    return text.format(root=root) + "\n\n" + FLOW.format(root=root, repo=workload(root).repo, brief=brief_file)
+    return text.format(root=root) + "\n\n" + FLOW.format(root=root, repo=s.repo or workload(root).repo, brief=brief_file)
 
 
 def install_agents(root: Path, agents_dir: Path | None = None) -> list[Path]:

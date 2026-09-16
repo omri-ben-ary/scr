@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .brief import brief_for
 from .events import EventLog
-from .ops import spawn, task_worktree, workload
+from .ops import spawn, task_worktree, workload_for
 from .run import claude_argv, claude_bin, scr_cmd, start_claude
 from .store import Store
 
@@ -18,7 +18,6 @@ from .store import Store
 def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", permission_mode: str = "bypassPermissions",
            model: str | None = None, relaunch: bool = False, dry_run: bool = False) -> list[str]:
     store = Store(root)
-    wl = workload(root, store)
     tasks = store.load_all()
     want = {"dispatched", "in_progress", "checkpoint"} if relaunch else {"dispatched"}
     tids = tids or [t.id for t in tasks.values() if t.status in want]
@@ -32,7 +31,7 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
         out += spawn(root, tids)
     for tid in tids:
         t = tasks[tid]
-        wt = task_worktree(wl, t)
+        wt = task_worktree(workload_for(root, store, t), t)
         brief = brief_for(root, store, t)
         bf = t.dir / "brief.txt"
         bf.write_text(brief, encoding="utf-8")
