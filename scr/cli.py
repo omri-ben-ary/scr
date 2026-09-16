@@ -105,16 +105,7 @@ def cmd_task_set(args):
     if args.tokens:
         log.append("field", task=args.id, field="tokens_used", value=t.rec["tokens_used"], actor=args.actor)
     # cascade: a blocked task whose blockers are now all done becomes ready; done -> closed frees dependents
-    if args.status in {"merged", "closed", "rejected"}:
-        g = Graph.build(store.load_all())
-        for d in g.succ(g.blocks).get(args.id, []):
-            dt = g.tasks[d]
-            if dt.status in {"triaged", "blocked"} and g.ready_now(d) and dt.rec.get("queue") == "scribers":
-                lifecycle.apply(dt.rec, "ready")
-                dt.save()
-                log.append("state", task=d, **{"from": "blocked" if dt.status == "blocked" else "triaged"}, to="ready", actor="scr", note=f"unblocked by {args.id}")
-            if args.status == "rejected" and dt.is_open:
-                log.append("system", name="blocker_rejected", actor="scr", data={"task": d, "blocker": args.id}, note="Gate 2: rewrite, reparent, or drop")
+    lifecycle.cascade(store, log, args.id, args.status)
     print(f"{args.id}: {old} -> {args.status}")
     refresh(root, args.quiet)
 

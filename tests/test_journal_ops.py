@@ -195,6 +195,9 @@ def test_declarative_chores(world):
          "done": {"task_status": {"T-0001": ["omri_queue"]}}},
         {"id": "man", "title": "manual", "why": "w", "manual": True, "done": {"event": {"name": "never"}}},
     ]))
+    # the fixture copies the LIVE config, whose concurrency may already be 2: make the chore undone first
+    lim = root / "config" / "limits.yaml"
+    lim.write_text(re.sub(r"(?m)^concurrency:\s*\d+", "concurrency: 3", lim.read_text(encoding="utf-8")), encoding="utf-8")
     open_ids = [c["id"] for c in chores.status(root, set())]
     assert open_ids == ["conc", "park", "man"]
     r = chores.run(root, "conc")

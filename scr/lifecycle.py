@@ -36,6 +36,29 @@ def allowed(rec: dict, new: str) -> bool:
     return new in table.get(rec.get("status", "proposed"), set())
 
 
+def cascade(store, log, tid: str, status: str, actor: str = "scr") -> list[str]:
+    """After `tid` reaches merged / closed / rejected: dependents whose blockers are now all done become
+    `ready`; a rejected blocker raises `blocker_rejected`. One place for this, called by every path that
+    finishes a task — `scr task set` AND the watcher's auto-land (which bypassed it until 2026-09-16 and
+    left T-0033 blocked on a merged T-0030). Returns the ids made ready."""
+    if status not in {"merged", "closed", "rejected"}:
+        return []
+    from .graph import Graph
+    g = Graph.build(store.load_all())
+    made: list[str] = []
+    for d in g.succ(g.blocks).get(tid, []):
+        dt = g.tasks[d]
+        if dt.status in {"triaged", "blocked"} and g.ready_now(d) and dt.rec.get("queue") == "scribers":
+            was = dt.status
+            apply(dt.rec, "ready")
+            dt.save()
+            log.append("state", task=d, **{"from": was}, to="ready", actor=actor, note=f"unblocked by {tid}")
+            made.append(d)
+        if status == "rejected" and dt.is_open:
+            log.append("system", name="blocker_rejected", actor=actor, data={"task": d, "blocker": tid}, note="Gate 2: rewrite, reparent, or drop")
+    return made
+
+
 def apply(rec: dict, new: str) -> None:
     """Mutate the record for a transition (beyond status)."""
     old = rec.get("status")

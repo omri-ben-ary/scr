@@ -55,7 +55,8 @@ Do nothing he has not decided. Commands (run from anywhere; `--root` is set):
   dismiss alarm  {scr} --actor omri ack <key>              (a card's key: `events:<task>:<kind>:<ts>` dismisses the whole group)
   finally        {scr} verify
 The scriptorium tree journals itself after every scr call: never run git in {root}. Never edit Lean,
-mission files or notes in this session; that is scriber work and becomes a task.
+mission files, notes, tooling or config in this session — you never implement a fix here; that is a task
+(workload `scriptorium` for the operation's own tooling), and the commands above are the only changes you make.
 """
 
 ROLES = {
@@ -80,7 +81,10 @@ ROLES = {
 FLOW = """Scriptorium root: {root}. Workload repo: {repo}. Your brief (an INDEX of this ticket, not the records
 themselves): {brief}
 
-How this session runs:
+How this session runs (Omri's rule, 2026-09-16):
+- Your ONLY output is a task list Omri approves, which you then record with scr. You never implement a fix in
+  this session — not in tooling, Lean, notes, mission files or config. A fix that is needed is a task; you
+  write its spec, you do not make the change.
 - Omri speaks first. Your opening turn is two lines: who you are (role) and what the brief covers — read only
   the brief's first section for that — then stop and wait. Do not read records, reports, the roadmap or code
   before he has said what he wants.
@@ -89,7 +93,7 @@ How this session runs:
   ambiguous; otherwise answer with an assessment, options and a recommendation. Quote paths and line numbers;
   say when something is not in the records.
 - You act only on what he decides, with scr, as the brief's last section says. Nothing is created, changed or
-  dismissed before he concludes."""
+  dismissed before he concludes, and nothing but records is ever changed."""
 
 
 @dataclass
@@ -314,7 +318,8 @@ def install_agents(root: Path, agents_dir: Path | None = None) -> list[Path]:
         body = (f"---\nname: {agent_name(role)}\ndescription: Scriptorium {name} — interactive session opened by the Scriptorium UI's Discuss button; "
                 f"waits for Omri, then works from the ticket's brief. Written by scr discuss; do not hand-edit.\n---\n"
                 f"{text.format(root=root)}\n\nScriptorium root: {root}. Workload repo: {repo}. The session's brief and flow rules arrive "
-                f"in the appended system prompt; follow them.\n")
+                f"in the appended system prompt; follow them. You never implement a fix in a Discuss session: your only "
+                f"output is a task list Omri approves, recorded with scr.\n")
         if _read(p) != body:
             p.write_text(body, encoding="utf-8")
         out.append(p)

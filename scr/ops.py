@@ -234,6 +234,8 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
         lifecycle.apply(t.rec, "merged"); t.rec["tokens_used"] = int(t.rec.get("tokens_used", 0)) + tokens; t.save()
         log.append("state", task=tid, **{"from": old}, to="merged", actor=f"steward:{tid}", tokens=tokens or None, note=f"auto-land: {url}")
         out.append(f"  merged -> {wl.main}; {tid} marked merged")
+        for d in lifecycle.cascade(store, log, tid, "merged", actor=f"steward:{tid}"):
+            out.append(f"  unblocked {d} -> ready")
     return {"ok": True, "url": url, "out": out}
 
 
