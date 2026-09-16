@@ -159,8 +159,8 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
     """Commit the task's worktree, push its branch, open the PR (and with merge=True merge it and
     mark the task merged after verifying origin/<main> contains the branch)."""
     store = Store(root)
-    wl = workload(root, store, wl_name)
     t = store.get(tid)
+    wl = workload(root, store, wl_name) if wl_name else workload_for(root, store, t)
     log = _log(root)
     out: list[str] = []
     wt = task_worktree(wl, t)
