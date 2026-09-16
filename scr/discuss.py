@@ -357,7 +357,7 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
         return out + ["claude (Claude Code CLI) not on PATH — open a terminal in that folder and paste the brief"]
     first = (f"Say in two lines who you are and what your brief covers (read only the first section of {bf} for that), "
              "then wait for Omri's instruction.")
-    add_dirs = [str(root), str(workload(root).repo)]
+    add_dirs = [str(root), str(s.repo or workload(root).repo)]
     agent_flag = f"--agent {agent} " if agent else ""
     if os.name == "nt":
         # A launcher SCRIPT, not an inline command: Windows Terminal splits its command line on ';'

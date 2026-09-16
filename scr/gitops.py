@@ -18,7 +18,11 @@ from pathlib import Path
 
 STALE_LOCK_S = 60
 NOISE = (":(exclude)build.log", ":(exclude)**/__pycache__/**", ":(exclude)**/.pytest_cache/**",
-         ":(exclude).lake/**", ":(exclude).loopy/**", ":(exclude)**/*.pyc", ":(exclude)*.lock")
+         ":(exclude).lake/**", ":(exclude).loopy/**", ":(exclude)**/*.pyc", ":(exclude)*.lock",
+         # the entries THEMSELVES, not only their contents: a worktree's .lake is a junction, which git sees as
+         # a single ignored entry named ".lake", and `git add -A -- .` then refused with "paths are ignored"
+         # (T-0015, every tick from 2026-09-16 20:58 — T-0041)
+         ":(exclude).lake", ":(exclude).loopy")
 NOISE_RE = ("/.lake/", "__pycache__", ".pytest_cache", "build.log", "/.loopy/", ".lake/")
 
 
