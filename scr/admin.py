@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .events import EventLog
 from .gitops import Git
-from .run import kill, pids_matching, scr_exe, start_detached
+from .run import kill, pids_matching, scr_exe, service_argv, start_detached
 
 UPDATABLE = ("scr", "ui", "hooks", "agents", "templates", "docs", "README.md", ".gitignore", "pyproject.toml", "tests")
 GITIGNORE_LINES = [
@@ -143,7 +143,8 @@ def desktop_shortcut(root: Path, port: int = 8765) -> list[str]:
     """Windows: Scriptorium.lnk on the Desktop (and in the root) that runs `scr up`."""
     if os.name != "nt":
         return []
-    exe = scr_exe(root)[0]
+    argv = service_argv(root)
+    exe, pre = argv[0], " ".join(argv[1:])
     targets = [root / "Scriptorium.lnk"]
     desk = Path.home() / "Desktop"
     if desk.exists():
@@ -153,7 +154,7 @@ def desktop_shortcut(root: Path, port: int = 8765) -> list[str]:
         if lnk.exists():
             continue
         ps = (f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}'); $s.TargetPath = '{exe}'; "
-              f"$s.Arguments = '--root \"{root}\" up --port {port}'; $s.WorkingDirectory = '{root}'; "
+              f"$s.Arguments = '{pre} --root \"{root}\" up --port {port}'; $s.WorkingDirectory = '{root}'; "
               f"$s.WindowStyle = 7; $s.Description = 'Scriptorium: start the UI and the watcher'; $s.IconLocation = '%SystemRoot%\\System32\\shell32.dll,165'; $s.Save()")
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True)
         out.append(f"shortcut: {lnk}" if r.returncode == 0 else f"shortcut failed ({lnk}): {(r.stdout + r.stderr).strip()[-200:]}")
@@ -184,10 +185,10 @@ def start(root: Path, what: str, port: int = 8765) -> list[str]:
         return [f"{what} already running"]
     (root / "reports").mkdir(exist_ok=True)
     if what == "ui":
-        args = scr_exe(root) + ["--root", str(root), "ui", "--port", str(port), "--no-browser"]
+        args = service_argv(root) + ["--root", str(root), "ui", "--port", str(port), "--no-browser"]
         log = root / "reports" / "ui.log"
     else:
-        args = scr_exe(root) + ["--root", str(root), "watch", "--unattended", "--quiet"]
+        args = service_argv(root) + ["--root", str(root), "watch", "--unattended", "--quiet"]
         log = root / "reports" / "watch.log"
     pid = start_detached(args, root, log)
     time.sleep(1.5)
@@ -196,7 +197,7 @@ def start(root: Path, what: str, port: int = 8765) -> list[str]:
 
 def register(root: Path, port: int = 8765) -> list[str]:
     """Windows: two logon tasks (Scriptorium\\UI, Scriptorium\\Watcher). Elsewhere: print what to add to cron."""
-    exe = " ".join(f'"{a}"' for a in scr_exe(root))
+    exe = " ".join(f'"{a}"' if (" " in a or a.endswith(".exe")) else a for a in service_argv(root))
     ui = f'{exe} --root "{root}" ui --port {port} --no-browser'
     watch = f'{exe} --root "{root}" watch --unattended --quiet'
     if os.name != "nt":

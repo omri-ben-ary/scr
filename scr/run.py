@@ -22,6 +22,16 @@ def scr_exe(root: Path) -> list[str]:
     return [sys.executable, "-m", "scr"]
 
 
+def service_argv(root: Path) -> list[str]:
+    """How to run scr for a long-lived background service: on Windows through pythonw (no console
+    window at all); elsewhere the normal scr."""
+    if os.name == "nt":
+        pyw = root / ".venv" / "Scripts" / "pythonw.exe"
+        if pyw.exists():
+            return [str(pyw), "-m", "scr"]
+    return scr_exe(root)
+
+
 def _env() -> dict:
     """When scr runs as `python -m scr` (no venv), the package dir must be importable from any cwd."""
     env = dict(os.environ)

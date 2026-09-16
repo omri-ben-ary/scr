@@ -55,11 +55,12 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
             scr_cmd(root, f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid, "--note", f"headless pid {pid}", "--quiet")
             out.append(f"  headless pid {pid}; transcript {tr}")
         else:
-            cmd = f"claude {('--model ' + model) if model else ''} (Get-Content -Raw -Encoding UTF8 '{bf}')"
+            ps1 = t.dir / "launch.ps1"     # a script, not an inline command: wt splits command lines on ';'
+            ps1.write_text("\ufeff" + f"Set-Location -LiteralPath '{wt}'\nclaude {('--model ' + model) if model else ''} (Get-Content -Raw -Encoding UTF8 '{bf}')\n", encoding="utf-8")
             if os.name == "nt" and shutil.which("wt"):
-                subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", tid, "-d", str(wt), "powershell", "-NoExit", "-Command", cmd])
+                subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", tid, "-d", str(wt), "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)])
             elif os.name == "nt":
-                subprocess.Popen(["powershell", "-NoExit", "-Command", cmd], cwd=wt, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
+                subprocess.Popen(["powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)], cwd=wt, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
             else:
                 out.append(f"  interactive tabs need Windows Terminal; run in {wt}: claude \"$(cat {bf})\""); continue
             scr_cmd(root, f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid, "--note", "interactive tab", "--quiet")

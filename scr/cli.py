@@ -437,7 +437,11 @@ def cmd_up(args):
     from .admin import up, stop
     if args.stop:
         _print(stop(root, "ui") + stop(root, "watch")); return
-    _print(up(root, ui_only=args.ui_only, restart=args.restart, no_register=args.no_register, port=args.port, open_browser=not args.no_browser))
+    lines = up(root, ui_only=args.ui_only, restart=args.restart, no_register=args.no_register, port=args.port, open_browser=not args.no_browser)
+    _print(lines)
+    (root / "reports").mkdir(exist_ok=True)      # `up` also runs windowless from the Desktop shortcut: keep a trace
+    with (root / "reports" / "up.log").open("a", encoding="utf-8") as f:
+        f.write(f"--- {now_iso()}\n" + "\n".join(lines) + "\n")
 
 
 def cmd_discuss(args):

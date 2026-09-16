@@ -216,14 +216,20 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
     first = f"Read {bf} in full now (it is your brief for this session), then begin as it says."
     add_dirs = [str(root), str(workload(root).repo)]
     if os.name == "nt":
-        # PowerShell: the system prompt comes from a file (no command-line cap issues for the brief; the role text is short)
-        cmd = (f"$sys = Get-Content -Raw -Encoding UTF8 '{sp}'; "
-               f"claude --permission-mode acceptEdits --add-dir '{add_dirs[0]}' --add-dir '{add_dirs[1]}' --append-system-prompt $sys '{first}'")
+        # A launcher SCRIPT, not an inline command: Windows Terminal splits its command line on ';'
+        # (seen 2026-09-16: it tried to run `" claude ...` as a program). The system prompt is read
+        # from a file inside the script, so nothing long ever sits on a command line.
+        ps1 = bf.with_suffix(".launch.ps1")
+        ps1.write_text("\ufeff" + f"Set-Location -LiteralPath '{s.cwd}'\n"
+                       f"$sys = Get-Content -Raw -Encoding UTF8 '{sp}'\n"
+                       f"claude --permission-mode acceptEdits --add-dir '{add_dirs[0]}' --add-dir '{add_dirs[1]}' --append-system-prompt $sys '{first}'\n",
+                       encoding="utf-8")
+        title = s.title.replace(";", ",").replace('"', "'")
         if shutil.which("wt"):
-            subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", s.title, "-d", str(s.cwd), "powershell", "-NoExit", "-Command", cmd])
+            subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", title, "-d", str(s.cwd), "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)])
         else:
-            subprocess.Popen(["powershell", "-NoExit", "-Command", cmd], cwd=s.cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
-        out.append(f"terminal opened: {s.title}")
+            subprocess.Popen(["powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)], cwd=s.cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
+        out.append(f"terminal opened: {title}")
     else:
         term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
         line = f"cd \"{s.cwd}\" && {exe} --permission-mode acceptEdits --add-dir \"{add_dirs[0]}\" --add-dir \"{add_dirs[1]}\" --append-system-prompt \"$(cat \"{sp}\")\" \"{first}\""
