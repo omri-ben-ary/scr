@@ -599,6 +599,7 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
     ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
+    pl = sub.add_parser("plan", parents=[common], help="open a planning session (Intake + Prioritizer) to turn a conversation into tasks"); pl.add_argument("--print-only", action="store_true"); pl.set_defaults(fn=cmd_discuss, item="plan")
     dc = sub.add_parser("discuss", parents=[common], help="open a Claude Code session preloaded with a ticket's context"); dc.add_argument("item"); dc.add_argument("--print-only", action="store_true"); dc.set_defaults(fn=cmd_discuss)
     ui = sub.add_parser("ui", parents=[common], help="serve the Scriptorium UI on localhost (Omri's entry point)")
     ui.add_argument("--port", type=int, default=8765); ui.add_argument("--no-browser", action="store_true"); ui.add_argument("--child", action="store_true", help=argparse.SUPPRESS); ui.set_defaults(fn=cmd_ui)
@@ -607,7 +608,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
 MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire",
-            "spawn", "launch", "chore", "update", "migrate", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config"}
+            "spawn", "launch", "chore", "update", "migrate", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan"}
 
 
 def main(argv=None):

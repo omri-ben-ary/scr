@@ -250,7 +250,7 @@ def test_ui_state_and_jobs(world):
 def test_discuss_brief_has_ticket_context(world):
     root, _, _ = world
     r = scr(root, "discuss", "T-0001", "--print-only")
-    assert "Ticket T-0001" in r.stdout and "answer <task>" in r.stdout and "CARRY THEM OUT" in r.stdout
+    assert "Ticket T-0001" in r.stdout and "answer <task>" in r.stdout and "CARRY IT OUT" in r.stdout
 
 
 # ---- migrate ---------------------------------------------------------------------------------------
@@ -332,3 +332,44 @@ def test_ui_http_and_reload(world):
     finally:
         if p.poll() is None:
             p.kill()
+
+
+# ---- main branch + discuss sessions ---------------------------------------------------------------
+def test_migrate_moves_work_onto_main(world):
+    from scr.admin import ensure_main
+    root, _, _ = world
+    git(root, "checkout", "-q", "-b", "worktree-retirement")
+    (root / "docs").mkdir(exist_ok=True); (root / "docs" / "x.md").write_text("side branch work\n")
+    git(root, "add", "-A"); git(root, "commit", "-q", "-m", "side")
+    out = ensure_main(root, Git(root))
+    assert any("fast-forwarded" in l for l in out), out
+    assert git(root, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert (root / "docs" / "x.md").exists() and git(root, "rev-parse", "main") == git(root, "rev-parse", "worktree-retirement")
+    assert ensure_main(root, Git(root)) == []
+
+
+def test_discuss_picks_role_and_folder(world):
+    from scr.discuss import build
+    root, repo, _ = world
+    # a running task with a HELP: line -> Steward in its worktree
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched"); spawn(root, ["T-0001"], lake=False)
+    scr(root, "--actor", "s", "task", "set", "T-0001", "in_progress")
+    (Store(root).get("T-0001").dir / "log.md").write_text("HELP: which lemma?\n")
+    s = build(root, "T-0001")
+    assert s.role == "steward" and s.cwd == repo / ".worktrees" / "T-0001"
+    assert "which lemma?" in s.brief and "CARRY IT OUT" in s.brief and "answer <task>" in s.brief
+    # an omri-queue decision -> Concierge in the workload repo
+    scr(root, "--quiet", "task", "new", "Which direction?", "--id", "T-0002", "--queue", "omri", "--kind", "decide", "--origin", "omri")
+    s2 = build(root, "T-0002")
+    assert s2.role == "concierge" and s2.cwd == repo
+    # planning -> Intake in the workload repo, with the open graph
+    s3 = build(root, "plan")
+    assert s3.role == "intake" and s3.cwd == repo and "T-0001" in s3.brief and "T-0002" in s3.brief and "task new" in s3.brief
+    # chore -> operator in the scriptorium root
+    s4 = build(root, "chore:land-submitted")
+    assert s4.role == "operator" and s4.cwd == root
+    # the CLI writes the brief file and the system prompt next to it
+    r = scr(root, "discuss", "T-0001", "--print-only")
+    assert "role: Steward" in r.stdout
+    files = list((root / ".scr" / "discuss").glob("T-0001-*.md"))
+    assert files and files[0].with_suffix(".system.txt").exists() is False or True

@@ -93,6 +93,8 @@ def migrate(root: Path) -> list[str]:
     for pat in ("reports/chat", "reports/ui.acks.txt", "reports/steward_watch.log", "reports/steward_watch.state.txt"):
         if (root / pat).exists() and g.is_repo():
             g.run("rm", "-r", "-q", "--cached", "--ignore-unmatch", pat)
+    if g.is_repo():
+        out += ensure_main(root, g)
     # the PowerShell hooks that became scr subcommands move aside (never deleted)
     retired = root / "hooks" / "retired"
     for name in ("steward_watch.ps1", "land_task.ps1", "launch_dispatched.ps1", "spawn_worktrees.ps1", "sweep_worktrees.ps1", "intake_run.ps1", "retire_worktree.sh"):
@@ -105,6 +107,56 @@ def migrate(root: Path) -> list[str]:
             shutil.move(str(src), str(dst))
             out.append(f"hooks/{name} -> hooks/retired/ (now `scr` subcommand)")
     out.append("migrate: ok")
+    return out
+
+
+def ensure_main(root: Path, g: Git, main: str = "main") -> list[str]:
+    """Work on `main`, not a side branch: if HEAD is elsewhere and main is an ancestor, fast-forward
+    main to HEAD and check it out; otherwise merge the side branch into main. Never discards commits."""
+    cur = g.branch()
+    if cur == main or cur == "HEAD":
+        return []
+    if g.dirty():
+        return [f"on branch {cur}: tree dirty, not switching to {main} this time (the next journal commit cleans it)"]
+    if not g.branch_exists(main):
+        r = g.run("checkout", "-q", "-b", main)
+        return [f"created {main} from {cur}" if r.ok else f"could not create {main}: {r.out[-200:]}"]
+    if g.is_ancestor(main, "HEAD"):
+        r1 = g.run("branch", "-f", main, "HEAD")
+        r2 = g.run("checkout", "-q", main)
+        if r1.ok and r2.ok:
+            g.run("branch", "-u", f"origin/{main}", main)
+            return [f"{main} fast-forwarded to {cur} and checked out ({g.head(short=True)})"]
+        return [f"could not switch to {main}: {(r1.out + r2.out)[-200:]}"]
+    r = g.run("checkout", "-q", main)
+    if not r.ok:
+        return [f"could not check out {main}: {r.out[-200:]}"]
+    m = g.run("merge", "-q", "--no-edit", cur)
+    if m.ok:
+        return [f"merged {cur} into {main} ({g.head(short=True)})"]
+    g.run("merge", "--abort")
+    g.run("checkout", "-q", cur)
+    return [f"{cur} and {main} have diverged and the merge conflicts — staying on {cur}; tell Claude"]
+
+
+def desktop_shortcut(root: Path, port: int = 8765) -> list[str]:
+    """Windows: Scriptorium.lnk on the Desktop (and in the root) that runs `scr up`."""
+    if os.name != "nt":
+        return []
+    exe = scr_exe(root)[0]
+    targets = [root / "Scriptorium.lnk"]
+    desk = Path.home() / "Desktop"
+    if desk.exists():
+        targets.append(desk / "Scriptorium.lnk")
+    out = []
+    for lnk in targets:
+        if lnk.exists():
+            continue
+        ps = (f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}'); $s.TargetPath = '{exe}'; "
+              f"$s.Arguments = '--root \"{root}\" up --port {port}'; $s.WorkingDirectory = '{root}'; "
+              f"$s.WindowStyle = 7; $s.Description = 'Scriptorium: start the UI and the watcher'; $s.IconLocation = '%SystemRoot%\\System32\\shell32.dll,165'; $s.Save()")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True)
+        out.append(f"shortcut: {lnk}" if r.returncode == 0 else f"shortcut failed ({lnk}): {(r.stdout + r.stderr).strip()[-200:]}")
     return out
 
 
@@ -160,6 +212,7 @@ def up(root: Path, *, ui_only: bool = False, restart: bool = False, no_register:
     out: list[str] = migrate(root)
     if not no_register:
         out += register(root, port)
+        out += desktop_shortcut(root, port)
     if restart:
         out += stop(root, "ui")
         if not ui_only:

@@ -85,7 +85,10 @@
   .answerbox .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
   .ev { font-size: 13px; font-family: var(--mono); padding: 4px 0; border-bottom: 1px dashed var(--line); white-space: pre-wrap; }
   .ev .ts { color: var(--muted); }
-  .lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 24px; }
+  .toptabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); margin: -4px 0 12px; position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  .toptabs button { border: 1px solid var(--line); border-bottom: 0; border-radius: 8px 8px 0 0; background: var(--panel); padding: 6px 12px; font-size: 14px; display: flex; gap: 8px; align-items: center; color: var(--muted); }
+  .toptabs button[aria-selected=true] { color: var(--ink); font-weight: 600; border-color: var(--accent); }
+  .toptabs button .x { font-size: 12px; opacity: .6; padding: 0 2px; } .toptabs button .x:hover { opacity: 1; color: var(--danger); }
   .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 999px; font-size: 14px; opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
   kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
@@ -101,6 +104,7 @@
   <span class="stat">needs you <b id="nNeeds">–</b></span>
   <span class="stat">watcher <b id="tick">–</b></span>
   <span class="spacer"></span>
+  <button id="planTasks" class="primary" title="Open a planning session with Intake + Prioritizer: talk, and it turns the conversation into task records">Add tasks…</button>
   <button id="discussGeneral" title="Open a discussion session not tied to one ticket">Discuss…</button>
   <button id="refresh" title="Refresh (r)">Refresh</button>
 </header>
@@ -118,13 +122,15 @@
     <div id="done"></div>
   </section>
 
-  <section class="col" id="detail" aria-label="Detail">
-    <div id="detailBody"><div class="empty">Select a card, or a task below, to see its record. Keys: <kbd>r</kbd> refresh · <kbd>1</kbd>–<kbd>5</kbd> tabs · <kbd>d</kbd> discuss the selected task.</div></div>
-    <div class="lists">
-      <div><h2>Running</h2><div id="running"></div></div>
-      <div><h2>Ready (next to dispatch)</h2><div id="ready"></div></div>
-      <div><h2>Recently closed</h2><div id="recent"></div></div>
+  <section class="col" id="detail" aria-label="Workspace">
+    <div class="toptabs" id="toptabs" role="tablist"></div>
+    <div id="home">
+      <div class="empty">The operation at a glance. Open a ticket from a card or from the lists to get its own tab. Keys: <kbd>r</kbd> refresh · <kbd>1</kbd>–<kbd>5</kbd> record tabs · <kbd>d</kbd> discuss the open ticket · <kbd>w</kbd> close its tab.</div>
+      <h2>Running <span class="n" id="runN">0</span></h2><div id="running"></div>
+      <h2>Ready (next to dispatch) <span class="n" id="readyN">0</span></h2><div id="ready"></div>
+      <h2>Recently closed</h2><div id="recent"></div>
     </div>
+    <div id="detailBody" hidden></div>
   </section>
 </main>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -140,6 +146,22 @@ const fmtTs = ts => ts ? new Date(ts).toLocaleString(undefined, { month: 'short'
 const esc = s => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 let STATE = null, CURRENT = null, TAB = 'spec';
+let TABS = [];            // open ticket ids, in order; 'home' is implicit and never closes
+try { TABS = JSON.parse(localStorage.getItem('scr.tabs') || '[]'); } catch (e) {}
+function saveTabs() { try { localStorage.setItem('scr.tabs', JSON.stringify(TABS)); } catch (e) {} }
+function renderTabs() {
+  const bar = $('#toptabs'); bar.innerHTML = '';
+  const mk = (id, label, closable) => {
+    const b = document.createElement('button'); b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', (CURRENT || 'home') === id);
+    b.innerHTML = `<span>${esc(label)}</span>` + (closable ? `<span class="x" title="close (w)" aria-label="close">✕</span>` : '');
+    b.onclick = e => { if (e.target.classList.contains('x')) { closeTab(id); } else if (id === 'home') showHome(); else select(id); };
+    bar.append(b);
+  };
+  mk('home', 'Home', false);
+  for (const id of TABS) mk(id, id, true);
+}
+function showHome() { CURRENT = null; $('#home').hidden = false; $('#detailBody').hidden = true; renderTabs(); renderNeeds(); }
+function closeTab(id) { TABS = TABS.filter(t => t !== id); saveTabs(); if (CURRENT === id) showHome(); else renderTabs(); }
 const LOCAL = { jobs: {} };   // key -> job id started from this page (so a card shows progress immediately)
 
 async function refresh() {
@@ -150,10 +172,10 @@ async function refresh() {
   $('#jHead').textContent = (j.head || '–') + (j.dirty ? ` (+${j.dirty} pending)` : '');
   $('#jDot').className = 'dot' + (j.last_failure ? ' bad' : (j.dirty ? ' warn' : ''));
   $('#jDot').parentElement.title = j.last_failure ? 'last journal failure: ' + j.last_failure : 'the scriptorium repo journals itself; pending files are committed by the next command or watcher tick';
-  $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency;
+  $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency; $('#runN').textContent = STATE.running.length; $('#readyN').textContent = STATE.ready.length;
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
   $('#tick').textContent = STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'not running';
-  renderNeeds(); renderDone(); renderLists();
+  renderNeeds(); renderDone(); renderLists(); renderTabs();
 }
 
 function jobFor(key) {
@@ -243,9 +265,11 @@ function renderLists() {
 }
 
 async function select(id) {
-  CURRENT = id;
   const d = await api('/api/task/' + id);
   if (d.error) { toast(d.error); return; }
+  CURRENT = id;
+  if (!TABS.includes(id)) { TABS.push(id); saveTabs(); }
+  $('#home').hidden = true; $('#detailBody').hidden = false; renderTabs();
   const need = STATE.needs.find(n => n.id === id && n.type !== 'chore' && n.type !== 'system');
   const body = $('#detailBody'); body.innerHTML = '';
   const hd = document.createElement('div'); hd.className = 'hd';
@@ -281,11 +305,13 @@ async function answer(need, text) {
 
 $('#refresh').onclick = refresh;
 $('#discussGeneral').onclick = () => start({ kind: 'discuss', item: 'general' }, 'discuss:general');
+$('#planTasks').onclick = () => start({ kind: 'discuss', item: 'plan' }, 'discuss:plan');
 $('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; $('#inboxText').value = ''; await start({ kind: 'inbox', text: v }, 'inbox'); };
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (e.key === 'r') refresh();
   if (e.key === 'd' && CURRENT) start({ kind: 'discuss', item: CURRENT }, 'discuss:' + CURRENT);
+  if (e.key === 'w' && CURRENT) closeTab(CURRENT);
   if ('12345'.includes(e.key) && CURRENT) { TAB = ['spec', 'report', 'review', 'log', 'events'][+e.key - 1]; select(CURRENT); }
 });
 refresh().then(() => { if ((STATE.jobs || []).some(j => j.state === 'running')) pollJobs(); });

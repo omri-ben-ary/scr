@@ -357,18 +357,3 @@ def land_all_submitted(root: Path) -> list[str]:
             out.append(f"{t.id}: failed: {e}")
     return out or ["nothing submitted or accepted"]
 
-
-def create_trusted_branch(root: Path) -> list[str]:
-    wl = workload(root)
-    if not wl.trusted:
-        return ["no trusted_branch in config/workloads.yaml"]
-    g = Git(wl.repo)
-    g.fetch()
-    if not g.branch_exists(wl.trusted):
-        base = f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
-        r = g.run("branch", wl.trusted, base)
-        if not r.ok:
-            return [f"branch failed: {r.out}"]
-    r = g.push(wl.trusted)
-    _log(root).append("system", name="trusted_branch", actor="omri", note=f"{wl.trusted} pushed" if r.ok else f"push failed: {r.out[-200:]}")
-    return [f"{wl.trusted}: " + ("pushed" if r.ok else "push failed: " + r.out[-300:])]
