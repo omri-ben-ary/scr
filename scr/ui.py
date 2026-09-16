@@ -148,13 +148,38 @@ def state(root: Path) -> dict:
         if t.status == "escalated" or (t.status == "omri_queue" and rec.get("queue") == "scribers"):
             needs.append({"key": f"gate:{t.id}", "id": t.id, "kind": "gate", "title": rec.get("title", ""), "status": t.status,
                           "type": "gate", "options": ["accept", "return", "reject"], "text": "escalated by the Steward — see review.md"})
-    for e in _events(root, None, 600):
+    # System alarms: ONE card per (task, alarm kind), not one per event — a watcher that logs per file can
+    # otherwise produce hundreds of cards (583 on 2026-09-16). A card's key `events:<task>:<name>:<latest ts>`
+    # acks every event of that task and kind up to that timestamp in one click; old per-event acks
+    # (`event:<hash>` lines) still count.
+    group_acked: dict[tuple[str, str], str] = {}
+    for k in acked:
+        if k.startswith("events:"):
+            parts = k.split(":", 3)
+            if len(parts) == 4:
+                group_acked[(parts[1], parts[2])] = max(group_acked.get((parts[1], parts[2]), ""), parts[3])
+    groups: dict[tuple[str, str], dict] = {}
+    for e in _events(root, None, 2000):
         age = _age_h(e.get("ts"))
         if age is not None and age > 24 * 7:
             continue
-        if e.get("kind") == "system" and e.get("name") in {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped"} and e.get("h") not in acked:
-            needs.append({"key": f"event:{e.get('h')}", "id": e.get("task") or "-", "kind": "system", "title": e.get("name"), "type": "system",
-                          "text": e.get("note") or json.dumps(e.get("data") or {}), "ts": e.get("ts"), "options": [], "h": e.get("h")})
+        if e.get("kind") != "system" or e.get("name") not in {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped"}:
+            continue
+        task, name, ts = e.get("task") or "-", e.get("name"), e.get("ts") or ""
+        if e.get("h") in acked or ts <= group_acked.get((task, name), ""):
+            continue
+        grp = groups.setdefault((task, name), {"id": task, "kind": "system", "title": name, "type": "system", "options": [], "ts": ts, "count": 0, "notes": []})
+        grp["count"] += 1
+        grp["ts"] = max(grp["ts"], ts)
+        grp["notes"].append(e.get("note") or json.dumps(e.get("data") or {}))
+    for (task, name), grp in groups.items():
+        notes = grp.pop("notes")
+        shown = notes[-8:]
+        grp["text"] = "\n".join(shown) + (f"\n… and {len(notes) - len(shown)} earlier" if len(notes) > len(shown) else "")
+        if grp["count"] > 1:
+            grp["title"] = f"{name} ×{grp['count']}"
+        grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"
+        needs.append(grp)
     needs += chore_cards(root, acked)
     running = [{"id": t.id, "status": t.status, "title": t.rec.get("title", ""), "kind": t.rec.get("kind"),
                 "attempts": t.rec.get("attempts", 0), "tokens": t.rec.get("tokens_used", 0), "started": _started(root, t.id)}

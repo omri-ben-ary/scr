@@ -152,16 +152,23 @@ class Watcher:
                     except Exception as e:  # noqa: BLE001 — a checkpoint failure must not stop the tick
                         self.log(f"{t.id} checkpoint commit failed: {e}")
                         self.needs.append(f"{t.id} checkpoint commit failed: {str(e)[-200:]}")
-                changed = [p for p in Git(wt).dirty() if not p.startswith((".loopy/", "missions/LOOPY/runs/"))]
-                # after a checkpoint commit the tree is clean; drift is judged on the branch's diff to main instead
+                g = Git(wt)
+                changed = [p for p in g.dirty() if not p.startswith((".loopy/", "missions/LOOPY/runs/"))]
+                # After a checkpoint commit the tree is clean, so drift is the branch's OWN commits: its diff to
+                # the merge-base with the branch it was spawned from, origin/<main> (ops.spawn uses the same
+                # rule). Never the local main: that can sit far behind origin and then every file merged since
+                # looks like drift (2026-09-16: 465 false files on T-0029 -> 583 alarm cards).
                 if not changed:
-                    r = Git(wt).run("diff", "--name-only", f"{self.wl.main}...HEAD")
+                    base = f"origin/{self.wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{self.wl.main}") else self.wl.main
+                    r = g.run("diff", "--name-only", f"{base}...HEAD")
                     changed = [l.strip() for l in r.out.splitlines() if l.strip()] if r.ok else []
                 drift = [p for p in changed if scope and not in_scope(p, scope)]
-                for p in drift:
-                    if self.flag(f"drift:{t.id}:{p}"):
-                        self.log(f"{t.id} SCOPE DRIFT: {p}")
-                        self.scr(f"steward:{t.id}", "event", "system", "--name", "scope_drift", "--task", t.id, "--note", p, "--quiet")
+                new = [p for p in drift if self.flag(f"drift:{t.id}:{p}")]
+                if new:
+                    # ONE event per task per tick, listing the files (the UI shows one card per task and kind)
+                    self.log(f"{t.id} SCOPE DRIFT: {', '.join(new)}")
+                    note = ", ".join(new[:12]) + (f" (+{len(new) - 12} more)" if len(new) > 12 else "")
+                    self.scr(f"steward:{t.id}", "event", "system", "--name", "scope_drift", "--task", t.id, "--note", note[:900], "--quiet")
                 if drift:
                     flags.append(f"drift:{len(drift)}")
             else:
