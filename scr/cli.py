@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,22 +15,13 @@ import yaml
 from . import lifecycle
 from .canon import ZERO
 from .events import EventLog, now_iso
+from .journal import journal
+from .brief import brief_for
 from .graph import Graph
 from .queue import write_queues
 from .score import rank_ready, score_task
 from .state import State
 from .store import KINDS, QUEUES, RepoError, Store, find_root
-
-HOOK = """#!/bin/sh
-# scriptorium pre-commit: refresh derived views + snapshot, then verify.
-# Uses the interpreter that ran `scr install-hooks`, so a venv need not be active.
-set -e
-PY="{python}"
-"$PY" -m scr refresh --quiet
-git add state/STATE.json graph/graph.json queues/scribers.md queues/omri.md 2>/dev/null || true
-"$PY" -m scr verify --quiet
-"""
-
 
 def _ctx(args) -> tuple[Path, Store, EventLog]:
     root = find_root(Path(args.root) if getattr(args, "root", None) else None)
@@ -127,30 +119,9 @@ def cmd_task_set(args):
     refresh(root, args.quiet)
 
 
-BRIEF_TEMPLATE = """Use the scriber agent. This is Scriptorium task {id}: {title}
-Your brief is {spec} — read it in full; its Scope and Definition of done are binding, and anything
-outside Scope is read-only. Work only inside this worktree ({worktree}); never commit, never switch
-branch. Keep an honest run log in {log} (append-only; put any question for the Steward on a line
-starting `HELP:` and keep working on what does not depend on it). When done, write {report} using the
-template already there — fill "Statement changes" truthfully (any entry routes to Gate 1) and the
-`unlocks` block. Budget: {attempts} attempt(s), {tokens:,} tokens, {hours} h wall.{stmt}"""
-
-
 def cmd_task_brief(args):
     root, store, log = _ctx(args)
-    t = store.get(args.id)
-    d = t.dir
-    wl = (store.config("workloads") or {}).get(t.rec.get("workload") or "", {})
-    wt = t.rec.get("worktree") or f"{wl.get('worktrees', '../worktrees')}/{t.id}"
-    wt_abs = (root / wt).resolve()
-    b = t.rec.get("budget") or {}
-    stmt = ("\n\nThis task may need NEW or CHANGED statements (may_touch_statements: true). Freeze them in the "
-            "mission's TARGETS.md and HALT there once for Omri's approval (Gate 1) before proving anything."
-            if (t.rec.get("scope") or {}).get("may_touch_statements") else "")
-    print(BRIEF_TEMPLATE.format(
-        id=t.id, title=t.rec.get("title", ""), spec=(d / "spec.md").resolve(), worktree=wt_abs,
-        log=(d / "log.md").resolve(), report=(d / "report.md").resolve(),
-        attempts=b.get("max_attempts", 3), tokens=int(b.get("max_tokens", 0)), hours=b.get("max_wall_hours", 6), stmt=stmt))
+    print(brief_for(root, store, store.get(args.id)))
 
 
 def cmd_task_field(args):
@@ -349,22 +320,185 @@ def cmd_diff(args):
     _out(st.diff(load(args.a), load(args.b)), args.json)
 
 
-def cmd_install_hooks(args):
+def _print(lines):
+    for l in (lines if isinstance(lines, list) else [lines]):
+        print(l)
+
+
+def cmd_land(args):
     root, _, _ = _ctx(args)
-    hooks = root / ".git" / "hooks"
-    if not hooks.exists():
-        raise RepoError("not a git repo (run git init first)")
-    p = hooks / "pre-commit"
-    py = Path(sys.executable).as_posix()   # forward slashes work in Git Bash on Windows too
-    p.write_text(HOOK.replace("{python}", py), encoding="utf-8")
-    p.chmod(0o755)
-    print(f"installed {p}")
+    from .ops import land
+    r = land(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
+    _print(r["out"])
+    if not r["ok"]:
+        sys.exit(1)
+
+
+def cmd_sweep(args):
+    root, _, _ = _ctx(args)
+    from .ops import sweep
+    rows = sweep(root, merge=args.merge, dry_run=args.dry_run)
+    if args.json:
+        _out(rows, True); return
+    for r in rows:
+        print(f"=== {r['worktree']} ({r['branch']}): {r['files']} uncommitted file(s)" + (f" -> {r['sha']}" if r["sha"] else "") + (f" PR {r['url']}" if r["url"] else ""))
+        for f in r["sample"]:
+            print(f"  {f}")
+        if r["note"]:
+            print(f"  {r['note']}")
+    print("sweep: nothing to do" if not rows else f"sweep: {len(rows)} worktree(s)" + (" (dry run)" if args.dry_run else ""))
+    if any(not r["ok"] for r in rows):
+        sys.exit(1)
+
+
+def cmd_park(args):
+    root, _, _ = _ctx(args)
+    from .ops import park
+    _print(park(root, args.id, args.note or "parked", actor=args.actor))
+
+
+def cmd_retire(args):
+    root, _, _ = _ctx(args)
+    from .ops import retire
+    r = retire(root, args.name, execute=args.execute)
+    _print(r["out"])
+    sys.exit(0 if r["ok"] else r["code"])
+
+
+def cmd_spawn(args):
+    root, _, _ = _ctx(args)
+    from .ops import spawn
+    _print(spawn(root, args.tasks or None, lake=(False if args.no_lake else None)))
+
+
+def cmd_launch(args):
+    root, _, _ = _ctx(args)
+    from .launch import launch
+    _print(launch(root, args.tasks or None, mode=args.mode, permission_mode=args.permission_mode, model=args.model, relaunch=args.relaunch, dry_run=args.dry_run))
+
+
+def cmd_intake(args):
+    root, _, _ = _ctx(args)
+    from .launch import intake
+    _print(intake(root, dry_run=args.dry_run))
+
+
+def cmd_checkpoint(args):
+    root, _, _ = _ctx(args)
+    from .ops import checkpoint_commit
+    sha = checkpoint_commit(root, args.id, push=args.push)
+    print(f"{args.id}: checkpoint {sha}" if sha else f"{args.id}: nothing to checkpoint")
+
+
+def cmd_watch(args):
+    root, _, _ = _ctx(args)
+    from .watch import Watcher
+    store = Store(root)
+    interval = args.interval or int((store.config("limits") or {}).get("checkpoint_every_minutes", 30))
+    un = args.unattended
+    w = Watcher(root, stale_minutes=args.stale, auto_review=un or args.auto_review, auto_decide=un or args.auto_decide,
+                auto_dispatch=un or args.auto_dispatch, allow_statements=args.allow_statements, auto_land=un or args.auto_land,
+                auto_intake=un or args.auto_intake, permission_mode=args.permission_mode, push=args.push, quiet=args.quiet)
+    w.loop(interval, once=args.once)
+
+
+def cmd_chore(args):
+    root, _, _ = _ctx(args)
+    from . import chores
+    if args.op == "list":
+        acked = set((root / "reports" / "ui.acks.txt").read_text(encoding="utf-8").split()) if (root / "reports" / "ui.acks.txt").exists() else set()
+        for c in chores.status(root, acked):
+            print(f"{c['id']:24} {'(manual) ' if c['manual'] else ''}{c['title']}")
+    elif args.op == "run":
+        if not args.id:
+            raise RepoError("chore run needs an id")
+        r = chores.run(root, args.id, actor=args.actor)
+        print(r["output"]); print("DONE" if r["done"] else "NOT DONE")
+        sys.exit(0 if r["done"] else 1)
+    elif args.op == "check":
+        c = next((x for x in chores.load(root) if x["id"] == args.id), None)
+        print("done" if c and chores.check(root, c.get("done")) else "not done")
+
+
+def cmd_update(args):
+    root, _, _ = _ctx(args)
+    from .admin import update
+    _print(update(root, Path(args.bundle), actor=args.actor))
+
+
+def cmd_migrate(args):
+    root, _, _ = _ctx(args)
+    from .admin import migrate
+    _print(migrate(root))
+
+
+def cmd_up(args):
+    root, _, _ = _ctx(args)
+    from .admin import up, stop
+    if args.stop:
+        _print(stop(root, "ui") + stop(root, "watch")); return
+    _print(up(root, ui_only=args.ui_only, restart=args.restart, no_register=args.no_register, port=args.port, open_browser=not args.no_browser))
+
+
+def cmd_discuss(args):
+    root, _, _ = _ctx(args)
+    from .discuss import discuss
+    _print(discuss(root, args.item, open_terminal=not args.print_only))
+
+
+def cmd_config(args):
+    root, store, log = _ctx(args)
+    p = root / "config" / f"{args.file}.yaml"
+    if not p.exists():
+        raise RepoError(f"no config/{args.file}.yaml")
+    txt = p.read_text(encoding="utf-8")
+    val = yaml.safe_load(args.value)
+    rx = re.compile(rf"(?m)^{re.escape(args.key)}:[^#\n]*(#[^\n]*)?$")
+    if rx.search(txt):
+        txt = rx.sub(lambda m: f"{args.key}: {val}" + (f"   {m.group(1)}" if m.group(1) else ""), txt, count=1)
+    else:
+        txt = txt.rstrip("\n") + f"\n{args.key}: {val}\n"
+    p.write_text(txt, encoding="utf-8")
+    log.append("system", name="system_change", actor=args.actor, note=args.note or f"{args.file}.{args.key} = {val}", data={"file": args.file, "key": args.key, "value": val})
+    print(f"{args.file}.{args.key} = {val}")
+    refresh(root, args.quiet)
+
+
+def cmd_answer(args):
+    root, _, _ = _ctx(args)
+    from .answers import apply
+    r = apply(root, args.id, args.text, args.kind, actor=args.actor, concierge=not args.no_concierge)
+    _print(r["log"])
+
+
+def cmd_inbox(args):
+    root, _, _ = _ctx(args)
+    from .answers import add_inbox
+    add_inbox(root, args.text, actor=args.actor)
+    print("added to Inbox")
+
+
+def cmd_ack(args):
+    root, _, _ = _ctx(args)
+    p = root / "reports" / "ui.acks.txt"
+    p.parent.mkdir(exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(args.key + "\n")
+    EventLog(root / "events" / "events.jsonl").append("system", name="ack", actor=args.actor, note=args.key)
+    print(f"acknowledged {args.key}")
+
+
+def cmd_journal(args):
+    root, _, _ = _ctx(args)
+    sha = journal(root, args.actor, args.note, push=args.push)
+    if not args.quiet:
+        print(f"journaled {sha}" if sha else "nothing to journal")
 
 
 def cmd_ui(args):
     from .ui import serve
     root, _, _ = _ctx(args)
-    serve(root, args.port, not args.no_browser)
+    serve(root, args.port, not args.no_browser, child=args.child)
 
 
 def cmd_checkin(args):
@@ -381,6 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--actor", default=argparse.SUPPRESS if sup else "omri", help="who is acting (omri | intake | prioritizer | steward:<id> | concierge | observer | scriber:<id>)")
         parser.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS if sup else False)
         parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS if sup else False, help="JSON output where applicable")
+        parser.add_argument("--no-journal", action="store_true", default=argparse.SUPPRESS if sup else False, help="do not auto-commit the scriptorium tree after this command")
 
     p = argparse.ArgumentParser(prog="scr", description="Scriptorium: git-backed task queues, dependency graph, hashed state.")
     globals_(p, False)
@@ -433,19 +568,73 @@ def build_parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("replay", parents=[common], help="derived state from the event log"); rp.add_argument("--task"); rp.set_defaults(fn=cmd_replay)
     h = sub.add_parser("history", parents=[common], help="snapshot chain across git commits"); h.add_argument("-n", type=int, default=20); h.set_defaults(fn=cmd_history)
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)
-    sub.add_parser("install-hooks", parents=[common], help="pre-commit: refresh + verify").set_defaults(fn=cmd_install_hooks)
+    j = sub.add_parser("journal", parents=[common], help="commit the scriptorium tree if dirty (journal mode; every mutating command does this itself)")
+    j.add_argument("--note", default="journal"); j.add_argument("--push", action="store_true"); j.set_defaults(fn=cmd_journal)
+    ld = sub.add_parser("land", parents=[common], help="commit + push a task's worktree, open its PR (--merge: merge and mark merged)")
+    ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true"); ld.set_defaults(fn=cmd_land)
+    sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
+    sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true"); sw.set_defaults(fn=cmd_sweep)
+    pk = sub.add_parser("park", parents=[common], help="returned -> escalated -> omri_queue"); pk.add_argument("id"); pk.add_argument("--note"); pk.set_defaults(fn=cmd_park)
+    rt = sub.add_parser("retire", parents=[common], help="quarantine a merged worktree (move, never delete)"); rt.add_argument("name"); rt.add_argument("--execute", action="store_true"); rt.set_defaults(fn=cmd_retire)
+    sp = sub.add_parser("spawn", parents=[common], help="worktree per dispatched task from origin/<main>"); sp.add_argument("--tasks", nargs="*"); sp.add_argument("--no-lake", action="store_true"); sp.set_defaults(fn=cmd_spawn)
+    la = sub.add_parser("launch", parents=[common], help="start scriber sessions for dispatched tasks")
+    la.add_argument("--tasks", nargs="*"); la.add_argument("--mode", choices=["headless", "tabs"], default="headless"); la.add_argument("--permission-mode", default="bypassPermissions")
+    la.add_argument("--model"); la.add_argument("--relaunch", action="store_true"); la.add_argument("--dry-run", action="store_true"); la.set_defaults(fn=cmd_launch)
+    ik = sub.add_parser("intake", parents=[common], help="run the Intake agent once (headless)"); ik.add_argument("--dry-run", action="store_true"); ik.set_defaults(fn=cmd_intake)
+    ck = sub.add_parser("checkpoint", parents=[common], help="commit a running task's worktree on its branch"); ck.add_argument("id"); ck.add_argument("--push", action="store_true"); ck.set_defaults(fn=cmd_checkpoint)
+    w = sub.add_parser("watch", parents=[common], help="the Steward's mechanical loop (--once for a single tick)")
+    w.add_argument("--once", action="store_true"); w.add_argument("--interval", type=int, default=0); w.add_argument("--stale", type=int, default=45)
+    for flag in ("auto-review", "auto-decide", "auto-dispatch", "allow-statements", "auto-land", "auto-intake", "unattended", "push"):
+        w.add_argument("--" + flag, action="store_true")
+    w.add_argument("--permission-mode", default="acceptEdits"); w.set_defaults(fn=cmd_watch)
+    ch = sub.add_parser("chore", parents=[common], help="chores from ui/chores.yaml"); ch.add_argument("op", choices=["list", "run", "check"]); ch.add_argument("id", nargs="?"); ch.set_defaults(fn=cmd_chore)
+    upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
+    sub.add_parser("migrate", parents=[common], help="bring this checkout to journal mode (idempotent)").set_defaults(fn=cmd_migrate)
+    upp = sub.add_parser("up", parents=[common], help="start (and register at logon) the UI and the watcher")
+    upp.add_argument("--ui-only", action="store_true"); upp.add_argument("--restart", action="store_true"); upp.add_argument("--no-register", action="store_true")
+    upp.add_argument("--stop", action="store_true"); upp.add_argument("--port", type=int, default=8765); upp.add_argument("--no-browser", action="store_true"); upp.set_defaults(fn=cmd_up)
+    cf = sub.add_parser("config", parents=[common], help="set a top-level key in config/<file>.yaml (logged as system_change)")
+    cf.add_argument("op", choices=["set"]); cf.add_argument("file"); cf.add_argument("key"); cf.add_argument("value"); cf.add_argument("--note"); cf.set_defaults(fn=cmd_config)
+    an = sub.add_parser("answer", parents=[common], help="record Omri's answer to a decision / HELP / gate item (and run the Concierge)")
+    an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
+    ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
+    ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
+    dc = sub.add_parser("discuss", parents=[common], help="open a Claude Code session preloaded with a ticket's context"); dc.add_argument("item"); dc.add_argument("--print-only", action="store_true"); dc.set_defaults(fn=cmd_discuss)
     ui = sub.add_parser("ui", parents=[common], help="serve the Scriptorium UI on localhost (Omri's entry point)")
-    ui.add_argument("--port", type=int, default=8765); ui.add_argument("--no-browser", action="store_true"); ui.set_defaults(fn=cmd_ui)
+    ui.add_argument("--port", type=int, default=8765); ui.add_argument("--no-browser", action="store_true"); ui.add_argument("--child", action="store_true", help=argparse.SUPPRESS); ui.set_defaults(fn=cmd_ui)
     return p
 
 
+# Commands that change the tree and therefore end with a journal commit (journal mode).
+MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire",
+            "spawn", "launch", "chore", "update", "migrate", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config"}
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
     try:
         args.fn(args)
     except RepoError as e:
         print("error:", e, file=sys.stderr)
         sys.exit(2)
+    finally:
+        # journal AFTER the command, whether it succeeded or raised: a partial change is still a change
+        if args.cmd in MUTATING:
+            try:
+                root = find_root(Path(args.root) if getattr(args, "root", None) else None)
+                refresh(root, quiet=True)             # derived views always follow the records, journal or not
+                if getattr(args, "no_journal", False):
+                    raise RepoError("no journal")
+                shown, skip = [], False
+                for a in argv:                      # drop global noise; the actor is the message prefix
+                    if skip: skip = False; continue
+                    if a in ("--actor", "--root"): skip = True; continue
+                    if a in ("--quiet", "--json", "--no-journal"): continue
+                    shown.append(a)
+                journal(root, getattr(args, "actor", "scr"), " ".join(shown), force_refresh=False)
+            except RepoError:
+                pass
 
 
 if __name__ == "__main__":

@@ -10,8 +10,19 @@ artifact; `docs/hashing.md` is the verification scheme.
 
 ```sh
 uv sync                     # creates .venv with the `scr` command (Python ≥3.10, PyYAML); or: pip install -e .
-uv run scr install-hooks    # pre-commit: refresh derived views + verify (pins the venv interpreter)
+.venv\Scripts\scr.exe up    # migrate to journal mode, start the UI + watcher, register both at logon
 ```
+
+## Journal mode (nobody runs git here)
+
+The scriptorium repo commits itself. Every state-changing `scr` command (task set, event, answer,
+chore run, …) ends by refreshing the derived views and committing whatever is dirty, with the actor
+and the command in the message (`[steward:T-0025] task set T-0025 returned ...`); the watcher commits
+what scribers write to log.md/report.md every tick. `git log` is the audit trail, `scr history`
+reads the snapshot chain out of it. Concurrent callers are serialised by `.scr/journal.lock`; a
+crashed git's empty `*.lock` file is removed automatically after a minute. There is no pre-commit
+hook any more (verification happens before writes, not at commit time), and no reason to type `git`
+in this folder — if you do, the next `scr` call simply journals on top of it.
 
 ## Layout
 
@@ -56,37 +67,41 @@ actors are honest about who they are.
 
 ```sh
 scr verify && scr --actor prioritizer dispatch --allow-statements   # pick the conflict-free set (cap: limits.yaml concurrency)
-powershell -ExecutionPolicy Bypass -File hooks\launch_dispatched.ps1  # worktrees + brief + in_progress + one Claude session per task
-powershell -ExecutionPolicy Bypass -File hooks\steward_watch.ps1     # leave open: checkpoints, scope drift, HELP: lines, submissions
+scr launch [--mode tabs]        # worktrees (scr spawn) + brief + in_progress + one Claude session per task
+scr watch --once                # one Steward tick: checkpoint commits, scope drift, HELP: lines, submissions
 ```
 
 `scr task brief <id>` renders the launch prompt from the record (spec.md is the brief — never
-hand-write prompts). `launch_dispatched.ps1 -Mode headless` runs sessions detached (`claude -p`)
-for unattended nights; the default opens a Windows Terminal tab per task so you can watch.
-`steward_watch.ps1` is the mechanical half of the Steward for every running task at once; add
-`-AutoReview` to have a headless Steward session fill review.md on each submission (the
-accepted/returned/escalated decision stays yours unless `-AutoDecide`). Phase C of a Lean task
-can go through loopy: `hooks\loopy_phase_c.ps1`. Retire finished worktrees with
-`hooks\retire_worktree.sh` (quarantine, never delete).
+hand-write prompts). `scr launch` runs sessions detached (`claude -p`); `--mode tabs` opens a Windows
+Terminal tab per task so you can watch. `scr watch` is the mechanical half of the Steward for every
+running task at once; every tick it also commits each running worktree on its task branch
+(`[checkpoint]`), so nothing ever exists only in a worktree. `--auto-review` has a headless Steward
+session fill review.md on each submission (the decision stays yours unless `--auto-decide`);
+`--unattended` turns everything on. Landing is `scr land <id> --merge`; mission worktrees with
+uncommitted work are swept by `scr sweep --merge`; finished worktrees are retired (quarantined,
+never deleted) by `scr retire <name> --execute`. Phase C of a Lean task can go through loopy:
+`hooks\loopy_phase_c.ps1`. The old PowerShell hooks are under `hooks/retired/`.
 
 ## Unattended operation (the normal mode)
 
 ```
-powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1
+scr up                # (or: powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1)
+scr up --restart      # after an update; the UI also restarts itself when its code changes
 ```
 
 starts the UI at http://127.0.0.1:8765/ (your entry point: what needs you, every task's record and
-history, and an assistant that reads the records and the repo) and the watcher in `-Unattended`
-mode, and registers both at logon. Unattended = every mechanical decision is taken by the system:
-submissions are reviewed by a headless Steward (`-AutoReview`), accepted when the checks are
-mechanical and the statement diff is empty (`-AutoDecide`), landed as PRs and merged into the
-agents' `main_branch` (`-AutoLand`), Inbox lines and report `unlocks` become tasks (`-AutoIntake`),
-and the queue is refilled up to `concurrency` (`-AutoDispatch`). What still reaches you, in the UI:
+history, a Discuss button on every card that opens a Claude Code session preloaded with that ticket
+and empowered to carry out what you decide) and the watcher in `--unattended` mode, and registers
+both at logon. Updates: `scr update <bundle.zip|folder>` copies the files in and migrates. Unattended = every mechanical decision is taken by the system:
+submissions are reviewed by a headless Steward (`--auto-review`), accepted when the checks are
+mechanical and the statement diff is empty (`--auto-decide`), landed as PRs and merged into the
+agents' `main_branch` (`--auto-land`), Inbox lines and report `unlocks` become tasks (`--auto-intake`),
+and the queue is refilled up to `concurrency` (`--auto-dispatch`). What still reaches you, in the UI:
 the five gates — new/changed statements, direction decisions, stuck tasks, config changes, seeding.
 
 Branch policy: `main_branch` (master) is the agents' branch and the full history log; the
 `trusted_branch` (trusted) holds sources of truth and only you push to it (protect it on GitHub:
-require a PR + your review, restrict who can push). `hooks\sweep_worktrees.ps1 -Merge` commits and
+require a PR + your review, restrict who can push). `scr sweep --merge` commits and
 lands any uncommitted mission work so nothing exists only in a worktree.
 
 ## Lifecycle

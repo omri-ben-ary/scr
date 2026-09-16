@@ -1,0 +1,176 @@
+"""Administration: apply an update bundle, migrate a checkout to journal mode, and start/stop/register
+the two long-running services (the watcher and the UI). Python so the same code runs on Windows
+and on the cloud mirror; the only OS-specific parts are the scheduled-task registration and
+process discovery, both isolated here.
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+from .events import EventLog
+from .gitops import Git
+from .run import kill, pids_matching, scr_exe, start_detached
+
+UPDATABLE = ("scr", "ui", "hooks", "agents", "templates", "docs", "README.md", ".gitignore", "pyproject.toml", "tests")
+GITIGNORE_LINES = [
+    "__pycache__/", "*.egg-info/", ".pytest_cache/", ".venv/", ".scr/",
+    "reports/chat/", "reports/steward_watch.log", "reports/steward_watch.state.txt", "reports/ui.acks.txt",
+    "reports/concierge-*.txt", "reports/intake-*.txt", "reports/ui.log", "reports/watch.log",
+    "tasks/*/session-*.txt", "tasks/*/session-*.txt.err", "tasks/*/brief.txt", "tasks/*/review-brief.txt",
+    "tasks/*/review-session-*.txt", "tasks/*/review-session-*.txt.err", "tasks/*/commit-msg.txt", "tasks/*/pr-body.md",
+    "*.zip", "_to_delete*",
+]
+
+
+# ---- update --------------------------------------------------------------------------
+def update(root: Path, src: Path, actor: str = "omri") -> list[str]:
+    """Copy a bundle (zip or directory) over the checkout — only paths under UPDATABLE — then migrate.
+    The running UI notices its files changed and restarts itself; the watcher restarts at its next tick."""
+    out: list[str] = []
+    src = Path(src)
+    if src.is_file() and src.suffix == ".zip":
+        tmp = root / ".scr" / f"update-{datetime.now():%Y%m%d-%H%M%S}"
+        tmp.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(src) as z:
+            z.extractall(tmp)
+        # a zip may wrap everything in one top-level folder
+        entries = [p for p in tmp.iterdir() if p.name != "__MACOSX"]
+        src = entries[0] if len(entries) == 1 and entries[0].is_dir() and not (tmp / "scr").exists() else tmp
+    if not src.is_dir():
+        raise FileNotFoundError(f"no such bundle: {src}")
+    copied = 0
+    for top in UPDATABLE:
+        s = src / top
+        if not s.exists():
+            continue
+        if s.is_file():
+            shutil.copy2(s, root / top); copied += 1; continue
+        for f in s.rglob("*"):
+            if f.is_file() and "__pycache__" not in f.parts:
+                dst = root / f.relative_to(src)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dst); copied += 1
+    out.append(f"copied {copied} file(s) from {src.name}")
+    out += migrate(root)
+    EventLog(root / "events" / "events.jsonl").append("system", name="update", actor=actor, note=f"{src.name}: {copied} file(s)")
+    return out
+
+
+# ---- migrate -------------------------------------------------------------------------
+def migrate(root: Path) -> list[str]:
+    """Idempotent: bring a checkout to journal mode. Safe to run any number of times."""
+    out: list[str] = []
+    (root / ".scr").mkdir(exist_ok=True)
+    gi = root / ".gitignore"
+    have = set(gi.read_text(encoding="utf-8").splitlines()) if gi.exists() else set()
+    missing = [l for l in GITIGNORE_LINES if l not in have]
+    if missing:
+        with gi.open("a", encoding="utf-8") as f:
+            f.write("\n# journal mode working files\n" + "\n".join(missing) + "\n")
+        out.append(f".gitignore: added {len(missing)} pattern(s)")
+    hook = root / ".git" / "hooks" / "pre-commit"
+    if hook.exists() and "scriptorium pre-commit" in hook.read_text(encoding="utf-8", errors="replace"):
+        hook.rename(hook.with_name("pre-commit.disabled-by-journal-mode"))
+        out.append("pre-commit hook retired (journal mode verifies before it writes, not at commit time)")
+    g = Git(root)
+    if g.is_repo():
+        removed = g.clear_stale_locks()
+        if removed:
+            out.append("removed stale git locks: " + ", ".join(removed))
+        # git on Windows: no CRLF chatter, and identity for the journal commits if none is set
+        g.run("config", "core.safecrlf", "false")
+        if not g.has_identity():
+            g.run("config", "user.name", "scriptorium"); g.run("config", "user.email", "scriptorium@local")
+            out.append("git identity set for journal commits (scriptorium@local)")
+    # working files that the old UI tracked must leave the index (they are ignored now)
+    for pat in ("reports/chat", "reports/ui.acks.txt", "reports/steward_watch.log", "reports/steward_watch.state.txt"):
+        if (root / pat).exists() and g.is_repo():
+            g.run("rm", "-r", "-q", "--cached", "--ignore-unmatch", pat)
+    # the PowerShell hooks that became scr subcommands move aside (never deleted)
+    retired = root / "hooks" / "retired"
+    for name in ("steward_watch.ps1", "land_task.ps1", "launch_dispatched.ps1", "spawn_worktrees.ps1", "sweep_worktrees.ps1", "intake_run.ps1", "retire_worktree.sh"):
+        src = root / "hooks" / name
+        if src.exists():
+            retired.mkdir(exist_ok=True)
+            dst = retired / name
+            if dst.exists():
+                dst = retired / f"{name}.{datetime.now():%Y%m%d%H%M%S}"
+            shutil.move(str(src), str(dst))
+            out.append(f"hooks/{name} -> hooks/retired/ (now `scr` subcommand)")
+    out.append("migrate: ok")
+    return out
+
+
+# ---- services ------------------------------------------------------------------------
+# command lines look like: "<...>\\scr.exe" --root "<root>" ui --port 8765 --no-browser [--child]
+UI_PATTERN = r"scr(\.exe)?\"?(\s.*)?\sui(\s|$)"
+WATCH_PATTERN = r"scr(\.exe)?\"?(\s.*)?\swatch(\s|$)|steward_watch\.ps1"   # the second alternative is the retired PowerShell watcher
+
+
+def _pattern(p: str) -> str:
+    return p
+
+
+def stop(root: Path, what: str) -> list[str]:
+    pat = {"ui": UI_PATTERN, "watch": WATCH_PATTERN}[what]
+    out = []
+    for pid in pids_matching(_pattern(pat)):
+        kill(pid); out.append(f"stopped {what} pid {pid}")
+    return out or [f"no {what} running"]
+
+
+def start(root: Path, what: str, port: int = 8765) -> list[str]:
+    pat = {"ui": UI_PATTERN, "watch": WATCH_PATTERN}[what]
+    if pids_matching(_pattern(pat)):
+        return [f"{what} already running"]
+    (root / "reports").mkdir(exist_ok=True)
+    if what == "ui":
+        args = scr_exe(root) + ["--root", str(root), "ui", "--port", str(port), "--no-browser"]
+        log = root / "reports" / "ui.log"
+    else:
+        args = scr_exe(root) + ["--root", str(root), "watch", "--unattended", "--quiet"]
+        log = root / "reports" / "watch.log"
+    pid = start_detached(args, root, log)
+    time.sleep(1.5)
+    return [f"started {what} (pid {pid}; log {log.name})"]
+
+
+def register(root: Path, port: int = 8765) -> list[str]:
+    """Windows: two logon tasks (Scriptorium\\UI, Scriptorium\\Watcher). Elsewhere: print what to add to cron."""
+    exe = " ".join(f'"{a}"' for a in scr_exe(root))
+    ui = f'{exe} --root "{root}" ui --port {port} --no-browser'
+    watch = f'{exe} --root "{root}" watch --unattended --quiet'
+    if os.name != "nt":
+        return ["not Windows; to run at login add to your session manager:", "  " + ui, "  " + watch]
+    out = []
+    for name, cmd in (("Scriptorium\\UI", ui), ("Scriptorium\\Watcher", watch)):
+        r = subprocess.run(["schtasks", "/Create", "/F", "/TN", name, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", cmd], capture_output=True, text=True)
+        out.append(f"registered {name}" if r.returncode == 0 else f"schtasks failed for {name}: {(r.stdout + r.stderr).strip()[-200:]}")
+    return out
+
+
+def up(root: Path, *, ui_only: bool = False, restart: bool = False, no_register: bool = False, port: int = 8765, open_browser: bool = True) -> list[str]:
+    out: list[str] = migrate(root)
+    if not no_register:
+        out += register(root, port)
+    if restart:
+        out += stop(root, "ui")
+        if not ui_only:
+            out += stop(root, "watch")
+        time.sleep(1)
+    out += start(root, "ui", port)
+    if not ui_only:
+        out += start(root, "watch")
+    url = f"http://127.0.0.1:{port}/"
+    if open_browser:
+        import webbrowser
+        webbrowser.open(url)
+    out.append(f"UI: {url}")
+    return out

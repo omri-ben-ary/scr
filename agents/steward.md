@@ -20,19 +20,13 @@ You follow one task from `dispatched` to `merged`, `returned`, or `escalated`. Y
   - checks fail and attempts remain → `scr task set <id> returned --note "<feedback>"` (then `ready` so it can be redispatched).
   - statement diff non-empty, or attempts exhausted, or report has `omri:decide` → `scr task set <id> escalated` then `omri_queue`; write a one-screen brief at the top of review.md: what changed, `scr graph impact <id> --decls <changed>` output (the blast radius), your recommendation.
 - Copy the report's `informs` proposals in as edges: `scr edge add informs <from> <id> --weight w --reason "..."`.
-- Commit with `[steward:<id>]`.
+- The scriptorium tree journals itself after every `scr` call (journal mode); never run git in that folder.
 
 ## Retiring the worktree
 
-Never delete a worktree by hand. Run the workload's `retire_worktree` hook
-(reference implementation: `hooks/retire_worktree.sh`), which quarantines the
-tree instead of deleting it, after checking it is merged and backing up any
-untracked files. Full rationale: `docs/worktree-retirement.md`.
-
-```sh
-<retire_worktree> --repo <workload.repo> --worktrees <workload.worktrees> \
-    --main <workload.main_branch> --name <worktree> --execute
-```
+Never delete a worktree by hand. Run `scr retire <worktree> --execute`, which
+quarantines the tree instead of deleting it (a move into `<repo>-RETIRED/`), after
+checking it is merged. Full rationale: `docs/worktree-retirement.md`.
 
 Route its exit code like any other check:
 - **0** — retired. Note the quarantine path in review.md. Do not delete the branch and do not empty the quarantine; both are Omri's.

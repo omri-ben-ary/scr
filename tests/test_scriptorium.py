@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def scr(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    env = {**os.environ, "SCRIPTORIUM_ROOT": str(root)}
+    env = {**os.environ, "SCRIPTORIUM_ROOT": str(root), "PYTHONPATH": str(REPO), "SCR_NO_JOURNAL": os.environ.get("SCR_TEST_JOURNAL", "1")}
     return subprocess.run([sys.executable, "-m", "scr", *args], cwd=root, env=env, capture_output=True, text=True, check=check)
 
 
@@ -235,21 +235,3 @@ def test_snapshot_diff(repo: Path):
     b = st.read_snapshot()
     d = st.diff(a, b)
     assert d["tasks_changed"] == ["T-0003"] and d["graph_changed"] == [] and not d["config_changed"]
-
-
-def test_git_hook_blocks_bad_commit(repo: Path):
-    seed(repo)
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
-    scr(repo, "install-hooks")
-    env = {**os.environ, "SCRIPTORIUM_ROOT": str(repo), "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    r = subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, env=env, capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    # hand-edit a status without an event: the hook must refuse
-    t = Store(repo).get("T-0003"); t.rec["status"] = "merged"; t.save()
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    r = subprocess.run(["git", "commit", "-q", "-m", "bad"], cwd=repo, env=env, capture_output=True, text=True)
-    assert r.returncode != 0
-    assert "log replays to" in r.stdout + r.stderr

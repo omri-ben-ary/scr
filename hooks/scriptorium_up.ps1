@@ -1,39 +1,15 @@
 ﻿<#
 .SYNOPSIS
-  Start everything, once: the UI (your entry point) and the unattended watcher, and register
-  both to start at logon so a reboot does not need you.
+  Start Scriptorium: the UI (your entry point) and the unattended watcher, registered at logon.
+  Everything lives in `scr up` now; this file only exists so the old command keeps working.
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1            # start now + register at logon
-  powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1 -NoRegister
+  powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1            # start + register
+  powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1 -RestartUI  # after an update
 #>
-[CmdletBinding()]
 param([switch]$NoRegister, [switch]$NoUI, [switch]$UIOnly, [switch]$RestartUI, [int]$Port = 8765)
-$ErrorActionPreference = 'Continue'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$scr = Join-Path $Root '.venv\Scripts\scr.exe'
-$watch = "powershell -ExecutionPolicy Bypass -File `"$Root\hooks\steward_watch.ps1`" -Unattended"
-$ui    = "`"$scr`" ui --port $Port --no-browser"
-if (-not $NoRegister) {
-  if (-not $UIOnly) { schtasks /Create /F /TN "Scriptorium\Watcher" /SC ONLOGON /RL LIMITED /TR $watch | Out-Null }
-  schtasks /Create /F /TN "Scriptorium\UI" /SC ONLOGON /RL LIMITED /TR $ui | Out-Null
-  Write-Host "registered at logon: Scriptorium\UI$(if (-not $UIOnly) { ', Scriptorium\Watcher' })"
-}
-# start the watcher now if not running (skipped with -UIOnly: the UI's chore list starts it when you press Run)
-if (-not $UIOnly) {
-  $running = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'steward_watch\.ps1' }
-  if (-not $running) { Start-Process powershell -ArgumentList '-ExecutionPolicy', 'Bypass', '-File', "$Root\hooks\steward_watch.ps1", '-Unattended' -WindowStyle Minimized; Write-Host "watcher started (minimized window)" } else { Write-Host "watcher already running" }
-}
-if (-not $NoUI) {
-  if ($RestartUI) {
-    # the UI loads its Python once; after a code update it must be restarted (a closed console window
-    # does not stop a UI that was started minimized by this script or by the logon task)
-    $old = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'scr(\.exe)? ui' })
-    $old += @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Get-CimInstance Win32_Process -Filter "ProcessId = $($_.OwningProcess)" })
-    foreach ($p in ($old | Sort-Object ProcessId -Unique)) { if ($p) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; Write-Host "stopped old UI pid $($p.ProcessId)" } }
-    Start-Sleep 1
-  }
-  $uiRunning = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'scr(\.exe)? ui' }
-  if (-not $uiRunning) { Start-Process $scr -ArgumentList 'ui', '--port', "$Port", '--no-browser' -WindowStyle Minimized; Start-Sleep 2 }
-  Start-Process "http://127.0.0.1:$Port/"
-  Write-Host "UI: http://127.0.0.1:$Port/"
-}
+$a = @('up', '--port', "$Port")
+if ($NoRegister) { $a += '--no-register' }
+if ($UIOnly -or $NoUI) { $a += '--ui-only' }
+if ($RestartUI) { $a += '--restart' }
+& (Join-Path $Root '.venv\Scripts\scr.exe') --root $Root @a

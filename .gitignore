@@ -20,3 +20,8 @@ tasks/*/pr-body.md
 # update bundles dropped at the root by hand
 *.zip
 _to_delete*
+.scr/
+
+# journal mode working files
+reports/ui.log
+reports/watch.log

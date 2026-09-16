@@ -20,55 +20,63 @@
   a { color: var(--accent); }
   button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 8px 14px; }
   button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .55; cursor: progress; }
   button:focus-visible, [tabindex]:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
   button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
   button.small { padding: 4px 10px; font-size: 14px; }
   textarea, input[type=text] { width: 100%; font: inherit; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); }
   .sr-only { position: absolute; left: -9999px; }
 
-  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+  header { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
   header h1 { font-size: 18px; margin: 0 16px 0 0; letter-spacing: .02em; }
   .stat { display: flex; gap: 6px; align-items: baseline; color: var(--muted); font-size: 14px; }
   .stat b { color: var(--ink); font-size: 16px; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
-  .dot.bad { background: var(--danger); }
-  .stat.bad { color: var(--danger); font-weight: 600; } .stat.bad code { font-weight: 400; user-select: all; }
+  .dot.bad { background: var(--danger); } .dot.warn { background: var(--warn); }
+  .stat.bad { color: var(--danger); font-weight: 600; }
   header .spacer { flex: 1; }
 
-  main { display: grid; grid-template-columns: minmax(300px, 380px) minmax(0, 1fr) minmax(320px, 420px); gap: 0; height: calc(100% - 58px); }
-  @media (max-width: 1100px) { main { grid-template-columns: 1fr; height: auto; } .col { max-height: none !important; } }
-  .col { overflow: auto; padding: 16px; border-right: 1px solid var(--line); max-height: calc(100vh - 58px); }
+  main { display: grid; grid-template-columns: minmax(360px, 520px) minmax(0, 1fr); height: calc(100% - 58px); }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; height: auto; } .col { max-height: none !important; } }
+  .col { overflow: auto; padding: 16px 20px; border-right: 1px solid var(--line); max-height: calc(100vh - 58px); }
   .col:last-child { border-right: 0; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 18px 0 8px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 20px 0 8px; display: flex; align-items: center; gap: 8px; }
   h2:first-child { margin-top: 0; }
+  h2 .n { background: var(--line); color: var(--ink); border-radius: 999px; padding: 0 8px; font-size: 12px; }
 
-  .card { background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--system); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-left: 5px solid var(--system); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px; position: relative; }
   .card[data-type=gate] { border-left-color: var(--gate); }
   .card[data-type=help] { border-left-color: var(--help); }
   .card[data-type=decision] { border-left-color: var(--decision); }
   .card[data-type=chore] { border-left-color: var(--ok); }
-  .badge.chore { background: var(--ok); }
-  .out { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
   .card.selected { box-shadow: 0 0 0 2px var(--accent); }
+  .card.running { border-style: dashed; }
+  .card.running::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: linear-gradient(90deg, var(--accent) 0 40%, transparent 40% 100%); background-size: 200% 100%; animation: slide 1.2s linear infinite; border-radius: 0 0 var(--radius) 0; }
+  @keyframes slide { from { background-position: 100% 0 } to { background-position: -100% 0 } }
   .card .top { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); }
   .badge { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: 2px 7px; border-radius: 999px; color: #fff; background: var(--system); }
-  .badge.gate { background: var(--gate); } .badge.help { background: var(--help); } .badge.decision { background: var(--decision); }
+  .badge.gate { background: var(--gate); } .badge.help { background: var(--help); } .badge.decision { background: var(--decision); } .badge.chore { background: var(--ok); }
+  .badge.failed { background: var(--danger); } .badge.done { background: var(--ok); } .badge.running { background: var(--accent); }
   .card .title { font-weight: 600; margin: 4px 0 6px; }
   .card .text { font-size: 14px; color: var(--muted); white-space: pre-wrap; }
-  .card .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .card .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; }
+  .card .status { font-size: 13px; color: var(--muted); font-style: italic; }
+  .out { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
+  .out.err { border-color: var(--danger); }
+  details.done { margin-bottom: 6px; } details.done summary { cursor: pointer; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+  details.done .ts { color: var(--muted); font-size: 12px; margin-left: auto; }
   .row { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 14px; }
   .row .id { font-family: var(--mono); color: var(--accent); cursor: pointer; }
   .row .st { font-size: 12px; color: var(--muted); }
   .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
 
-  #detail { padding-right: 20px; }
   #detail .hd { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
   #detail .hd .id { font-family: var(--mono); color: var(--accent); }
   #detail .hd .status { font-size: 13px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
   .tabs { display: flex; gap: 4px; margin: 14px 0 10px; border-bottom: 1px solid var(--line); }
   .tabs button { border: 0; border-bottom: 3px solid transparent; border-radius: 0; background: none; padding: 8px 12px; }
   .tabs button[aria-selected=true] { border-bottom-color: var(--accent); font-weight: 600; }
-  .md { max-width: 90ch; }
+  .md { max-width: 100ch; }
   .md pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow-x: auto; font-size: 13px; }
   .md code { font-family: var(--mono); font-size: .92em; }
   .md table { border-collapse: collapse; font-size: 14px; } .md td, .md th { border: 1px solid var(--line); padding: 4px 8px; }
@@ -77,16 +85,7 @@
   .answerbox .opts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
   .ev { font-size: 13px; font-family: var(--mono); padding: 4px 0; border-bottom: 1px dashed var(--line); white-space: pre-wrap; }
   .ev .ts { color: var(--muted); }
-
-  #chat { display: flex; flex-direction: column; height: 100%; }
-  #chatlog { flex: 1; overflow: auto; padding-bottom: 8px; }
-  .msg { margin: 8px 0; padding: 10px 12px; border-radius: 10px; max-width: 95%; font-size: 15px; }
-  .msg.user { background: var(--accent); color: var(--accent-ink); margin-left: auto; }
-  .msg.assistant { background: var(--panel); border: 1px solid var(--line); }
-  .msg .who { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .7; margin-bottom: 4px; }
-  #chatform { display: flex; gap: 8px; align-items: flex-end; padding-top: 8px; border-top: 1px solid var(--line); }
-  #chatform textarea { min-height: 64px; resize: vertical; }
-  .thinking { color: var(--muted); font-style: italic; }
+  .lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0 24px; }
   .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 999px; font-size: 14px; opacity: 0; transition: opacity .2s; }
   .toast.show { opacity: 1; }
   kbd { font-family: var(--mono); font-size: 12px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
@@ -95,217 +94,202 @@
 <body>
 <header role="banner">
   <h1>Scriptorium</h1>
-  <span class="stat"><span class="dot" id="verifyDot" aria-hidden="true"></span><span id="verifyText">verifying…</span></span>
+  <span class="stat" title="chain + replay verification"><span class="dot" id="verifyDot" aria-hidden="true"></span><span id="verifyText">verifying…</span></span>
+  <span class="stat" title="the scriptorium repo journals itself; this is the last commit"><span class="dot" id="jDot" aria-hidden="true"></span>journal <b id="jHead">–</b></span>
   <span class="stat">running <b id="nRunning">–</b> / cap <b id="cap">–</b></span>
   <span class="stat">ready <b id="nReady">–</b></span>
   <span class="stat">needs you <b id="nNeeds">–</b></span>
-  <span class="stat">watcher tick <b id="tick">–</b></span>
+  <span class="stat">watcher <b id="tick">–</b></span>
   <span class="spacer"></span>
-  <span class="stat bad" id="stale" hidden role="alert">UI code changed on disk — restart it: <code>powershell -ExecutionPolicy Bypass -File hooks\scriptorium_up.ps1 -UIOnly -RestartUI</code></span>
+  <button id="discussGeneral" title="Open a discussion session not tied to one ticket">Discuss…</button>
   <button id="refresh" title="Refresh (r)">Refresh</button>
 </header>
 
 <main>
   <section class="col" aria-label="Needs you">
-    <h2>Needs you</h2>
+    <h2>Needs you <span class="n" id="needsN">0</span></h2>
     <div id="needs"></div>
     <h2>Add an idea to the Inbox</h2>
-    <form id="inboxForm">
-      <label class="sr-only" for="inboxText">One line: what should become a task</label>
-      <input type="text" id="inboxText" placeholder="One line — Intake turns it into a task tonight">
-      <div style="margin-top:6px"><button class="small primary" type="submit">Add to Inbox</button></div>
+    <form id="inboxForm"><label class="sr-only" for="inboxText">Idea</label>
+      <textarea id="inboxText" rows="2" placeholder="One line; Intake turns it into a task at the next run"></textarea>
+      <div class="actions" style="margin-top:6px"><button type="submit" class="small primary">Add to Inbox</button></div>
     </form>
-    <h2>Running</h2>
-    <div id="running"></div>
-    <h2>Ready (next dispatch)</h2>
-    <div id="ready"></div>
-    <h2>Recently closed</h2>
-    <div id="recent"></div>
+    <h2>Done <span class="n" id="doneN">0</span></h2>
+    <div id="done"></div>
   </section>
 
-  <section class="col" id="detail" aria-live="polite" aria-label="Task detail">
-    <div class="empty">Select an item on the left, or ask the assistant on the right. <br><br>Keys: <kbd>r</kbd> refresh · <kbd>1</kbd>–<kbd>5</kbd> tabs · <kbd>/</kbd> focus chat</div>
-  </section>
-
-  <section class="col" id="chat" aria-label="Assistant">
-    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
-      <h2 style="margin:0">Assistant <span id="chatScope" style="font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
-      <button class="small" id="chatGeneral" title="Switch to the general thread">General thread</button>
+  <section class="col" id="detail" aria-label="Detail">
+    <div id="detailBody"><div class="empty">Select a card, or a task below, to see its record. Keys: <kbd>r</kbd> refresh · <kbd>1</kbd>–<kbd>5</kbd> tabs · <kbd>d</kbd> discuss the selected task.</div></div>
+    <div class="lists">
+      <div><h2>Running</h2><div id="running"></div></div>
+      <div><h2>Ready (next to dispatch)</h2><div id="ready"></div></div>
+      <div><h2>Recently closed</h2><div id="recent"></div></div>
     </div>
-    <div id="chatlog" role="log" aria-live="polite"></div>
-    <form id="chatform">
-      <label class="sr-only" for="chatText">Message to the assistant</label>
-      <textarea id="chatText" placeholder="Ask about this task, the history, or the mathematics… (Enter to send, Shift+Enter for a new line)"></textarea>
-      <button class="primary" type="submit" id="chatSend">Send</button>
-    </form>
   </section>
 </main>
-<div class="toast" id="toast" role="status"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-const $ = (s, el = document) => el.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const md = s => (window.marked ? marked.parse(s || '', { mangle: false, headerIds: false }) : `<pre>${esc(s)}</pre>`);
+const $ = s => document.querySelector(s);
 const api = async (path, body) => {
   const r = await fetch(path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {});
   return r.json();
 };
 const toast = m => { const t = $('#toast'); t.textContent = m; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2600); };
 const fmtTs = ts => ts ? new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+const esc = s => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-let STATE = null, CURRENT = null, TAB = 'spec', THREAD = 'general';
+let STATE = null, CURRENT = null, TAB = 'spec';
+const LOCAL = { jobs: {} };   // key -> job id started from this page (so a card shows progress immediately)
 
 async function refresh() {
   STATE = await api('/api/state');
   $('#verifyDot').className = 'dot' + (STATE.verify_ok ? '' : ' bad');
-  $('#verifyText').textContent = STATE.verify_ok ? `verified · ${STATE.state_root}` : 'VERIFY FAILED';
+  $('#verifyText').textContent = STATE.verify_ok ? `verified · ${STATE.state_root}` : 'VERIFY FAILED: ' + STATE.verify_out;
+  const j = STATE.journal || {};
+  $('#jHead').textContent = (j.head || '–') + (j.dirty ? ` (+${j.dirty} pending)` : '');
+  $('#jDot').className = 'dot' + (j.last_failure ? ' bad' : (j.dirty ? ' warn' : ''));
+  $('#jDot').parentElement.title = j.last_failure ? 'last journal failure: ' + j.last_failure : 'the scriptorium repo journals itself; pending files are committed by the next command or watcher tick';
   $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency;
-  $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length;
+  $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
   $('#tick').textContent = STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'not running';
-  $('#stale').hidden = !STATE.code_stale;
-  renderNeeds(); renderLists();
+  renderNeeds(); renderDone(); renderLists();
+}
+
+function jobFor(key) {
+  const jobs = (STATE && STATE.jobs) || [];
+  return jobs.find(x => x.key === key && x.state === 'running') || jobs.find(x => x.key === key);
+}
+
+function actionButton(label, cls, fn) { const b = document.createElement('button'); b.className = 'small ' + cls; b.textContent = label; b.onclick = fn; return b; }
+
+async function start(body, key) {
+  const j = await api('/api/run', body);
+  if (j.error) { toast(j.error); return; }
+  LOCAL.jobs[key] = j.id;
+  toast('started: ' + j.title);
+  renderNeeds(); pollJobs();
+}
+
+let POLL = null;
+function pollJobs() {
+  if (POLL) return;
+  POLL = setInterval(async () => {
+    const jobs = await api('/api/jobs');
+    const running = jobs.some(j => j.state === 'running');
+    if (STATE) { STATE.jobs = jobs; renderNeeds(); renderDone(); }
+    if (!running) { clearInterval(POLL); POLL = null; refresh(); }
+  }, 2000);
 }
 
 function renderNeeds() {
   const box = $('#needs'); box.innerHTML = '';
   if (!STATE.needs.length) { box.innerHTML = '<div class="empty">Nothing needs you. The operation is running by itself.</div>'; return; }
   for (const n of STATE.needs) {
-    const c = document.createElement('article'); c.className = 'card'; c.dataset.type = n.type; c.tabIndex = 0;
-    c.setAttribute('role', 'button'); c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
-    const label = { gate: 'Gate', help: 'Help', decision: n.kind || 'Decide', system: n.title, chore: n.kind === 'manual' ? 'Do' : 'Run' }[n.type] || n.type;
-    let text = n.text || (n.waiting && n.waiting.length ? `${n.waiting.length} task(s) wait on this` : '');
-    if (n.age_h != null) text += (text ? ' · ' : '') + `${n.age_h} h old`;
-    c.innerHTML = `<div class="top"><span class="badge ${n.type}">${esc(label)}</span><span>${esc(n.id)}</span>${n.ts ? `<span>${fmtTs(n.ts)}</span>` : ''}</div>
-      <div class="title">${esc(n.type === 'system' ? (n.text || n.title) : n.title)}</div>
-      ${n.type !== 'system' ? `<div class="text">${esc(text)}</div>` : ''}
-      <div class="actions"></div>`;
-    const acts = $('.actions', c);
-    if (n.type === 'chore') {
-      c.onclick = null; c.removeAttribute('role'); c.tabIndex = -1;
-      if (n.has_run) {
-        const b = document.createElement('button'); b.className = 'small primary'; b.textContent = 'Run';
-        b.onclick = async e => { e.stopPropagation(); b.disabled = true; b.textContent = 'Running…';
-          let out = $('.out', c); if (!out) { out = document.createElement('div'); out.className = 'out'; c.appendChild(out); }
-          out.textContent = 'working — this can take a few minutes for git/PR steps…';
-          const r = await api('/api/chore', { id: n.id });
-          out.textContent = (r.output || r.error || '') + (r.ok ? '\n\n✔ done' : '\n\n✖ not done yet (exit ' + r.exit + ') — read the output; Run again when fixed');
-          b.disabled = false; b.textContent = 'Run'; if (r.ok) setTimeout(refresh, 1500); };
-        acts.appendChild(b);
-      }
-      if (n.link) { const a = document.createElement('a'); a.href = n.link; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open link'; a.style.alignSelf = 'center'; acts.appendChild(a); }
-      const d = document.createElement('button'); d.className = 'small'; d.textContent = n.kind === 'manual' ? 'Mark done' : 'Dismiss';
-      d.onclick = async e => { e.stopPropagation(); await api('/api/ack', { h: 'chore:' + n.id }); refresh(); };
-      acts.appendChild(d);
-    } else if (n.type === 'system') {
-      const b = document.createElement('button'); b.className = 'small'; b.textContent = 'Acknowledge';
-      b.onclick = async e => { e.stopPropagation(); await api('/api/ack', { h: n.h }); refresh(); };
-      acts.appendChild(b);
-      if (n.id !== '-') { const o = document.createElement('button'); o.className = 'small'; o.textContent = 'Open task'; o.onclick = e => { e.stopPropagation(); openTask(n.id); }; acts.appendChild(o); }
+    const job = jobFor(n.key);
+    const running = job && job.state === 'running';
+    const failed = job && job.state === 'failed' && (!job.finished || true);
+    const c = document.createElement('article'); c.className = 'card' + (running ? ' running' : '') + (CURRENT === n.id ? ' selected' : ''); c.dataset.type = n.type; c.tabIndex = 0;
+    c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
+    const top = document.createElement('div'); top.className = 'top';
+    top.innerHTML = `<span class="badge ${n.type}">${n.type}</span> <span>${esc(n.id)}</span>` + (n.age_h ? `<span>· ${n.age_h} h</span>` : '') + (n.ts ? `<span>· ${fmtTs(n.ts)}</span>` : '') + (n.waiting && n.waiting.length ? `<span>· ${n.waiting.length} waiting</span>` : '');
+    const title = document.createElement('div'); title.className = 'title'; title.textContent = n.title;
+    c.append(top, title);
+    if (n.text) { const t = document.createElement('div'); t.className = 'text'; t.textContent = n.text; c.append(t); }
+    if (n.link) { const a = document.createElement('a'); a.href = n.link; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open the page this needs ↗'; c.append(a); }
+    const act = document.createElement('div'); act.className = 'actions';
+    if (running) {
+      const s = document.createElement('span'); s.className = 'status'; s.textContent = `in progress since ${fmtTs(job.started)}…`; act.append(s);
     } else {
-      const o = document.createElement('button'); o.className = 'small primary'; o.textContent = 'Open & answer';
-      o.onclick = e => { e.stopPropagation(); openTask(n.id, n); }; acts.appendChild(o);
-      const d = document.createElement('button'); d.className = 'small'; d.textContent = 'Discuss';
-      d.onclick = e => { e.stopPropagation(); openTask(n.id, n); setThread(n.id); $('#chatText').focus(); }; acts.appendChild(d);
+      if (n.type === 'chore') {
+        if (n.runnable) act.append(actionButton('Run', 'primary', () => start({ kind: 'chore', id: n.id, title: n.title }, n.key)));
+        act.append(actionButton('Mark done', '', () => start({ kind: 'ack', key: n.key }, n.key)));
+      } else if (n.type === 'system') {
+        act.append(actionButton('Dismiss', '', () => start({ kind: 'ack', key: n.h }, n.key)));
+      } else {
+        for (const o of (n.options || [])) act.append(actionButton(o, 'primary', () => answer(n, o)));
+        act.append(actionButton('Answer…', '', () => { select(n.id); setTimeout(() => $('#answerText') && $('#answerText').focus(), 50); }));
+      }
+      const discussItem = n.type === 'chore' ? 'chore:' + n.id : (n.type === 'system' ? 'event:' + n.h : n.id);
+      act.append(actionButton('Discuss', '', () => start({ kind: 'discuss', item: discussItem }, 'discuss:' + discussItem)));
     }
-    c.onclick = () => openTask(n.id, n);
-    c.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTask(n.id, n); } };
-    box.appendChild(c);
+    c.append(act);
+    if (job && job.state === 'failed') {
+      const o = document.createElement('div'); o.className = 'out err'; o.textContent = '✖ not done — ' + (job.output || '(no output)'); c.append(o);
+    }
+    if (n.id && n.id !== '-') { c.addEventListener('click', e => { if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'A') select(n.id); }); c.addEventListener('keydown', e => { if (e.key === 'Enter') select(n.id); }); }
+    box.append(c);
+  }
+}
+
+function renderDone() {
+  const box = $('#done'); box.innerHTML = '';
+  const done = ((STATE && STATE.jobs) || []).filter(j => j.state !== 'running');
+  $('#doneN').textContent = done.length;
+  if (!done.length) { box.innerHTML = '<div class="empty">Nothing yet today.</div>'; return; }
+  for (const j of done.slice(0, 40)) {
+    const d = document.createElement('details'); d.className = 'done';
+    d.innerHTML = `<summary><span class="badge ${j.state}">${j.state === 'done' ? '✓ done' : '✖ failed'}</span> <span>${esc(j.title)}</span><span class="ts">${fmtTs(j.finished || j.started)}</span></summary><div class="out${j.state === 'failed' ? ' err' : ''}">${esc(j.output || '(no output)')}</div>`;
+    box.append(d);
   }
 }
 
 function renderLists() {
-  const mk = (el, rows, fmt) => { el.innerHTML = rows.length ? '' : '<div class="empty">—</div>'; for (const r of rows) { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = fmt(r); $('.id', d).onclick = () => openTask(r.id); el.appendChild(d); } };
-  mk($('#running'), STATE.running, r => `<span class="id">${r.id}</span><span class="st">${r.status}${r.started ? ' · since ' + fmtTs(r.started) : ''}</span><span style="flex:1;font-size:13px">${esc(r.title.slice(0, 70))}</span>`);
-  mk($('#ready'), STATE.ready, r => `<span class="id">${r.id}</span><span class="st">${r.kind}</span><span style="flex:1;font-size:13px">${esc(r.title.slice(0, 70))}</span>`);
-  mk($('#recent'), STATE.recent, r => `<span class="id">${r.id}</span><span class="st">${r.to} · ${fmtTs(r.ts)}</span><span style="flex:1;font-size:13px">${esc(r.title.slice(0, 60))}</span>`);
+  const mk = (rows, fmt) => rows.length ? rows.map(fmt).join('') : '<div class="empty">—</div>';
+  $('#running').innerHTML = mk(STATE.running, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.status}${r.started ? ' · since ' + fmtTs(r.started) : ''}</span></div>`);
+  $('#ready').innerHTML = mk(STATE.ready, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.kind}</span></div>`);
+  $('#recent').innerHTML = mk(STATE.recent, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.to} · ${fmtTs(r.ts)}</span></div>`);
+  document.querySelectorAll('.row .id').forEach(el => el.onclick = () => select(el.dataset.id));
 }
 
-async function openTask(id, need) {
-  const d = await api('/api/task/' + id); CURRENT = d; CURRENT.need = need;
-  document.querySelectorAll('.card').forEach(c => c.classList.toggle('selected', c.getAttribute('aria-label')?.includes(id)));
-  renderDetail();
-  if (THREAD === 'general' || THREAD !== id) setThread(id, true);
-}
-
-function renderDetail() {
-  const d = CURRENT, rec = d.rec, box = $('#detail');
-  const need = d.need;
-  let answer = '';
-  if (need && need.type !== 'system') {
-    const opts = (need.options || []).map(o => `<button class="small" data-opt="${esc(o)}">${esc(o)}</button>`).join('');
-    const kind = need.type; // decision | help | gate
-    answer = `<div class="answerbox" role="group" aria-label="Answer">
-      <div style="font-weight:600;margin-bottom:6px">${kind === 'help' ? 'Answer the HELP request' : kind === 'gate' ? 'Gate decision' : 'Your answer'}</div>
-      ${need.text ? `<div class="text" style="margin-bottom:8px;font-size:14px;color:var(--muted)">${esc(need.text)}</div>` : ''}
-      <div class="opts">${opts}</div>
-      <label class="sr-only" for="ansText">Answer text</label>
-      <textarea id="ansText" rows="2" placeholder="${kind === 'gate' ? 'accept / return <feedback> / reject <reason>' : 'Type an answer, or pick an option above'}"></textarea>
-      <div style="margin-top:8px;display:flex;gap:8px"><button class="primary" id="ansSend">Apply answer</button><span class="empty" id="ansNote">Recorded in the task log and the event chain; the Concierge applies the consequences.</span></div>
-    </div>`;
+async function select(id) {
+  CURRENT = id;
+  const d = await api('/api/task/' + id);
+  if (d.error) { toast(d.error); return; }
+  const need = STATE.needs.find(n => n.id === id && n.type !== 'chore' && n.type !== 'system');
+  const body = $('#detailBody'); body.innerHTML = '';
+  const hd = document.createElement('div'); hd.className = 'hd';
+  hd.innerHTML = `<span class="id">${d.id}</span><strong>${esc(d.rec.title || '')}</strong><span class="status">${d.rec.status}</span><span class="status">${d.rec.kind}</span>` +
+    (d.blocked_by.length ? `<span class="status">blocked by ${d.blocked_by.join(', ')}</span>` : '') + (d.blocks.length ? `<span class="status">blocks ${d.blocks.join(', ')}</span>` : '') +
+    (d.worktree ? `<span class="status" title="${esc(d.worktree)}">worktree</span>` : '');
+  const db = document.createElement('button'); db.className = 'small'; db.textContent = 'Discuss this ticket'; db.onclick = () => start({ kind: 'discuss', item: d.id }, 'discuss:' + d.id);
+  hd.append(db);
+  body.append(hd);
+  if (need) {
+    const ab = document.createElement('div'); ab.className = 'answerbox';
+    ab.innerHTML = `<div><b>${need.type === 'help' ? 'The scriber asks' : need.type === 'gate' ? 'Gate decision' : 'Decision'}</b>${need.text ? ': ' + esc(need.text) : ''}</div><div class="opts"></div><label class="sr-only" for="answerText">Answer</label><textarea id="answerText" rows="3" placeholder="${need.type === 'gate' ? 'accept / return <feedback> / reject <why>' : 'Your answer (free text)'}"></textarea><div class="actions" style="margin-top:6px"><button class="small primary" id="sendAnswer">Send answer</button></div>`;
+    for (const o of (need.options || [])) ab.querySelector('.opts').append(actionButton(o, 'primary', () => answer(need, o)));
+    ab.querySelector('#sendAnswer').onclick = () => { const v = $('#answerText').value.trim(); if (v) answer(need, v); };
+    body.append(ab);
   }
-  const tabs = ['spec', 'report', 'review', 'log', 'events'];
-  box.innerHTML = `<div class="hd"><span class="id">${esc(d.id)}</span><span class="status">${esc(rec.status)}</span><span class="status">${esc(rec.kind)}</span>
-      ${rec.scope?.may_touch_statements ? '<span class="status" style="border-color:var(--gate);color:var(--gate)">may touch statements</span>' : ''}</div>
-    <h3 style="margin:8px 0 4px;font-size:18px">${esc(rec.title)}</h3>
-    <div class="empty" style="padding:0 0 6px">${d.blocked_by.length ? 'blocked by ' + d.blocked_by.join(', ') + ' · ' : ''}${d.blocks.length ? 'unblocks ' + d.blocks.join(', ') + ' · ' : ''}budget ${rec.budget?.max_attempts} att / ${(rec.budget?.max_tokens / 1e6).toFixed(1)}M tok / ${rec.budget?.max_wall_hours} h · attempts ${rec.attempts} · tokens ${rec.tokens_used}${d.worktree ? ' · <span style="font-family:var(--mono);font-size:12px">' + esc(d.worktree) + '</span>' : ''}</div>
-    ${answer}
-    <div class="tabs" role="tablist">${tabs.map((t, i) => `<button role="tab" data-tab="${t}" aria-selected="${t === TAB}" title="key ${i + 1}">${t}</button>`).join('')}</div>
-    <div id="tabbody" class="md" role="tabpanel"></div>`;
-  box.querySelectorAll('[role=tab]').forEach(b => b.onclick = () => { TAB = b.dataset.tab; renderDetail(); });
-  box.querySelectorAll('[data-opt]').forEach(b => b.onclick = () => { $('#ansText').value = b.dataset.opt; $('#ansText').focus(); });
-  const send = $('#ansSend'); if (send) send.onclick = async () => {
-    const v = $('#ansText').value.trim(); if (!v) return toast('Type or pick an answer first');
-    send.disabled = true; $('#ansNote').textContent = 'Applying…';
-    const r = await api('/api/answer', { task: d.id, answer: v, kind: need.type });
-    toast(r.ok ? 'Answer recorded' : 'Failed: ' + r.error); send.disabled = false;
-    await refresh(); const again = STATE.needs.find(n => n.id === d.id && n.type === need.type); openTask(d.id, again);
-  };
-  const body = $('#tabbody');
-  if (TAB === 'events') {
-    body.innerHTML = d.events.length ? d.events.slice().reverse().map(e => `<div class="ev"><span class="ts">${fmtTs(e.ts)}</span> <b>${esc(e.kind)}</b> ${esc(e.actor || '')} ${e.from != null || e.to ? esc((e.from || '·') + ' → ' + (e.to || '')) : ''}${e.name ? ' ' + esc(e.name) : ''}${e.edge ? ' ' + esc(e.edge + ' ' + e.from + '→' + e.to) : ''}${e.field ? ' ' + esc(e.field + '=' + JSON.stringify(e.value)) : ''}${e.note ? '\n   ' + esc(e.note) : ''}</div>`).join('') : '<div class="empty">no events</div>';
-  } else {
-    const txt = d.docs[TAB];
-    body.innerHTML = txt && txt.trim() ? md(txt) : '<div class="empty">empty</div>';
+  const tabs = document.createElement('div'); tabs.className = 'tabs'; tabs.setAttribute('role', 'tablist');
+  for (const [i, t] of ['spec', 'report', 'review', 'log', 'events'].entries()) {
+    const b = document.createElement('button'); b.textContent = `${i + 1} ${t}`; b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', TAB === t); b.onclick = () => { TAB = t; select(id); }; tabs.append(b);
   }
+  body.append(tabs);
+  const pane = document.createElement('div');
+  if (TAB === 'events') pane.innerHTML = d.events.slice().reverse().map(e => `<div class="ev"><span class="ts">${fmtTs(e.ts)}</span> ${esc(e.kind)} ${esc(e.actor || '')} ${e.from ? esc(e.from) + ' → ' + esc(e.to) : ''}${e.name ? ' ' + esc(e.name) : ''}${e.field ? ' ' + esc(e.field) + '=' + esc(JSON.stringify(e.value)) : ''}${e.note ? ' — ' + esc(e.note) : ''}</div>`).join('') || '<div class="empty">no events</div>';
+  else { pane.className = 'md'; pane.innerHTML = d.docs[TAB] ? marked.parse(d.docs[TAB]) : '<div class="empty">(empty)</div>'; }
+  body.append(pane);
+  renderNeeds();
 }
 
-// ---- chat ---------------------------------------------------------------------------------
-async function setThread(id, keepFocus) {
-  THREAD = id; $('#chatScope').textContent = id === 'general' ? '· general' : '· ' + id;
-  const log = $('#chatlog'); log.innerHTML = '';
-  const rows = await api('/api/chat/' + id);
-  for (const r of rows) addMsg(r.role, r.text);
-  if (!rows.length) addMsg('assistant', id === 'general' ? 'Ask me anything about the operation: which tasks are where, what a report found, why a task was returned, or a theory question about FGGS, the N_k law or the greedy algorithm. I read the records and the repo to answer.' : `This thread is about ${id}. I will read its spec, report, review and log before answering.`);
-  log.scrollTop = log.scrollHeight;
+async function answer(need, text) {
+  const kind = need.type === 'help' ? 'help' : need.type === 'gate' ? 'gate' : 'decision';
+  await start({ kind: 'answer', task: need.id, answer: text, answer_kind: kind, key: need.key }, need.key);
 }
-function addMsg(role, text) {
-  const m = document.createElement('div'); m.className = 'msg ' + role;
-  m.innerHTML = `<div class="who">${role === 'user' ? 'you' : 'assistant'}</div>` + (role === 'user' ? esc(text).replace(/\n/g, '<br>') : `<div class="md">${md(text)}</div>`);
-  $('#chatlog').appendChild(m); $('#chatlog').scrollTop = $('#chatlog').scrollHeight; return m;
-}
-$('#chatform').onsubmit = async e => {
-  e.preventDefault(); const t = $('#chatText'); const v = t.value.trim(); if (!v) return;
-  t.value = ''; addMsg('user', v);
-  const th = document.createElement('div'); th.className = 'thinking'; th.textContent = 'thinking… (the agent reads files; this can take a minute)'; $('#chatlog').appendChild(th);
-  $('#chatSend').disabled = true;
-  try { const r = await api('/api/chat', { thread: THREAD, message: v, task: THREAD === 'general' ? null : THREAD }); th.remove(); addMsg('assistant', r.reply || r.error || '(no reply)'); }
-  catch (err) { th.remove(); addMsg('assistant', 'Request failed: ' + err); }
-  $('#chatSend').disabled = false; t.focus();
-};
-$('#chatText').onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('#chatform').requestSubmit(); } };
-$('#chatGeneral').onclick = () => setThread('general');
 
-// ---- inbox / keys / polling ----------------------------------------------------------------
-$('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; await api('/api/inbox', { text: v }); $('#inboxText').value = ''; toast('Added to the Inbox'); };
 $('#refresh').onclick = refresh;
+$('#discussGeneral').onclick = () => start({ kind: 'discuss', item: 'general' }, 'discuss:general');
+$('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; $('#inboxText').value = ''; await start({ kind: 'inbox', text: v }, 'inbox'); };
 document.addEventListener('keydown', e => {
-  if (e.target.matches('input,textarea')) return;
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (e.key === 'r') refresh();
-  if (e.key === '/') { e.preventDefault(); $('#chatText').focus(); }
-  if (CURRENT && /^[1-5]$/.test(e.key)) { TAB = ['spec', 'report', 'review', 'log', 'events'][+e.key - 1]; renderDetail(); }
+  if (e.key === 'd' && CURRENT) start({ kind: 'discuss', item: CURRENT }, 'discuss:' + CURRENT);
+  if ('12345'.includes(e.key) && CURRENT) { TAB = ['spec', 'report', 'review', 'log', 'events'][+e.key - 1]; select(CURRENT); }
 });
-refresh(); setThread('general');
-setInterval(refresh, 60000);
+refresh().then(() => { if ((STATE.jobs || []).some(j => j.state === 'running')) pollJobs(); });
+setInterval(() => { if (!POLL) refresh(); }, 60000);
 </script>
 </body>
 </html>
