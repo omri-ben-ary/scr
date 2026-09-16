@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 def scr(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     env = {**os.environ, "SCRIPTORIUM_ROOT": str(root), "PYTHONPATH": str(REPO), "SCR_NO_JOURNAL": os.environ.get("SCR_TEST_JOURNAL", "1")}
-    return subprocess.run([sys.executable, "-m", "scr", *args], cwd=root, env=env, capture_output=True, text=True, check=check)
+    return subprocess.run([sys.executable, "-m", "scr", *args], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=check)
 
 
 @pytest.fixture

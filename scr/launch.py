@@ -91,7 +91,7 @@ def intake(root: Path, dry_run: bool = False, timeout: int = 3600) -> list[str]:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     try:
         r = subprocess.run(argv, input=brief, cwd=root,
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         text = r.stdout + r.stderr
     except subprocess.TimeoutExpired:
         text = "intake timed out"

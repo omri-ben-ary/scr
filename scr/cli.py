@@ -295,14 +295,14 @@ def cmd_replay(args):
 def cmd_history(args):
     root, _, _ = _ctx(args)
     try:
-        out = subprocess.run(["git", "log", "--format=%H %cI", "--", "state/STATE.json"], cwd=root, capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(["git", "log", "--format=%H %cI", "--", "state/STATE.json"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout
     except subprocess.CalledProcessError:
         print("no git history")
         return
     for line in out.splitlines()[: args.n]:
         sha, ts = line.split()
         try:
-            snap = json.loads(subprocess.run(["git", "show", f"{sha}:state/STATE.json"], cwd=root, capture_output=True, text=True, check=True).stdout)
+            snap = json.loads(subprocess.run(["git", "show", f"{sha}:state/STATE.json"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout)
             print(f"{ts}  {sha[:10]}  state {snap['state_root'][:12]}  parent {snap['parent_state_root'][:12]}  tasks {len(snap['tasks'])}  events {snap['events_count']}" + (f"  {snap['note']}" if snap.get("note") else ""))
         except Exception as e:
             print(f"{ts}  {sha[:10]}  (unreadable snapshot: {e})")
@@ -315,7 +315,7 @@ def cmd_diff(args):
     def load(ref: str) -> dict:
         if ref in ("WORKTREE", "."):
             return st.read_snapshot() or {}
-        return json.loads(subprocess.run(["git", "show", f"{ref}:state/STATE.json"], cwd=root, capture_output=True, text=True, check=True).stdout)
+        return json.loads(subprocess.run(["git", "show", f"{ref}:state/STATE.json"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout)
 
     _out(st.diff(load(args.a), load(args.b)), args.json)
 

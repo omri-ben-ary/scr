@@ -61,7 +61,7 @@ class Git:
 
     def run(self, *args: str, timeout: int = 300, retry_on_lock: bool = True) -> Result:
         try:
-            r = subprocess.run(self._base() + list(args), cwd=self.cwd, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(self._base() + list(args), cwd=self.cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except FileNotFoundError:
             return Result(127, "git not found on PATH")
         except subprocess.TimeoutExpired:

@@ -44,7 +44,7 @@ def scr_cmd(root: Path, actor: str, *args: str, timeout: int = 900) -> tuple[int
     cmd = scr_exe(root) + ["--root", str(root), "--actor", actor, *args]
     with _LOCK:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, cwd=root, timeout=timeout, env=_env())
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=root, timeout=timeout, env=_env())
         except subprocess.TimeoutExpired:
             return 124, f"scr {' '.join(args)} timed out"
     return r.returncode, (r.stdout + r.stderr).strip()

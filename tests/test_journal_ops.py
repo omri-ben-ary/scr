@@ -25,11 +25,11 @@ REPO = Path(__file__).resolve().parents[1]
 def scr(root: Path, *args: str, journal_on: bool = True, check: bool = True):
     env = {**os.environ, "SCRIPTORIUM_ROOT": str(root), "PYTHONPATH": str(REPO)}
     env["SCR_NO_JOURNAL"] = "0" if journal_on else "1"
-    return subprocess.run([sys.executable, "-m", "scr", "--root", str(root), *args], cwd=root, env=env, capture_output=True, text=True, check=check)
+    return subprocess.run([sys.executable, "-m", "scr", "--root", str(root), *args], cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", check=check)
 
 
 def git(cwd: Path, *a: str) -> str:
-    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True).stdout.strip()
 
 
 @pytest.fixture
@@ -304,7 +304,7 @@ def test_ui_http_and_reload(world):
     env = {**os.environ, "PYTHONPATH": str(REPO)}
     env.pop("SCR_NO_JOURNAL", None)
     p = subprocess.Popen([sys.executable, "-m", "scr", "--root", str(root), "ui", "--port", str(port), "--no-browser", "--child"], cwd=root, env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     try:
         for _ in range(50):
             time.sleep(0.2)
