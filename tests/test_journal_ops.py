@@ -3,6 +3,7 @@ declarative chores, and the UI job flow. Everything runs on Linux with plain git
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -387,3 +388,44 @@ def test_paused_watcher_does_nothing(world):
     assert res.get("paused") and Store(root).get("T-0001").status == "dispatched"
     (root / ".scr" / "paused").unlink()
     assert not Watcher(root, quiet=True).tick().get("paused")
+
+
+# ---- multi-workload dispatch (T-0036) + the unblock cascade on the land path (T-0040) ---------------
+def test_spawn_honours_task_workload(world):
+    root, repo, _ = world
+    base = root.parent
+    origin2 = base / "origin2.git"; git(base, "init", "-q", "--bare", "-b", "main", str(origin2))
+    repo2 = base / "tools"; repo2.mkdir(); git(repo2, "init", "-q", "-b", "main")
+    (repo2 / "README.md").write_text("tools\n"); git(repo2, "add", "-A"); git(repo2, "commit", "-q", "-m", "init")
+    git(repo2, "remote", "add", "origin", str(origin2)); git(repo2, "push", "-q", "-u", "origin", "main")
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["tools"] = {"repo": "../tools", "main_branch": "main", "worktrees": "../tools-worktrees"}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+    scr(root, "--quiet", "task", "new", "Fix the tooling", "--id", "T-0009", "--workload", "tools", "--files", "README.md", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0009", st)
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "dispatched")
+    out = spawn(root, ["T-0001", "T-0009"], lake=False)
+    wt1, wt9 = repo / ".worktrees" / "T-0001", base / "tools-worktrees" / "T-0009"
+    assert wt1.is_dir() and wt9.is_dir(), out                                  # each under ITS workload's root
+    assert git(wt9, "rev-parse", "--abbrev-ref", "HEAD") == "task/T-0009" and git(wt1, "rev-parse", "--abbrev-ref", "HEAD") == "task/T-0001"
+    assert (wt9 / "README.md").read_text() == "tools\n"                         # branched from the tools repo, not quantum-insertion
+    from scr.ops import checkpoint_commit
+    (wt9 / "README.md").write_text("changed\n")
+    assert checkpoint_commit(root, "T-0009")                                    # checkpointed in its own repo
+    assert git(repo2, "log", "task/T-0009", "-1", "--format=%s").startswith("[checkpoint] T-0009")
+
+
+def test_cascade_runs_on_the_land_path(world):
+    from scr import lifecycle
+    from scr.events import EventLog
+    root, _, _ = world
+    scr(root, "--quiet", "task", "new", "B needs A", "--id", "T-0002", "--blocked-by", "T-0001", "--origin", "omri")
+    for st in ("triaged", "blocked"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0002", st)
+    store = Store(root); a = store.get("T-0001")
+    lifecycle.apply(a.rec, "merged"); a.save()           # exactly what ops.land does — without `scr task set`
+    log = EventLog(root / "events" / "events.jsonl")
+    log.append("state", task="T-0001", **{"from": "ready"}, to="merged", actor="t")
+    assert lifecycle.cascade(store, log, "T-0001", "merged") == ["T-0002"]
+    assert Store(root).get("T-0002").status == "ready"
