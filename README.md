@@ -90,8 +90,12 @@ scr up --restart      # after an update; the UI also restarts itself when its co
 ```
 
 starts the UI at http://127.0.0.1:8765/ (your entry point: what needs you, every task's record and
-history, a Discuss button on every card that opens a Claude Code session preloaded with that ticket
-and empowered to carry out what you decide) and the watcher in `--unattended` mode, and registers
+history, a Discuss button on every card that opens a Claude Code session running as the ticket's role
+(`claude --agent scriptorium-<role>`; the agent files are written to `~/.claude/agents/`). The session
+introduces itself in two lines and waits for you; its brief is an index of the ticket, and it reads the
+records your request needs, then carries out what you decide with scr. System alarms show as one card
+per task and kind (`events:<task>:<kind>:<ts>`; Dismiss acks the whole group)) and the watcher in
+`--unattended` mode, and registers
 both at logon. Updates: `scr update <bundle.zip|folder>` copies the files in and migrates. Unattended = every mechanical decision is taken by the system:
 submissions are reviewed by a headless Steward (`--auto-review`), accepted when the checks are
 mechanical and the statement diff is empty (`--auto-decide`), landed as PRs and merged into the
