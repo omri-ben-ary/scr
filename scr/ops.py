@@ -34,7 +34,8 @@ def workload(root: Path, store: Store | None = None, name: str | None = None) ->
     wls = store.config("workloads") or {}
     if not wls:
         raise RepoError("config/workloads.yaml is empty")
-    name = name or next(iter(wls))
+    if not name or name not in wls:     # a record may name a workload before it is registered: default to the first entry
+        name = next(iter(wls))
     cfg = wls[name]
     repo = (root / cfg.get("repo", f"../{name}")).resolve()
     wt = (root / cfg["worktrees"]).resolve() if cfg.get("worktrees") else repo / ".worktrees"
@@ -43,6 +44,13 @@ def workload(root: Path, store: Store | None = None, name: str | None = None) ->
 
 def _log(root: Path) -> EventLog:
     return EventLog(root / "events" / "events.jsonl")
+
+
+def workload_for(root: Path, store: Store | None, t: Task) -> Workload:
+    """The workload a task record names (`workload:` in task.yaml), falling back to the first entry.
+    Every service that touches a task's worktree, branch or repo must resolve THIS, not the default
+    (T-0036: until 2026-09-16 the watcher, spawn, launch and discuss all took the first entry)."""
+    return workload(root, store, (t.rec or {}).get("workload"))
 
 
 def task_worktree(wl: Workload, t: Task) -> Path:
