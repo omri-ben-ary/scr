@@ -138,9 +138,15 @@ class Git:
 
     def commit_all(self, message: str, exclude: tuple[str, ...] = NOISE) -> str | None:
         """Stage everything (minus noise), commit if anything is staged. Returns the sha or None."""
-        add = self.run("add", "-A", "--", ".", *exclude)
+        # Add WITHOUT exclude pathspecs, then unstage the noise: on git 2.31 any `:(exclude)` pathspec next to
+        # `.` makes `git add -A` refuse with "paths are ignored: .lake" when an ignored directory exists
+        # (T-0015's worktree, every tick from 2026-09-16 20:58 — T-0041); plain `add -A -- .` just skips it.
+        add = self.run("add", "-A", "--", ".")
         if not add.ok:
             raise GitError(f"git add: {add.out}")
+        if exclude:
+            noise = [e.replace(":(exclude)", ":(glob)") for e in exclude]
+            self.run("reset", "-q", "--", *noise, *[n.replace(":(glob)", ":(glob)**/") for n in noise if not n.startswith(":(glob)**/")])
         if not self.run("diff", "--cached", "--quiet").ok:      # rc 1 = something staged
             msg_file = Path(self.git_dir()) / "SCR_COMMIT_MSG"   # inside .git: never part of the tree
             msg_file.write_text(message, encoding="utf-8")
