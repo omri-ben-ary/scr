@@ -31,7 +31,7 @@ from . import chores as chores_mod
 from .events import EventLog, now_iso
 from .graph import Graph
 from .journal import last_failure
-from .run import scr_cmd, scr_exe
+from .run import _env, scr_cmd, scr_exe
 from .state import State
 from .store import Store, find_root
 
@@ -184,7 +184,8 @@ def state(root: Path) -> dict:
         "concurrency": int(limits.get("concurrency", 3)),
         "verify_ok": not v["errors"], "verify_out": "; ".join(v["errors"][:3])[:400], "state_root": (snap.get("state_root") or "")[:12],
         "journal": {"head": head, "dirty": len(gj.dirty()) if head else 0, "last_failure": last_failure(root)},
-        "last_watch_tick": last_tick, "pid": os.getpid(),
+        "last_watch_tick": last_tick, "pid": os.getpid(), "paused": paused(root),
+        "watcher_running": bool(__import__("scr.run", fromlist=["pids_matching"]).pids_matching(__import__("scr.admin", fromlist=["WATCH_PATTERN"]).WATCH_PATTERN)),
         "needs": sorted(needs, key=lambda x: {"chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}[x["type"]]),
         "running": running, "ready": ready, "recent": recent,
         "jobs": JOBS.list(),
@@ -277,8 +278,39 @@ class Jobs:
 JOBS = Jobs()
 
 
+PAUSE_FILE = ".scr/paused"
+
+
+def paused(root: Path) -> bool:
+    return (root / PAUSE_FILE).exists()
+
+
+def _set_paused(root: Path, on: bool) -> dict:
+    p = root / PAUSE_FILE
+    p.parent.mkdir(exist_ok=True)
+    if on:
+        p.write_text(now_iso(), encoding="utf-8")
+    elif p.exists():
+        p.unlink()
+    scr_cmd(root, "omri", "event", "system", "--name", "watcher_paused" if on else "watcher_resumed", "--note", "via UI", "--quiet")
+    return {"ok": True, "output": "watcher paused: ticks only log 'paused' until you resume" if on else "watcher resumed"}
+
+
+def _quit(root: Path) -> dict:
+    from .admin import stop
+    lines = stop(root, "watch")
+    threading.Timer(1.0, lambda: os._exit(0)).start()      # the child exits 0 -> the supervisor stops too
+    return {"ok": True, "output": "\n".join(lines + ["UI shutting down; start it again from the Scriptorium shortcut"])}
+
+
 def run_action(root: Path, data: dict) -> dict:
     kind = data.get("kind")
+    if kind == "pause":
+        return JOBS.start("pause", "system:pause", "pause the watcher", lambda: _set_paused(root, True))
+    if kind == "resume":
+        return JOBS.start("resume", "system:resume", "resume the watcher", lambda: _set_paused(root, False))
+    if kind == "quit":
+        return JOBS.start("quit", "system:quit", "shut Scriptorium down", lambda: _quit(root))
     if kind == "chore":
         cid = data["id"]
         return JOBS.start("chore", f"chore:{cid}", data.get("title") or cid, lambda: _chore(root, cid))
@@ -408,7 +440,8 @@ def serve(root: Path, port: int = 8765, open_browser: bool = True, child: bool =
     if open_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     while True:
-        rc = subprocess.call(scr_exe(root) + ["--root", str(root), "ui", "--port", str(port), "--no-browser", "--child"], cwd=root)
+        # same interpreter as the supervisor (pythonw stays windowless), never scr.exe from here
+        rc = subprocess.call([sys.executable, "-m", "scr", "--root", str(root), "ui", "--port", str(port), "--no-browser", "--child"], cwd=root, env=_env())
         if rc != RELOAD_EXIT:
             break
         print("UI code changed on disk — restarting")
