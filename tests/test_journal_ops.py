@@ -373,3 +373,14 @@ def test_discuss_picks_role_and_folder(world):
     assert "role: Steward" in r.stdout
     files = list((root / ".scr" / "discuss").glob("T-0001-*.md"))
     assert files and files[0].with_suffix(".system.txt").exists() is False or True
+
+
+def test_paused_watcher_does_nothing(world):
+    from scr.watch import Watcher
+    root, _, _ = world
+    (root / ".scr").mkdir(exist_ok=True); (root / ".scr" / "paused").write_text("x")
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched")
+    res = Watcher(root, quiet=True).tick()
+    assert res.get("paused") and Store(root).get("T-0001").status == "dispatched"
+    (root / ".scr" / "paused").unlink()
+    assert not Watcher(root, quiet=True).tick().get("paused")

@@ -103,6 +103,8 @@
   <span class="stat">ready <b id="nReady">–</b></span>
   <span class="stat">needs you <b id="nNeeds">–</b></span>
   <span class="stat">watcher <b id="tick">–</b></span>
+  <button id="pauseBtn" class="small" title="Pause: the watcher keeps running but does nothing until you resume">Pause</button>
+  <button id="quitBtn" class="small" title="Stop the UI and the watcher; start again from the Scriptorium shortcut">Quit</button>
   <span class="spacer"></span>
   <button id="planTasks" class="primary" title="Open a planning session with Intake + Prioritizer: talk, and it turns the conversation into task records">Add tasks…</button>
   <button id="discussGeneral" title="Open a discussion session not tied to one ticket">Discuss…</button>
@@ -174,7 +176,8 @@ async function refresh() {
   $('#jDot').parentElement.title = j.last_failure ? 'last journal failure: ' + j.last_failure : 'the scriptorium repo journals itself; pending files are committed by the next command or watcher tick';
   $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency; $('#runN').textContent = STATE.running.length; $('#readyN').textContent = STATE.ready.length;
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
-  $('#tick').textContent = STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'not running';
+  $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
+  $('#pauseBtn').textContent = STATE.paused ? 'Resume' : 'Pause';
   renderNeeds(); renderDone(); renderLists(); renderTabs();
 }
 
@@ -306,6 +309,8 @@ async function answer(need, text) {
 $('#refresh').onclick = refresh;
 $('#discussGeneral').onclick = () => start({ kind: 'discuss', item: 'general' }, 'discuss:general');
 $('#planTasks').onclick = () => start({ kind: 'discuss', item: 'plan' }, 'discuss:plan');
+$('#pauseBtn').onclick = () => start({ kind: STATE && STATE.paused ? 'resume' : 'pause' }, 'system:pause');
+$('#quitBtn').onclick = async () => { await start({ kind: 'quit' }, 'system:quit'); setTimeout(() => { document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; }, 1500); };
 $('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; $('#inboxText').value = ''; await start({ kind: 'inbox', text: v }, 'inbox'); };
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;

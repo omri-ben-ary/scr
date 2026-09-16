@@ -75,7 +75,7 @@ def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode:
     args += extra or []
     flags = 0
     if os.name == "nt":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]  (+ CREATE_NO_WINDOW from scr/__init__)
     p = subprocess.Popen(args, cwd=cwd, stdin=brief_file.open("rb"), stdout=transcript.open("ab"),
                          stderr=transcript.with_suffix(transcript.suffix + ".err").open("ab"),
                          creationflags=flags, start_new_session=(os.name != "nt"))
@@ -86,7 +86,7 @@ def start_detached(args: list[str], cwd: Path, log: Path | None = None) -> int:
     """Start a long-running helper (the watcher, the UI) detached from this process."""
     flags = 0
     if os.name == "nt":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]  (+ CREATE_NO_WINDOW from scr/__init__)
     out = log.open("ab") if log else subprocess.DEVNULL
     p = subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                          creationflags=flags, start_new_session=(os.name != "nt"))

@@ -437,7 +437,7 @@ def cmd_up(args):
     from .admin import up, stop
     if args.stop:
         _print(stop(root, "ui") + stop(root, "watch")); return
-    lines = up(root, ui_only=args.ui_only, restart=args.restart, no_register=args.no_register, port=args.port, open_browser=not args.no_browser)
+    lines = up(root, ui_only=args.ui_only, restart=args.restart, register_logon=args.register, port=args.port, open_browser=not args.no_browser)
     _print(lines)
     (root / "reports").mkdir(exist_ok=True)      # `up` also runs windowless from the Desktop shortcut: keep a trace
     with (root / "reports" / "up.log").open("a", encoding="utf-8") as f:
@@ -595,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
     sub.add_parser("migrate", parents=[common], help="bring this checkout to journal mode (idempotent)").set_defaults(fn=cmd_migrate)
     upp = sub.add_parser("up", parents=[common], help="start (and register at logon) the UI and the watcher")
-    upp.add_argument("--ui-only", action="store_true"); upp.add_argument("--restart", action="store_true"); upp.add_argument("--no-register", action="store_true")
+    upp.add_argument("--ui-only", action="store_true"); upp.add_argument("--restart", action="store_true"); upp.add_argument("--register", action="store_true", help="also start at logon (default: only the Desktop shortcut starts it)")
     upp.add_argument("--stop", action="store_true"); upp.add_argument("--port", type=int, default=8765); upp.add_argument("--no-browser", action="store_true"); upp.set_defaults(fn=cmd_up)
     cf = sub.add_parser("config", parents=[common], help="set a top-level key in config/<file>.yaml (logged as system_change)")
     cf.add_argument("op", choices=["set"]); cf.add_argument("file"); cf.add_argument("key"); cf.add_argument("value"); cf.add_argument("--note"); cf.set_defaults(fn=cmd_config)

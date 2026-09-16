@@ -209,11 +209,23 @@ def register(root: Path, port: int = 8765) -> list[str]:
     return out
 
 
-def up(root: Path, *, ui_only: bool = False, restart: bool = False, no_register: bool = False, port: int = 8765, open_browser: bool = True) -> list[str]:
+def unregister(root: Path) -> list[str]:
+    if os.name != "nt":
+        return []
+    out = []
+    for name in ("Scriptorium\\UI", "Scriptorium\\Watcher"):
+        r = subprocess.run(["schtasks", "/Delete", "/F", "/TN", name], capture_output=True, text=True)
+        if r.returncode == 0:
+            out.append(f"logon task removed: {name}")
+    return out
+
+
+def up(root: Path, *, ui_only: bool = False, restart: bool = False, register_logon: bool = False, port: int = 8765, open_browser: bool = True) -> list[str]:
+    """Start (or restart) the UI and the watcher. Nothing runs at logon unless register_logon: the
+    Desktop shortcut is how Scriptorium starts, and Quit in the UI is how it stops."""
     out: list[str] = migrate(root)
-    if not no_register:
-        out += register(root, port)
-        out += desktop_shortcut(root, port)
+    out += register(root, port) if register_logon else unregister(root)
+    out += desktop_shortcut(root, port)
     if restart:
         out += stop(root, "ui")
         if not ui_only:

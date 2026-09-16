@@ -120,6 +120,9 @@ class Watcher:
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
         self.needs, self.rows = [], []
+        if (self.root / ".scr" / "paused").exists():
+            self.log("paused (resume from the UI)")
+            return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
         self.touch_log()
         sha = journal(self.root, "steward-watch", "tick: docs/records changed", push=self.push)
         if sha:
@@ -317,8 +320,8 @@ class Watcher:
                 time.sleep(30)
                 if _code_signature() > sig + 0.5:
                     self.log("code changed on disk — restarting the watcher")
-                    from .run import scr_exe, start_detached
+                    from .run import service_argv, start_detached
                     import sys as _sys
-                    start_detached(scr_exe(self.root) + ["--root", str(self.root)] + [a for a in _sys.argv[1:] if a not in ("--root", str(self.root))],
+                    start_detached(service_argv(self.root) + ["--root", str(self.root)] + [a for a in _sys.argv[1:] if a not in ("--root", str(self.root))],
                                    self.root, self.root / "reports" / "watch.log")
                     return
