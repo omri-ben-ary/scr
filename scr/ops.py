@@ -130,8 +130,8 @@ def checkpoint_commit(root: Path, tid: str, push: bool = False, wl_name: str | N
     """Commit whatever a running task's worktree holds, on its task branch. Nothing may exist only
     in a worktree: a crashed session or a crashed git (QI23, 2026-09-07) must cost at most one tick."""
     store = Store(root)
-    wl = workload(root, store, wl_name)
     t = store.get(tid)
+    wl = workload(root, store, wl_name) if wl_name else workload_for(root, store, t)
     wt = task_worktree(wl, t)
     if not wt.exists():
         return None
