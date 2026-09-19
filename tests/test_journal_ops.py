@@ -15,6 +15,7 @@ import pytest
 import yaml
 
 from scr import chores
+from scr.events import EventLog
 from scr.gitops import Git, GitError
 from scr.journal import journal
 from scr.ops import checkpoint_commit, land, park, retire, spawn, sweep
@@ -546,3 +547,95 @@ def test_hotfix_requests_dropped_together_with_the_fix(world):
     assert "ps_quote everywhere" in (t.dir / "report.md").read_text()
     assert hotfix.status(root) is None and not (root / ".scr" / "hotfix" / "close.json").exists()
     assert git(root, "status", "--porcelain") == ""
+
+
+# ---- dead / stale scriber sessions (T-0063) ---------------------------------------------------------
+def _running_with_session(world, pid: int | None, transcript: str | None = "session-20260917-000000.txt", data: bool = True):
+    """T-0001 in_progress in its worktree with a `launch` event the way the launcher records it: pid + transcript
+    in `data` (data=True), or the pre-T-0063 shape — the note `headless pid N` plus the launcher's log.md line."""
+    root, repo, _ = world
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched")
+    spawn(root, ["T-0001"], lake=False)
+    scr(root, "--actor", "s", "task", "set", "T-0001", "in_progress")
+    t = Store(root).get("T-0001")
+    args = ["--note", f"headless pid {pid}"]
+    if data:
+        args += ["--data", json.dumps({"pid": pid, "transcript": transcript})]
+    else:
+        (t.dir / "log.md").write_text(f"- 2026-09-16T19:59:38 [launcher] headless scriber session started (permission-mode bypassPermissions)\n"
+                                      f"- 2026-09-16T19:59:38 [launcher] pid {pid}, transcript {t.dir / transcript}\n", encoding="utf-8")
+    scr(root, "--actor", "steward:T-0001", "event", "system", "--name", "launch", "--task", "T-0001", *args, "--quiet")
+    return root, repo, t
+
+
+def _named(root: Path, name: str, task: str = "T-0001") -> list[dict]:
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("name") == name and e.get("task") == task]
+
+
+def test_watch_returns_task_whose_session_pid_is_gone(world):
+    from scr import ui
+    from scr.watch import Watcher
+    p = subprocess.Popen([sys.executable, "-c", "pass"]); p.wait()       # a pid that existed and is gone
+    root, _, t = _running_with_session(world, p.pid)
+    res = Watcher(root, quiet=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "returned"
+    assert res["rows"][0]["flags"].startswith(f"ckpt:") or "DEAD" in res["rows"][0]["flags"]
+    dead = _named(root, "session_dead")
+    assert len(dead) == 1 and f"pid {p.pid}" in dead[0]["note"], dead
+    ret = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("to") == "returned"]
+    assert ret and ret[-1]["note"].startswith("session died:"), ret
+    assert any("session died" in n for n in res["needs"])
+    cards = [n for n in ui.state(root)["needs"] if n["type"] == "system" and n.get("name") == "session_dead"]
+    assert len(cards) == 1 and cards[0]["id"] == "T-0001" and cards[0]["key"].startswith("events:T-0001:session_dead:"), cards
+    Watcher(root, quiet=True).tick()                                        # a returned task is not looked at again
+    assert Store(root).get("T-0001").status == "returned" and len(_named(root, "session_dead")) == 1
+    assert git(root, "status", "--porcelain") == ""
+
+
+def test_watch_returns_task_whose_transcript_err_says_terminated(world):
+    """The T-0015 shape: an old note-only launch event, the transcript named in log.md, the pid still alive
+    (here: the test process), and claude's termination line in the .err."""
+    from scr.watch import Watcher
+    root, _, t = _running_with_session(world, os.getpid(), "session-20260916-195938.txt", data=False)
+    (t.dir / "session-20260916-195938.txt.err").write_text(
+        "Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.\n", encoding="utf-8")
+    w = Watcher(root, quiet=True)
+    sess = w.session_of(t)
+    assert sess == {"pid": os.getpid(), "transcript": "session-20260916-195938.txt", "ts": sess["ts"]}
+    res = w.tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "returned"
+    dead = _named(root, "session_dead")
+    assert len(dead) == 1 and "claude terminated it: Background tasks still running after 600s" in dead[0]["note"], dead
+    assert not _named(root, "stale")                                         # dead is not also stale
+
+
+def test_watch_flags_alive_but_idle_session_as_stale_not_dead(world):
+    from scr import ui
+    from scr.watch import Watcher
+    root, repo, t = _running_with_session(world, os.getpid())                # alive: this very process
+    wt = repo / ".worktrees" / "T-0001"
+    old = time.time() - 3 * 3600
+    for f in [*wt.rglob("*"), t.dir / "log.md"]:
+        if f.is_file():
+            os.utime(f, (old, old))
+    res = Watcher(root, stale_minutes=45, quiet=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "in_progress"                 # alive but idle: never returned
+    assert "STALE" in res["rows"][0]["flags"] and "DEAD" not in res["rows"][0]["flags"], res["rows"]
+    assert any("silent for" in n and f"pid {os.getpid()} is alive" in n for n in res["needs"]), res["needs"]
+    assert len(_named(root, "stale")) == 1 and not _named(root, "session_dead")
+    cards = [n for n in ui.state(root)["needs"] if n["type"] == "system" and n.get("name") == "stale"]
+    assert len(cards) == 1 and cards[0]["id"] == "T-0001" and "STALE" in cards[0]["title"], cards
+    # a second idle tick raises no second event; the scriber writing again clears the card by itself
+    Watcher(root, stale_minutes=45, quiet=True).tick()
+    assert len(_named(root, "stale")) == 1
+    with (t.dir / "log.md").open("a", encoding="utf-8") as f:
+        f.write("- still here\n")
+    res3 = Watcher(root, stale_minutes=45, quiet=True).tick()
+    assert "STALE" not in res3["rows"][0]["flags"]
+    assert not [n for n in ui.state(root)["needs"] if n.get("name") == "stale"]
+    # and a new idle episode is a new card
+    os.utime(t.dir / "log.md", (old, old))
+    Watcher(root, stale_minutes=45, quiet=True).tick()
+    assert len(_named(root, "stale")) == 2

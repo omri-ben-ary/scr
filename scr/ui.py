@@ -111,6 +111,17 @@ def _started(root: Path, tid: str) -> str | None:
 
 _CHORE_CACHE: dict = {"ts": 0.0, "items": []}
 
+# System events that become a "needs you" card, one per (task, name). `stale` is a live condition: its card
+# shows only while the watcher's `stale:<task>` flag is set (idle >= stale_minutes, session alive) and
+# clears by itself when the scriber writes again; `session_dead` stays until dismissed (T-0063).
+ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale"}
+ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent"}
+RUNNING = {"dispatched", "in_progress", "checkpoint"}
+
+
+def _watch_flags(root: Path) -> set[str]:
+    return set(_read(root / ".scr" / "watch.state.txt").split())
+
 
 def chore_cards(root: Path, acked: set[str], max_age: float = 120.0) -> list[dict]:
     if time.time() - _CHORE_CACHE["ts"] < max_age:
@@ -159,16 +170,20 @@ def state(root: Path) -> dict:
             if len(parts) == 4:
                 group_acked[(parts[1], parts[2])] = max(group_acked.get((parts[1], parts[2]), ""), parts[3])
     groups: dict[tuple[str, str], dict] = {}
+    flags = _watch_flags(root)
     for e in _events(root, None, 2000):
         age = _age_h(e.get("ts"))
         if age is not None and age > 24 * 7:
             continue
-        if e.get("kind") != "system" or e.get("name") not in {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped"}:
+        if e.get("kind") != "system" or e.get("name") not in ALARM_EVENTS:
             continue
         task, name, ts = e.get("task") or "-", e.get("name"), e.get("ts") or ""
         if e.get("h") in acked or ts <= group_acked.get((task, name), ""):
             continue
-        grp = groups.setdefault((task, name), {"id": task, "kind": "system", "title": name, "type": "system", "options": [], "ts": ts, "count": 0, "notes": []})
+        if name == "stale" and not (f"stale:{task}" in flags and task in tasks and tasks[task].status in RUNNING):
+            continue
+        grp = groups.setdefault((task, name), {"id": task, "kind": "system", "name": name, "title": ALARM_TITLES.get(name, name), "type": "system",
+                                               "options": [], "ts": ts, "count": 0, "notes": []})
         grp["count"] += 1
         grp["ts"] = max(grp["ts"], ts)
         grp["notes"].append(e.get("note") or json.dumps(e.get("data") or {}))
@@ -177,7 +192,7 @@ def state(root: Path) -> dict:
         shown = notes[-8:]
         grp["text"] = "\n".join(shown) + (f"\n… and {len(notes) - len(shown)} earlier" if len(notes) > len(shown) else "")
         if grp["count"] > 1:
-            grp["title"] = f"{name} ×{grp['count']}"
+            grp["title"] = f"{grp['title']} ×{grp['count']}"
         grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"
         needs.append(grp)
     needs += chore_cards(root, acked)

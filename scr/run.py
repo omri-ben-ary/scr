@@ -115,6 +115,39 @@ def pids_matching(pattern: str) -> list[int]:
     return [p for p in pids if p != os.getpid()]
 
 
+def pid_alive(pid: int | None) -> bool:
+    """Is a process with this pid still running? No new dependencies: Win32 via ctypes (OpenProcess +
+    GetExitCodeProcess; an access-denied handle still means "exists"), POSIX via kill(pid, 0). The
+    watcher uses it on the pid the launcher recorded for a scriber session (T-0063). A pid Windows has
+    already reused for another process counts as alive; the transcript `.err` check covers that gap."""
+    if not pid or int(pid) <= 0:
+        return False
+    pid = int(pid)
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32                                     # type: ignore[attr-defined]
+        PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE, ERROR_ACCESS_DENIED = 0x1000, 259, 5
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED or k32.GetLastError() == ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return True                                              # exists but unreadable: assume alive
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def kill(pid: int) -> bool:
     try:
         if os.name == "nt":

@@ -50,6 +50,8 @@
   .card[data-type=decision] { border-left-color: var(--decision); }
   .card[data-type=chore] { border-left-color: var(--ok); }
   .card[data-type=hotfix] { border-left-color: var(--danger); } .badge.hotfix { background: var(--danger); }
+  .card[data-name=session_dead] { border-left-color: var(--danger); } .badge.session_dead { background: var(--danger); }
+  .card[data-name=stale] { border-left-color: var(--warn); } .badge.stale { background: var(--warn); }
   .card.selected { box-shadow: 0 0 0 2px var(--accent); }
   .card.running { border-style: dashed; }
   .card.running::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: linear-gradient(90deg, var(--accent) 0 40%, transparent 40% 100%); background-size: 200% 100%; animation: slide 1.2s linear infinite; border-radius: 0 0 var(--radius) 0; }
@@ -216,10 +218,11 @@ function renderNeeds() {
     const job = jobFor(n.key);
     const running = job && job.state === 'running';
     const failed = job && job.state === 'failed' && (!job.finished || true);
-    const c = document.createElement('article'); c.className = 'card' + (running ? ' running' : '') + (CURRENT === n.id ? ' selected' : ''); c.dataset.type = n.type; c.tabIndex = 0;
+    const c = document.createElement('article'); c.className = 'card' + (running ? ' running' : '') + (CURRENT === n.id ? ' selected' : ''); c.dataset.type = n.type; if (n.name) c.dataset.name = n.name; c.tabIndex = 0;
     c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
     const top = document.createElement('div'); top.className = 'top';
-    top.innerHTML = `<span class="badge ${n.type}">${n.type}</span> <span>${esc(n.id)}</span>` + (n.age_h ? `<span>· ${n.age_h} h</span>` : '') + (n.ts ? `<span>· ${fmtTs(n.ts)}</span>` : '') + (n.waiting && n.waiting.length ? `<span>· ${n.waiting.length} waiting</span>` : '');
+    const badge = n.type === 'system' && n.name ? n.name : n.type;   // system alarms wear their kind: scope_drift, session_dead, stale
+    top.innerHTML = `<span class="badge ${n.type} ${esc(badge)}">${esc(badge)}</span> <span>${esc(n.id)}</span>` + (n.age_h ? `<span>· ${n.age_h} h</span>` : '') + (n.ts ? `<span>· ${fmtTs(n.ts)}</span>` : '') + (n.waiting && n.waiting.length ? `<span>· ${n.waiting.length} waiting</span>` : '');
     const title = document.createElement('div'); title.className = 'title'; title.textContent = n.title;
     c.append(top, title);
     if (n.text) { const t = document.createElement('div'); t.className = 'text'; t.textContent = n.text; c.append(t); }

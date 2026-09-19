@@ -2,6 +2,7 @@
 hooks/launch_dispatched.ps1 and hooks/intake_run.ps1)."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -51,7 +52,10 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
             pid = start_claude(wt, bf, tr, permission_mode=permission_mode, model=model)
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"- {stamp} [launcher] pid {pid}, transcript {tr}\n")
-            scr_cmd(root, f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid, "--note", f"headless pid {pid}", "--quiet")
+            # the watcher re-checks this pid and this transcript's .err every tick (T-0063): both go in `data`,
+            # the note stays human-readable (and is the fallback for events recorded before `data` existed)
+            scr_cmd(root, f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid, "--note", f"headless pid {pid}",
+                    "--data", json.dumps({"pid": pid, "transcript": tr.name}), "--quiet")
             out.append(f"  headless pid {pid}; transcript {tr}")
         else:
             ps1 = t.dir / "launch.ps1"     # a script, not an inline command: wt splits command lines on ';'

@@ -10,7 +10,10 @@ Per tick:
     HELP: lines  -> help events (once per line)
     wall budget  -> budget_wall (once)
     submission   report.md != template -> submitted
+    dead session -> the launched pid is gone or the transcript .err says claude terminated it: returned
+                    + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15)
     heartbeat    checkpoint -> in_progress
+    stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> one headless review session (auto-review)
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
@@ -28,12 +31,17 @@ from .events import EventLog
 from .gitops import Git
 from .journal import journal
 from .ops import checkpoint_commit, in_scope, land, retire, task_worktree, workload, workload_for
-from .run import scr_cmd, start_claude
+from .run import pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
 
 STATE_FILE = ".scr/watch.state.txt"
 LOG_FILE = "reports/steward_watch.log"
+# claude -p writes this to stderr when it kills the session at its background-task ceiling (T-0067 owns the ceiling)
+DEAD_LINE = "Background tasks still running after"
+# Only a task whose session should be running is ever declared dead. `dispatched` has no session yet and
+# cannot be returned; a `waiting` task (T-0069) is parked on purpose and is never dead.
+DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 
 
 class Watcher:
@@ -56,6 +64,7 @@ class Watcher:
         self.report_tpl = tpl.read_text(encoding="utf-8").strip() if tpl.exists() else ""
         self.needs: list[str] = []
         self.rows: list[dict] = []
+        self.events: list[dict] | None = None      # events.jsonl, read once per tick
 
     # ---- helpers ------------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -93,12 +102,68 @@ class Watcher:
         """The UI reads the log's mtime as 'last tick'; make sure every tick leaves a line."""
         self.log("tick")
 
+    def read_events(self) -> list[dict]:
+        if self.events is None:
+            self.events = EventLog(self.root / "events" / "events.jsonl").read()
+        return self.events
+
     def started_at(self, tid: str) -> datetime | None:
         ts = None
-        for e in EventLog(self.root / "events" / "events.jsonl").read():
+        for e in self.read_events():
             if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == "in_progress" and e.get("from") == "dispatched":
                 ts = e.get("ts")
         return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+
+    def session_of(self, t) -> dict | None:
+        """The headless session the launcher started for the task's CURRENT run: {pid, transcript, ts} from
+        the last `launch` event since the last dispatched -> in_progress transition (the launcher sets
+        in_progress first, then launches). None for an interactive tab (no pid) or a run launched before
+        the pid was recorded; the pid comes from the event's data or its `headless pid N` note, the
+        transcript from the data or the launcher's line in log.md."""
+        launch = None
+        for e in self.read_events():
+            if e.get("task") != t.id:
+                continue
+            if e.get("kind") == "state" and e.get("to") == "in_progress" and e.get("from") == "dispatched":
+                launch = None
+            elif e.get("kind") == "system" and e.get("name") == "launch":
+                launch = e
+        if not launch:
+            return None
+        data = launch.get("data") or {}
+        pid = data.get("pid")
+        if pid is None:
+            m = re.search(r"headless pid (\d+)", launch.get("note") or "")
+            pid = int(m.group(1)) if m else None
+        if not pid:
+            return None
+        transcript = data.get("transcript")
+        if not transcript:
+            log_md = t.dir / "log.md"
+            for line in reversed(log_md.read_text(encoding="utf-8", errors="replace").splitlines() if log_md.exists() else []):
+                m = re.search(rf"\[launcher\] pid {int(pid)}, transcript (.+?)\s*$", line)
+                if m:
+                    transcript = Path(m.group(1).strip()).name
+                    break
+        return {"pid": int(pid), "transcript": transcript, "ts": launch.get("ts")}
+
+    @staticmethod
+    def session_dead(t, sess: dict) -> str | None:
+        """Why the session is dead, or None: the transcript's .err carries claude's termination line, or the
+        launched pid no longer exists. A pid Windows has reused still counts as alive (the .err covers the
+        common case); an alive-but-silent session is STALE, never dead."""
+        if sess.get("transcript"):
+            err = t.dir / (sess["transcript"] + ".err")
+            try:
+                text = err.read_text(encoding="utf-8", errors="replace") if err.exists() else ""
+            except OSError:
+                text = ""
+            for line in text.splitlines():
+                if DEAD_LINE in line:
+                    return f"claude terminated it: {line.strip()[:160]}"
+        if not pid_alive(sess["pid"]):
+            return f"pid {sess['pid']} no longer exists"
+        return None
 
     @staticmethod
     def newest_change(d: Path) -> datetime | None:
@@ -119,7 +184,7 @@ class Watcher:
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
-        self.needs, self.rows = [], []
+        self.needs, self.rows, self.events = [], [], None
         if (self.root / ".scr" / "paused").exists():
             self.log("paused (resume from the UI)")
             return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
@@ -210,6 +275,10 @@ class Watcher:
 
             rep = t.dir / "report.md"
             submitted = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl and self.report_tpl
+            # A finished session with a report is a submission, never a death; a session that is gone
+            # without one has nothing left to submit -> returned (dispatch relaunches it when ready).
+            sess = self.session_of(t) if t.status in DEAD_CHECK_STATUSES else None
+            dead = self.session_dead(t, sess) if sess and not submitted else None
             if ok and submitted and t.status != "submitted":
                 if t.status == "checkpoint":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "in_progress", "--quiet")
@@ -218,14 +287,32 @@ class Watcher:
                 self.scr(f"steward:{t.id}", "task", "set", t.id, "submitted", "--note", "report.md written (watcher)", "--quiet")
                 self.log(f"{t.id} -> submitted (report.md written)")
                 flags.append("SUBMITTED")
+            elif ok and dead:
+                flags.append(f"DEAD pid {sess['pid']}")
+                key = f"dead:{t.id}:{sess['pid']}"
+                if self.flag(key):
+                    self.log(f"{t.id} session dead: {dead} -> returned")
+                    self.scr(f"steward:{t.id}", "event", "system", "--name", "session_dead", "--task", t.id, "--note", f"pid {sess['pid']}: {dead}"[:300], "--quiet")
+                    if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
+                        self.unflag(key)                                  # retried next tick
+                self.needs.append(f"{t.id} session died ({dead}) — returned; no relaunch from here")
             elif ok and t.status in {"in_progress", "checkpoint"}:
                 if t.status == "in_progress":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "checkpoint", "--quiet")
                 self.scr(f"steward:{t.id}", "task", "set", t.id, "in_progress", "--quiet")
-            if idle >= self.stale:
+            if idle >= self.stale and not dead:
                 flags.append(f"STALE {idle}m")
-                self.needs.append(f"{t.id} silent for {idle} min — is its session alive?")
+                alive = f"pid {sess['pid']} is alive" if sess else "no recorded pid to check"
+                self.needs.append(f"{t.id} silent for {idle} min ({alive}) — is its session hung?")
+                if self.flag(f"stale:{t.id}"):                             # once per idle episode (see below)
+                    self.scr(f"steward:{t.id}", "event", "system", "--name", "stale", "--task", t.id, "--note",
+                             f"silent for {idle} min (threshold {self.stale}); {alive}", "--quiet")
+            else:
+                self.unflag(f"stale:{t.id}")
             self.rows.append({"task": t.id, "status": t.status, "idle_min": idle, "wall_h": wall, "flags": " ".join(flags), "title": t.rec.get("title", "")[:60]})
+        # a stale flag belongs to a running task: drop it when the task moved on, so a later run can raise it again
+        for key in [k for k in self.flags if k.startswith("stale:") and k.split(":", 1)[1] not in {t.id for t in running}]:
+            self.unflag(key)
 
         tasks = self.store.load_all()
         review = [t for t in tasks.values() if t.status == "submitted"]
