@@ -423,6 +423,20 @@ def cmd_migrate(args):
     _print(migrate(root))
 
 
+def cmd_ensure_main(args):
+    """Fold a side branch into <main> (fast-forward, else merge) and with --push send it to origin. This is
+    the `scr` way to move the checkout's branch: nobody types git in the scriptorium folder (T-0061)."""
+    root, store, _ = _ctx(args)
+    from .admin import ensure_main
+    from .gitops import Git
+    from .ops import self_workload
+    g = Git(root)
+    if g.dirty():                       # ensure_main refuses a dirty tree; in journal mode the tree is committed first
+        journal(root, args.actor, "ensure-main: journal the tree before folding main")
+    wl = self_workload(root, store)
+    _print(ensure_main(root, g, main=args.main or (wl.main if wl else "main"), push=args.push))
+
+
 def cmd_up(args):
     root, _, _ = _ctx(args)
     from .admin import up, stop
@@ -610,6 +624,8 @@ def build_parser() -> argparse.ArgumentParser:
     ch = sub.add_parser("chore", parents=[common], help="chores from ui/chores.yaml"); ch.add_argument("op", choices=["list", "run", "check"]); ch.add_argument("id", nargs="?"); ch.set_defaults(fn=cmd_chore)
     upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
     sub.add_parser("migrate", parents=[common], help="bring this checkout to journal mode (idempotent)").set_defaults(fn=cmd_migrate)
+    em = sub.add_parser("ensure-main", parents=[common], help="fold a side branch into main (fast-forward, else merge) and, with --push, push main to origin")
+    em.add_argument("--main", help="branch name (default: the scriptorium workload's main_branch)"); em.add_argument("--push", action="store_true"); em.set_defaults(fn=cmd_ensure_main)
     upp = sub.add_parser("up", parents=[common], help="start (and register at logon) the UI and the watcher")
     upp.add_argument("--ui-only", action="store_true"); upp.add_argument("--restart", action="store_true"); upp.add_argument("--register", action="store_true", help="also start at logon (default: only the Desktop shortcut starts it)")
     upp.add_argument("--stop", action="store_true"); upp.add_argument("--port", type=int, default=8765); upp.add_argument("--no-browser", action="store_true"); upp.set_defaults(fn=cmd_up)
@@ -632,7 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
 MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire",
-            "spawn", "launch", "chore", "update", "migrate", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix"}
+            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix"}
 
 
 def main(argv=None):
