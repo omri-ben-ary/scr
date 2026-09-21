@@ -72,7 +72,7 @@ def start_concierge(root: Path, tid: str, answer: str) -> int | None:
     bf = root / ".scr" / f"concierge-{tid}-{int(time.time())}.txt"
     bf.parent.mkdir(exist_ok=True)
     bf.write_text(brief, encoding="utf-8")
-    return start_claude(root, bf, root / "reports" / f"concierge-{tid}-{int(time.time())}.txt", permission_mode="acceptEdits")
+    return start_claude(root, bf, root / "reports" / f"concierge-{tid}-{int(time.time())}.txt", root=root)
 
 
 def add_inbox(root: Path, text: str, actor: str = "omri") -> dict:

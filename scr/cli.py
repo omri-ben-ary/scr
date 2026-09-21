@@ -598,7 +598,7 @@ def build_parser() -> argparse.ArgumentParser:
     rt = sub.add_parser("retire", parents=[common], help="quarantine a merged worktree (move, never delete)"); rt.add_argument("name"); rt.add_argument("--execute", action="store_true"); rt.set_defaults(fn=cmd_retire)
     sp = sub.add_parser("spawn", parents=[common], help="worktree per dispatched task from origin/<main>"); sp.add_argument("--tasks", nargs="*"); sp.add_argument("--no-lake", action="store_true"); sp.set_defaults(fn=cmd_spawn)
     la = sub.add_parser("launch", parents=[common], help="start scriber sessions for dispatched tasks")
-    la.add_argument("--tasks", nargs="*"); la.add_argument("--mode", choices=["headless", "tabs"], default="headless"); la.add_argument("--permission-mode", default="bypassPermissions")
+    la.add_argument("--tasks", nargs="*"); la.add_argument("--mode", choices=["headless", "tabs"], default="headless"); la.add_argument("--permission-mode", default=None, help="override the config default (limits.yaml claude_permission_mode; see scr/run.py)")
     la.add_argument("--model"); la.add_argument("--relaunch", action="store_true"); la.add_argument("--dry-run", action="store_true"); la.set_defaults(fn=cmd_launch)
     ik = sub.add_parser("intake", parents=[common], help="run the Intake agent once (headless)"); ik.add_argument("--dry-run", action="store_true"); ik.set_defaults(fn=cmd_intake)
     ck = sub.add_parser("checkpoint", parents=[common], help="commit a running task's worktree on its branch"); ck.add_argument("id"); ck.add_argument("--push", action="store_true"); ck.set_defaults(fn=cmd_checkpoint)
@@ -606,7 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--once", action="store_true"); w.add_argument("--interval", type=int, default=0); w.add_argument("--stale", type=int, default=45)
     for flag in ("auto-review", "auto-decide", "auto-dispatch", "allow-statements", "auto-land", "auto-intake", "unattended", "push"):
         w.add_argument("--" + flag, action="store_true")
-    w.add_argument("--permission-mode", default="acceptEdits"); w.set_defaults(fn=cmd_watch)
+    w.add_argument("--permission-mode", default=None, help="override the config default for the sessions this watcher starts (limits.yaml claude_permission_mode)"); w.set_defaults(fn=cmd_watch)
     ch = sub.add_parser("chore", parents=[common], help="chores from ui/chores.yaml"); ch.add_argument("op", choices=["list", "run", "check"]); ch.add_argument("id", nargs="?"); ch.set_defaults(fn=cmd_chore)
     upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
     sub.add_parser("migrate", parents=[common], help="bring this checkout to journal mode (idempotent)").set_defaults(fn=cmd_migrate)

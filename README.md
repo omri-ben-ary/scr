@@ -103,6 +103,18 @@ agents' `main_branch` (`--auto-land`), Inbox lines and report `unlocks` become t
 and the queue is refilled up to `concurrency` (`--auto-dispatch`). What still reaches you, in the UI:
 the five gates — new/changed statements, direction decisions, stuck tasks, config changes, seeding.
 
+Permission mode: every Claude session the operation starts — the headless ones (`claude -p`: scribers,
+Steward reviews and tooling reviews, the nightly Intake, the Concierge) and the interactive ones you open
+with Discuss — runs in Claude Code **auto mode** (`--permission-mode auto`), and a session started in a
+worktree gets `--add-dir <scriptorium root>` so it can read its `tasks/<id>/` record and `agents/`.
+The reason is that a headless session has nobody to approve a prompt: under `acceptEdits` every
+`scr.exe`, venv `python.exe` and `lake` call and every read outside the worktree was denied, so three
+reviews in a row wrote a Decision they could not apply and the nightly Intake created nothing (T-0077).
+In exchange the briefs forbid what the mode would otherwise allow: never merge a branch, never edit a
+Lean statement, never run git in the scriptorium root (it journals itself). The default lives once, in
+`scr/run.py` (`DEFAULT_PERMISSION_MODE`); `scr config set limits claude_permission_mode <mode>` overrides
+it for every session, and `scr launch --permission-mode` / `scr watch --permission-mode` for one run.
+
 Branch policy: `main_branch` (master) is the agents' branch and the full history log; the
 `trusted_branch` (trusted) holds sources of truth and only you push to it (protect it on GitHub:
 require a PR + your review, restrict who can push). `scr sweep --merge` commits and

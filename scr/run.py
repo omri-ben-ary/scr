@@ -64,15 +64,64 @@ def claude_argv(*args: str) -> list[str] | None:
     return [exe, *args]
 
 
-def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode: str = "acceptEdits",
-                 model: str | None = None, extra: list[str] | None = None) -> int | None:
-    """Detached `claude -p` reading the brief from stdin; stdout/stderr to the transcript. Returns the pid."""
-    args = claude_argv("-p", "--permission-mode", permission_mode, "--output-format", "text")
+DEFAULT_PERMISSION_MODE = "auto"        # the one default; the reason is in permission_mode_for's docstring
+PERMISSION_MODE_KEY = "claude_permission_mode"   # top-level key in config/limits.yaml that overrides it
+
+
+def permission_mode_for(root: Path | None) -> str:
+    """The permission mode every Claude session the operation starts runs in: config/limits.yaml
+    `claude_permission_mode` if set, else DEFAULT_PERMISSION_MODE = `auto` (T-0077).
+
+    Why `auto`: headless sessions (`claude -p`: scribers, Steward reviews, tooling reviews, the nightly
+    Intake, the Concierge, a future Steward help-session) have nobody at the keyboard to answer a permission
+    prompt. Under `acceptEdits` every scr.exe / venv python.exe / lake call and every read outside the
+    worktree was denied, so three reviews in a row (T-0056, T-0063, T-0071) wrote a Decision they could not
+    apply and the nightly Intake of 2026-09-16 created nothing. `auto` lets a session run the tools its brief
+    names and apply its own decision; in exchange the briefs forbid what the mode would otherwise allow:
+    never merge a branch, never edit a Lean statement, never run git in the scriptorium root (scr/brief.py,
+    agents/steward.md). The sessions Omri opens from the UI (Discuss) take the same default ("every session
+    I open should be on auto mode", 2026-09-20). The other values Claude Code accepts (`acceptEdits`,
+    `bypassPermissions`, `dontAsk`, `manual`, `plan`) are overrides, never defaults:
+    `scr config set limits claude_permission_mode <mode>`, or `--permission-mode` on `scr launch` / `scr watch`
+    for one run. A missing or unreadable limits.yaml must not stop a launch: it means the default."""
+    if root is None:
+        return DEFAULT_PERMISSION_MODE
+    p = Path(root) / "config" / "limits.yaml"
+    if not p.exists():
+        return DEFAULT_PERMISSION_MODE
+    try:
+        import yaml
+        cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001  (scr verify reports a broken config; the launch goes on with the default)
+        return DEFAULT_PERMISSION_MODE
+    mode = cfg.get(PERMISSION_MODE_KEY) if isinstance(cfg, dict) else None
+    return str(mode).strip() if mode else DEFAULT_PERMISSION_MODE
+
+
+def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | None = None, model: str | None = None,
+                 extra: list[str] | None = None) -> list[str] | None:
+    """The argv of a headless session: `claude -p --permission-mode <mode> --output-format text`, plus
+    `--add-dir <root>` when it runs somewhere other than the scriptorium root (a task worktree) so it can
+    read tasks/<id>/ and agents/. `permission_mode=None` means the config default (permission_mode_for)."""
+    mode = permission_mode or permission_mode_for(root)
+    args = claude_argv("-p", "--permission-mode", mode, "--output-format", "text")
     if not args:
         return None
+    if root is not None and Path(cwd).resolve() != Path(root).resolve():
+        args += ["--add-dir", str(root)]
     if model:
         args += ["--model", model]
     args += extra or []
+    return args
+
+
+def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode: str | None = None,
+                 model: str | None = None, extra: list[str] | None = None, root: Path | None = None) -> int | None:
+    """Detached `claude -p` reading the brief from stdin; stdout/stderr to the transcript. Returns the pid.
+    Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv)."""
+    args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra)
+    if not args:
+        return None
     flags = 0
     if os.name == "nt":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]  (+ CREATE_NO_WINDOW from scr/__init__)

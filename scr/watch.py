@@ -46,7 +46,7 @@ DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 
 class Watcher:
     def __init__(self, root: Path, *, stale_minutes: int = 45, auto_review=False, auto_decide=False, auto_dispatch=False,
-                 allow_statements=False, auto_land=False, auto_intake=False, permission_mode="acceptEdits", push=False,
+                 allow_statements=False, auto_land=False, auto_intake=False, permission_mode=None, push=False,
                  quiet=False):
         self.root = root
         self.store = Store(root)
@@ -55,6 +55,7 @@ class Watcher:
         self.stale = stale_minutes
         self.auto_review, self.auto_decide, self.auto_dispatch = auto_review, auto_decide, auto_dispatch
         self.allow_statements, self.auto_land, self.auto_intake = allow_statements, auto_land, auto_intake
+        # None = the config default (scr/run.py permission_mode_for); a value here is an override for tests and `scr watch --permission-mode`
         self.permission_mode, self.push, self.quiet = permission_mode, push, quiet
         self.flags: set[str] = set()
         sf = root / STATE_FILE
@@ -367,7 +368,7 @@ class Watcher:
                 if out and "dispatched T-" in out:
                     self.log("auto-dispatch: " + "; ".join(l for l in out.splitlines() if "dispatched T-" in l))
                     from .launch import launch
-                    for line in launch(self.root, mode="headless", permission_mode="bypassPermissions"):
+                    for line in launch(self.root, mode="headless", permission_mode=self.permission_mode):
                         self.log(f"  launcher: {line}")
 
         self.save_flags()
@@ -393,7 +394,7 @@ class Watcher:
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
         if not wt.exists():
             self.log(f"{t.id} cannot start review: worktree missing"); self.unflag(f"review:{t.id}"); return
-        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode)
+        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode, root=self.root)
         if pid:
             self.log(f"{t.id} review session started (pid {pid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid}", "--quiet")
@@ -421,7 +422,7 @@ class Watcher:
         bf = t.dir / "review-brief.txt"
         bf.write_text(brief, encoding="utf-8")
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
-        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode)
+        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode, root=self.root)
         if pid:
             self.log(f"{t.id} tooling review session started (pid {pid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid} (tooling)", "--quiet")

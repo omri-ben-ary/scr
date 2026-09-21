@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .events import EventLog
 from .ops import task_worktree, workload, workload_for
-from .run import claude_bin, scr_exe
+from .run import claude_bin, permission_mode_for, scr_exe
 from .store import Store
 
 CONCLUDE = """
@@ -361,6 +361,14 @@ def install_agents(root: Path, agents_dir: Path | None = None) -> list[Path]:
     return out
 
 
+def session_flags(root: Path, agent: str | None, add_dirs: list[str], quote) -> str:
+    """The flags every Discuss session gets, whatever the item kind: the role agent, the permission mode
+    (the same config default as the headless sessions, scr/run.py; Omri, 2026-09-20: "every session I open
+    should be on auto mode") and the extra directories. `quote` is the target shell's path quoting."""
+    agent_flag = f"--agent {agent} " if agent else ""
+    return f"{agent_flag}--permission-mode {permission_mode_for(root)} " + " ".join(f"--add-dir {quote(d)}" for d in add_dirs)
+
+
 def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
     s = build(root, item)
     bdir = root / ".scr" / "discuss"
@@ -390,7 +398,8 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
     if s.role == "toolsmith":
         first = f"Read {bf} in full now, then begin as it says."
     add_dirs = [str(root), str(s.repo or workload(root).repo)]
-    agent_flag = f"--agent {agent} " if agent else ""
+    flags_ps = session_flags(root, agent, add_dirs, ps_quote)
+    flags_sh = session_flags(root, agent, add_dirs, lambda x: f'"{x}"')
     if os.name == "nt":
         # A launcher SCRIPT, not an inline command: Windows Terminal splits its command line on ';'
         # (seen 2026-09-16: it tried to run `" claude ...` as a program). The system prompt is read
@@ -404,7 +413,7 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
         ps1.write_text("\ufeff" + f"Set-Location -LiteralPath {ps_quote(str(s.cwd))}\n"
                        f"$sys = Get-Content -Raw -Encoding UTF8 {ps_quote(str(sp))}\n"
                        f"$first = (Get-Content -Raw -Encoding UTF8 {ps_quote(str(ff))}).Trim()\n"
-                       f"claude {agent_flag}--permission-mode acceptEdits --add-dir {ps_quote(add_dirs[0])} --add-dir {ps_quote(add_dirs[1])} --append-system-prompt $sys $first\n",
+                       f"claude {flags_ps} --append-system-prompt $sys $first\n",
                        encoding="utf-8")
         title = (f"{ROLES[s.role][0]}: {s.title}").replace(";", ",").replace('"', "'")
         if shutil.which("wt"):
@@ -414,7 +423,7 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
         out.append(f"terminal opened: {title}")
     else:
         term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
-        line = (f"cd \"{s.cwd}\" && {exe} {agent_flag}--permission-mode acceptEdits --add-dir \"{add_dirs[0]}\" --add-dir \"{add_dirs[1]}\" "
+        line = (f"cd \"{s.cwd}\" && {exe} {flags_sh} "
                 f"--append-system-prompt \"$(cat \"{sp}\")\" \"{first}\"")
         if term:
             subprocess.Popen([term, "-e", f"bash -c '{line}'"])

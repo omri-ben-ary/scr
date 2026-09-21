@@ -12,12 +12,14 @@ from pathlib import Path
 from .brief import brief_for
 from .events import EventLog
 from .ops import spawn, task_worktree, workload_for
-from .run import claude_argv, claude_bin, scr_cmd, start_claude
+from .run import claude_bin, permission_mode_for, scr_cmd, session_argv, start_claude
 from .store import Store
 
 
-def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", permission_mode: str = "bypassPermissions",
+def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", permission_mode: str | None = None,
            model: str | None = None, relaunch: bool = False, dry_run: bool = False) -> list[str]:
+    """`permission_mode=None` (the normal case) is the config default resolved by scr/run.py (T-0077)."""
+    permission_mode = permission_mode or permission_mode_for(root)
     store = Store(root)
     tasks = store.load_all()
     want = {"dispatched", "in_progress", "checkpoint"} if relaunch else {"dispatched"}
@@ -49,7 +51,7 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
             tr = t.dir / f"session-{datetime.now():%Y%m%d-%H%M%S}.txt"
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"\n- {stamp} [launcher] headless scriber session started (permission-mode {permission_mode})\n")
-            pid = start_claude(wt, bf, tr, permission_mode=permission_mode, model=model)
+            pid = start_claude(wt, bf, tr, permission_mode=permission_mode, model=model, root=root)
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"- {stamp} [launcher] pid {pid}, transcript {tr}\n")
             # the watcher re-checks this pid and this transcript's .err every tick (T-0063): both go in `data`,
@@ -86,7 +88,7 @@ End with: scr event system --name intake_ran --note '<n created>'; scr verify.
 
 
 def intake(root: Path, dry_run: bool = False, timeout: int = 3600) -> list[str]:
-    argv = claude_argv("-p", "--permission-mode", "acceptEdits", "--output-format", "text")
+    argv = session_argv(root, root=root)          # the config permission mode (scr/run.py), cwd = the root
     if not argv:
         return ["claude not on PATH — intake skipped"]
     scr = root / ".venv" / "Scripts" / "scr.exe"
