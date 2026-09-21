@@ -53,6 +53,19 @@ def workload_for(root: Path, store: Store | None, t: Task) -> Workload:
     return workload(root, store, (t.rec or {}).get("workload"))
 
 
+def self_workload(root: Path, store: Store | None = None) -> Workload | None:
+    """The workload whose repo IS the scriptorium checkout (`repo: .` — registered as `scriptorium` by
+    T-0043), or None. It is special in three ways (T-0061): its worktrees are spawned from the checkout's
+    HEAD, not origin/<main> (the journal commits locally first and origin follows); `venv: link` gives
+    each worktree the checkout's .venv; `push: true` makes the watcher push every journal commit."""
+    store = store or Store(root)
+    for name in (store.config("workloads") or {}):
+        wl = workload(root, store, name)
+        if wl.repo == root.resolve():
+            return wl
+    return None
+
+
 def task_worktree(wl: Workload, t: Task) -> Path:
     return wl.wt_root / t.id
 
@@ -88,8 +101,33 @@ def _share_lake(repo: Path, wt: Path, out: list[str]) -> None:
             shutil.copytree(src_b, dst_b, dirs_exist_ok=True)
 
 
+def _link_venv(repo: Path, wt: Path, out: list[str]) -> None:
+    """`venv: link` — <worktree>/.venv is a junction (Windows) / symlink to the checkout's .venv: the same
+    interpreter, the same pytest and PyYAML, no install, no disk. `python -m pytest tests` run in the
+    worktree is honest: the cwd precedes the editable-install finder on sys.path, so `scr` is imported
+    from the WORKTREE (tests/test_scriptorium.py::test_scr_under_test_is_this_checkout guards it). A bare
+    `pytest.exe` would import the checkout's scr — the workload's `tests:` command must keep `python -m`."""
+    src, dst = repo / ".venv", wt / ".venv"
+    if dst.exists() or dst.is_symlink():
+        return
+    if not src.is_dir():
+        out.append(f"  no venv to link: {src} is missing (uv sync in the checkout first)")
+        return
+    if os.name == "nt":
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)], capture_output=True, text=True)
+        out.append("  junction .venv -> checkout .venv" if r.returncode == 0 else f"  venv junction failed: {(r.stdout + r.stderr).strip()[-200:]}")
+    else:
+        os.symlink(src, dst, target_is_directory=True)
+        out.append("  symlink .venv -> checkout .venv")
+
+
 def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, wl_name: str | None = None) -> list[str]:
-    """One worktree per dispatched/running task (or the ids given), branch task/<id> from origin/<main>."""
+    """One worktree per dispatched/running task (or the ids given), branch task/<id> from origin/<main> —
+    except for the scriptorium's own workload (`repo: .`), whose branch starts at the checkout's HEAD: the
+    journal commits there first and origin later, so HEAD is the only base that holds every record and the
+    current code (T-0061: on 2026-09-19 origin/main sat 1075 commits behind the checkout, and a scriber
+    spawned from it saw neither its own task record nor scr/ops.py). With `venv: link` the worktree also
+    gets the checkout's .venv (see _link_venv)."""
     store = Store(root)
     tasks = store.load_all()
     if not tids:
@@ -106,8 +144,11 @@ def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, w
         if wl.name not in prepared:
             wl.wt_root.mkdir(parents=True, exist_ok=True)
             g0 = Git(wl.repo)
-            g0.fetch()
-            prepared[wl.name] = (g0, f"origin/{wl.main}" if g0.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main)
+            if wl.repo == root.resolve():
+                prepared[wl.name] = (g0, "HEAD")          # the checkout itself: see the docstring
+            else:
+                g0.fetch()
+                prepared[wl.name] = (g0, f"origin/{wl.main}" if g0.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main)
         g, base = prepared[wl.name]
         wt = task_worktree(wl, t)
         br = f"task/{tid}"
@@ -116,9 +157,12 @@ def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, w
             r = g.worktree_add(wt, br, base)
             if not r.ok:
                 out.append(f"  worktree add failed: {r.out}"); continue
-            out.append(f"  based on {base} @ {Git(wl.repo).run('rev-parse', '--short', base).out}")
+            label = f"checkout HEAD ({g.branch()})" if base == "HEAD" else base
+            out.append(f"  based on {label} @ {g.run('rev-parse', '--short', base).out}")
         else:
             out.append("  exists, reusing")
+        if wl.cfg.get("venv") == "link":
+            _link_venv(wl.repo, wt, out)
         want_lake = lake if lake is not None else (".lean" in (t.dir / "task.yaml").read_text(encoding="utf-8"))
         if want_lake:
             _share_lake(wl.repo, wt, out)

@@ -30,7 +30,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import checkpoint_commit, in_scope, land, retire, task_worktree, workload, workload_for
+from .ops import checkpoint_commit, in_scope, land, retire, self_workload, task_worktree, workload, workload_for
 from .run import pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -57,6 +57,12 @@ class Watcher:
         self.allow_statements, self.auto_land, self.auto_intake = allow_statements, auto_land, auto_intake
         # None = the config default (scr/run.py permission_mode_for); a value here is an override for tests and `scr watch --permission-mode`
         self.permission_mode, self.push, self.quiet = permission_mode, push, quiet
+        # The journal push is a property of the scriptorium's own workload entry (`push: true` in
+        # config/workloads.yaml): the unattended watcher that `scr up` starts carries no flags, and until
+        # T-0061 (2026-09-19) it ran with push=False, so no journal commit ever reached origin. --push on the
+        # command line still turns it on, and alone decides the checkpoint push of a task branch (QI unchanged).
+        self_wl = self_workload(root, self.store)
+        self.push_journal = bool(push) or bool((self_wl.cfg if self_wl else {}).get("push", False))
         self.flags: set[str] = set()
         sf = root / STATE_FILE
         if sf.exists():
@@ -173,7 +179,7 @@ class Watcher:
         newest = 0.0
         for p in d.rglob("*"):
             s = str(p)
-            if "/.lake/" in s or "\\.lake\\" in s or "/.git/" in s or "\\.git\\" in s or ".loopy" in s:
+            if "/.lake/" in s or "\\.lake\\" in s or "/.git/" in s or "\\.git\\" in s or ".loopy" in s or "/.venv/" in s or "\\.venv\\" in s:
                 continue
             try:
                 if p.is_file():
@@ -196,7 +202,7 @@ class Watcher:
                 self.log(line)
         except Exception as e:  # noqa: BLE001
             self.log(f"hotfix requests: {e}")
-        sha = journal(self.root, "steward-watch", "tick: docs/records changed", push=self.push)
+        sha = journal(self.root, "steward-watch", "tick: docs/records changed", push=self.push_journal)
         if sha:
             self.log(f"journaled {sha}")
         v = State(self.root).verify()
@@ -372,7 +378,7 @@ class Watcher:
                         self.log(f"  launcher: {line}")
 
         self.save_flags()
-        journal(self.root, "steward-watch", "tick: records changed", push=self.push)
+        journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "needs": self.needs}
 
     def start_review(self, t) -> None:

@@ -110,9 +110,20 @@ def migrate(root: Path) -> list[str]:
     return out
 
 
-def ensure_main(root: Path, g: Git, main: str = "main") -> list[str]:
+def ensure_main(root: Path, g: Git, main: str = "main", push: bool = False) -> list[str]:
     """Work on `main`, not a side branch: if HEAD is elsewhere and main is an ancestor, fast-forward
-    main to HEAD and check it out; otherwise merge the side branch into main. Never discards commits."""
+    main to HEAD and check it out; otherwise merge the side branch into main. Never discards commits.
+    With push=True, `main` then goes to origin (also when nothing had to move), so origin/<main> carries
+    every journal commit: `scr ensure-main --push` (T-0061; on 2026-09-19 main sat on c55540f while the
+    checkout journaled 1075 commits on worktree-retirement). The push is never forced."""
+    out = _fold_main(g, main)
+    if push and g.branch() == main:
+        r = g.push(main)
+        out.append(f"pushed {main} to origin ({g.head(short=True)})" if r.ok else f"push of {main} failed: {r.out[-200:]}")
+    return out
+
+
+def _fold_main(g: Git, main: str) -> list[str]:
     cur = g.branch()
     if cur == main or cur == "HEAD":
         return []
