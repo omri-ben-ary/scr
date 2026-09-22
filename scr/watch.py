@@ -30,7 +30,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import checkpoint_commit, in_scope, land, retire, self_workload, task_worktree, workload, workload_for
+from .ops import checkpoint_commit, in_scope, land, land_scriptorium, retire, self_workload, task_worktree, workload, workload_for
 from .run import pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -222,9 +222,11 @@ class Watcher:
             flags: list[str] = []
             scope = (t.rec.get("scope") or {}).get("files") or []
 
-            if t.rec.get("workload") == "scriptorium":
-                flags.append("tooling")          # lives in the checkout; the journal records its commits
-            elif wt.exists():
+            # A spawned worktree is checkpointed whatever its workload: until T-0078 (2026-09-21) a scriptorium
+            # task was assumed to live in the checkout ("tooling") and its worktree was never committed, so
+            # T-0063/T-0071 ended as uncommitted changes with no path to the trunk. Only a scriptorium task
+            # WITHOUT a worktree is a hotfix made in the checkout, which the journal commits.
+            if wt.exists():
                 if ok:
                     try:
                         c = checkpoint_commit(self.root, t.id, push=self.push)
@@ -238,9 +240,14 @@ class Watcher:
                 # After a checkpoint commit the tree is clean, so drift is the branch's OWN commits: its diff to
                 # the merge-base with the branch it was spawned from, origin/<main> (ops.spawn uses the same
                 # rule). Never the local main: that can sit far behind origin and then every file merged since
-                # looks like drift (2026-09-16: 465 false files on T-0029 -> 583 alarm cards).
+                # looks like drift (2026-09-16: 465 false files on T-0029 -> 583 alarm cards). The scriptorium's
+                # own worktrees are the mirror image: spawned from the checkout's HEAD (T-0061), so their base
+                # is the local trunk, which origin may trail.
                 if not changed:
-                    base = f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
+                    if wl.repo == self.root.resolve():
+                        base = wl.main
+                    else:
+                        base = f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
                     r = g.run("diff", "--name-only", f"{base}...HEAD")
                     changed = [l.strip() for l in r.out.splitlines() if l.strip()] if r.ok else []
                 drift = [p for p in changed if scope and not in_scope(p, scope)]
@@ -252,6 +259,8 @@ class Watcher:
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "scope_drift", "--task", t.id, "--note", note[:900], "--quiet")
                 if drift:
                     flags.append(f"drift:{len(drift)}")
+            elif t.rec.get("workload") == "scriptorium":
+                flags.append("tooling")          # a hotfix in the checkout; the journal records its commits
             else:
                 flags.append("no-worktree")
 
@@ -333,10 +342,8 @@ class Watcher:
                 if not self.flag(f"land:{t.id}"):
                     continue
                 if t.rec.get("workload") == "scriptorium":
-                    # the fix is already on main (the tree journals itself): accepted -> merged, no PR, no worktree
-                    self.scr(f"steward:{t.id}", "task", "set", t.id, "merged", "--note", "tooling task: change already on main (journal)", "--quiet")
-                    self.log(f"{t.id} tooling task -> merged")
-                    merged_now += 1
+                    if self.land_scriptorium_task(t):
+                        merged_now += 1
                     continue
                 self.log(f"{t.id} auto-land: commit/push/PR/merge")
                 try:
@@ -381,6 +388,55 @@ class Watcher:
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "needs": self.needs}
 
+    def land_scriptorium_task(self, t) -> bool:
+        """accepted scriptorium task -> merged (T-0078). No worktree: a hotfix made in the checkout, whose
+        commits the journal already put on the trunk — merged without a merge, as before. A spawned
+        worktree: ops.land_scriptorium (commit, merge the trunk in, tests, merge into the trunk), then
+        retire, like any other workload. A failure (conflict, failing tests, checkout off the trunk) leaves
+        the task accepted, logs the reason, raises ONE land_failed event per task-branch tip and a NEEDS-YOU
+        line every tick; the attempt is repeated only when task/<id> changes (a fix commit), since the same
+        tip would fail the same way — or when the branch reached the trunk by hand, which is then recorded."""
+        wl = workload_for(self.root, self.store, t)
+        wt = task_worktree(wl, t)
+        if not wt.exists():
+            self.scr(f"steward:{t.id}", "task", "set", t.id, "merged", "--note", "tooling task: change already on main (journal)", "--quiet")
+            self.log(f"{t.id} tooling task (no worktree) -> merged")
+            return True
+        g, mg = Git(wt), Git(self.root)
+        tip = g.head() if not g.dirty() else None
+        failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
+        if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
+            self.needs.append(f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit retries) or merge it into {wl.main} by hand")
+            self.unflag(f"land:{t.id}")
+            return False
+        self.log(f"{t.id} auto-land (scriptorium worktree): commit, merge {wl.main} in, tests, merge into {wl.main}")
+        try:
+            res = land_scriptorium(self.root, t.id)
+        except Exception as e:  # noqa: BLE001
+            res = {"ok": False, "reason": "error", "out": [f"FAILED (error): {e}"], "sha": None, "tip": g.head()}
+        for line in res["out"]:
+            self.log(f"  land: {line}")
+        if not res["ok"]:
+            why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
+            self.needs.append(f"{t.id} landing failed ({res['reason']}) — {why[:200]}; see reports/steward_watch.log")
+            for k in failed - {f"land_failed:{t.id}:{res.get('tip') or 'unknown'}"}:   # only the current tip is remembered
+                self.unflag(k)
+            if self.flag(f"land_failed:{t.id}:{res.get('tip') or 'unknown'}"):
+                self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
+            self.unflag(f"land:{t.id}")
+            return False
+        for k in failed:
+            self.unflag(k)
+        try:
+            r = retire(self.root, t.id, execute=True)
+        except Exception as e:  # noqa: BLE001
+            r = {"ok": False, "code": "error", "out": [str(e)]}
+        for line in r["out"]:
+            self.log(f"  retire: {line}")
+        if not r["ok"]:
+            self.needs.append(f"{t.id} merged; worktree retire refused ({r['code']}) — see log")
+        return True
+
     def start_review(self, t) -> None:
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
@@ -411,7 +467,8 @@ class Watcher:
         """A hotfix / tooling task: the 'worktree' is the checkout itself; the review reads the commits the
         record's log.md names, runs the tests, judges the fix, and proposes follow-ups in review.md."""
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): `task set {t.id} accepted` if the tests pass and the fix "
-                  f"addresses the symptom (the watcher marks it merged: the change is already on main); otherwise `returned` with feedback "
+                  f"addresses the symptom (the watcher then lands it: a hotfix made in the checkout is already on main; a task spawned into "
+                  f"a worktree is committed, merged into main and tested first — T-0078); otherwise `returned` with feedback "
                   f"or `escalated` then `omri_queue`. Never run git here; never edit the tooling in this session — a further fix is a new "
                   f"`scr hotfix open`."
                   if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")

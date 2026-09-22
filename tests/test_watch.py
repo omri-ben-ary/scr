@@ -221,3 +221,203 @@ def test_no_other_permission_mode_is_hard_coded():
     hits = [(p.name, i) for p in src.glob("*.py") for i, l in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
             if "acceptEdits" in l or "bypassPermissions" in l]
     assert hits and {h[0] for h in hits} == {"run.py"}, hits
+
+
+# ---- T-0078: a spawned scriptorium task lands (commit, merge, tests, merged) ----------------------------
+# The checkout is its own workload (test_scriptorium.self_world: repo `.`, linked venv, a bare origin). The
+# workload's `tests:` command is a one-line script that passes iff tool.txt (the file the task edits) says
+# "ok": whether the tests pass is then a property of the tree being landed, exactly as in the real case.
+from test_scriptorium import git as sgit, scr as sscr, self_world  # noqa: E402
+
+CHECK = "import sys; sys.exit(0 if open('tool.txt', encoding='utf-8').read().strip() == 'ok' else 1)\n"
+
+
+def _events(root: Path, name: str, task: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "system" and e.get("name") == name and e.get("task") == task]
+
+
+def _land_world(tmp_path: Path, monkeypatch, journal: bool = False) -> tuple[Path, Path, Path]:
+    """self_world on `main` with T-0007 (workload scriptorium, scope tool.txt) spawned into
+    ../scriptorium-worktrees/T-0007 and then accepted. Returns (root, origin, worktree)."""
+    if journal:
+        monkeypatch.delenv("SCR_NO_JOURNAL", raising=False)
+    else:
+        monkeypatch.setenv("SCR_NO_JOURNAL", "1")
+    root, origin = self_world(tmp_path)
+    sscr(root, "--actor", "omri", "ensure-main", "--push")
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["scriptorium"]["tests"] = f"{sys.executable} check.py"
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    (root / "check.py").write_text(CHECK, encoding="utf-8")
+    (root / "tool.txt").write_text("base\n", encoding="utf-8")
+    sscr(root, "--quiet", "task", "new", "Tooling", "--id", "T-0007", "--workload", "scriptorium", "--files", "tool.txt", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", st)
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] record, tool, check"); sgit(root, "push", "-q", "origin", "main")
+    spawn(root, ["T-0007"])
+    wt = tmp_path / "scriptorium-worktrees" / "T-0007"
+    assert wt.is_dir() and sgit(wt, "rev-parse", "--abbrev-ref", "HEAD") == "task/T-0007"
+    for st in ("in_progress", "submitted", "accepted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", st)
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] accepted")     # the trunk moves after the spawn, as it always does
+    return root, origin, wt
+
+
+def _tick(root: Path) -> dict:
+    from scr.watch import Watcher
+    return Watcher(root, quiet=True, auto_land=True).tick()
+
+
+def test_accepted_scriptorium_worktree_is_committed_merged_and_tested(tmp_path: Path, monkeypatch):
+    """DoD 1: an accepted scriptorium task with a spawned worktree holding an UNCOMMITTED change; after the
+    tick that change is a commit reachable from the trunk, the task is merged, and log.md names the commit.
+    Journal on: the real tick (journal, verify, land, journal) against a checkout that commits itself."""
+    root, origin, wt = _land_world(tmp_path, monkeypatch, journal=True)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")                                   # the scriber's work, never committed
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    t = Store(root).get("T-0007")
+    assert t.status == "merged", (t.status, res["needs"])
+    # the change is on the trunk: a commit reachable from main, and main's tree has it
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok"
+    change = sgit(root, "log", "-1", "--format=%H", "main", "--", "tool.txt")
+    assert change and sgit(root, "merge-base", "--is-ancestor", change, "main") == ""
+    assert sgit(root, "merge-base", "--is-ancestor", "task/T-0007", "main") == ""
+    assert sgit(root, "rev-parse", "main") != main_before
+    assert sgit(root, "rev-parse", "--abbrev-ref", "HEAD") == "main"                          # the checkout stays on the trunk
+    assert not (root / ".git" / "MERGE_HEAD").exists()
+    # the record names the trunk commit: the state event, the landed event, and log.md
+    ev = [e for e in _events(root, "landed", "T-0007")]
+    assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"] and "tests pass" in ev[0]["note"], ev
+    sha = ev[0]["note"].split("@")[1].split()[0]
+    assert sgit(root, "merge-base", "--is-ancestor", sha, "main") == ""
+    assert sgit(root, "show", f"{sha}:tool.txt").strip() == "ok"
+    log = (t.dir / "log.md").read_text(encoding="utf-8")
+    assert f"landed: task/T-0007 -> main @ {sha}" in log, log
+    assert not _events(root, "land_failed", "T-0007") and not res["needs"], res["needs"]
+    # merged is journaled (the tick commits the record) and pushed; the worktree is retired (quarantined, not deleted)
+    assert sgit(root, "status", "--porcelain") == ""
+    assert sgit(root, "rev-parse", "main") == sgit(origin, "rev-parse", "main")
+    assert not wt.exists() and list((tmp_path / "scriptorium-RETIRED").glob("*-T-0007/worktree/tool.txt"))
+
+
+def test_accepted_hotfix_without_worktree_is_merged_without_a_merge(tmp_path: Path, monkeypatch):
+    """DoD 2: the hotfix path is unchanged — a scriptorium task with no worktree is merged directly, the
+    trunk untouched, with the note that says why."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0008", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted", "accepted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0008", st)
+    (tmp_path / "scriptorium-worktrees" / "T-0007").rename(tmp_path / "T-0007-parked")   # keep this tick to the hotfix
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", "returned")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0008").status == "merged", res
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+    from scr.events import EventLog
+    st = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == "T-0008" and e.get("to") == "merged"]
+    assert len(st) == 1 and "already on main (journal)" in st[0]["note"], st
+
+
+def test_merge_conflict_is_not_merged_and_raises_land_failed(tmp_path: Path, monkeypatch):
+    """DoD 3a: the trunk changed the same line the worktree changed. The task stays accepted, one
+    land_failed event names the file, the NEEDS-YOU line is there every tick, the worktree is left clean
+    (merge aborted), the trunk untouched; the attempt is not repeated while the branch tip is the same, and
+    is repeated — and lands — once the branch is fixed."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk moved on tool.txt")
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    assert Store(root).get("T-0007").status == "accepted"
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "conflict" in ev[0]["note"] and "tool.txt" in ev[0]["note"], ev
+    assert any(n.startswith("T-0007 landing failed (conflict)") for n in res["needs"]), res["needs"]
+    assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "trunk edit"
+    assert not (root / ".git" / "worktrees" / "T-0007" / "MERGE_HEAD").exists()
+    assert sgit(wt, "status", "--porcelain") == ""                                            # the work was committed on task/T-0007 ...
+    assert sgit(wt, "show", "HEAD:tool.txt").strip() == "ok" and not _events(root, "landed", "T-0007")
+    tip = sgit(wt, "rev-parse", "HEAD")
+    # second tick: same tip -> no second attempt, no second event, still a NEEDS-YOU line
+    res2 = _tick(root)
+    assert Store(root).get("T-0007").status == "accepted" and len(_events(root, "land_failed", "T-0007")) == 1
+    assert any("landing failed at " + tip[:8] in n for n in res2["needs"]), res2["needs"]
+    assert sgit(wt, "rev-parse", "HEAD") == tip
+    # the fix: resolve on the branch by hand (merge main in, keep "ok", commit: a new tip) -> the next tick lands it
+    m = subprocess.run(["git", "merge", "main"], cwd=wt, capture_output=True, text=True)
+    assert m.returncode != 0 and "CONFLICT" in m.stdout + m.stderr
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    sgit(wt, "add", "tool.txt"); sgit(wt, "commit", "-q", "-m", "resolve: keep ok")
+    res3 = _tick(root)
+    assert Store(root).get("T-0007").status == "merged", res3["needs"]
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "landed", "T-0007")) == 1
+    assert len(_events(root, "land_failed", "T-0007")) == 1
+    assert not any(k.startswith("land_failed:T-0007:") for k in (root / ".scr" / "watch.state.txt").read_text(encoding="utf-8").split())
+
+
+def test_failing_tests_are_not_merged_and_raise_land_failed(tmp_path: Path, monkeypatch):
+    """DoD 3b: the merge is clean but the workload's tests fail on the result: not merged, land_failed says
+    `tests`, the trunk untouched. The tests ran in the worktree, on task/<id> with the trunk merged in, so
+    the failing tree never reached the checkout. A fix on the branch (still uncommitted) lands next tick."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("broken\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and ev[0]["note"].startswith("FAILED (tests)") and "check.py" in ev[0]["note"], ev
+    assert any("landing failed (tests)" in n for n in res["needs"]), res["needs"]
+    assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "base"
+    assert sgit(wt, "status", "--porcelain") == "" and sgit(wt, "merge-base", "--is-ancestor", "main", "HEAD") == ""   # trunk merged INTO the branch
+    log = (Store(root).get("T-0007").dir / "log.md").read_text(encoding="utf-8")
+    assert "landed:" not in log
+    # the scriber (or Omri) fixes the branch; the fix is uncommitted again, the next tick commits and lands it
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    res2 = _tick(root)
+    assert Store(root).get("T-0007").status == "merged", res2["needs"]
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "land_failed", "T-0007")) == 1
+
+
+def test_checkout_off_the_trunk_is_a_landing_failure_not_a_guess(tmp_path: Path, monkeypatch):
+    """The trunk is config `main_branch`, and the checkout must be on it (T-0061 ensure_main's rule); a
+    checkout on a side branch fails the landing with a pointer to `scr ensure-main`, touching nothing."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    sgit(root, "checkout", "-q", "-b", "side")
+    res = _tick(root)
+    assert Store(root).get("T-0007").status == "accepted"
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "trunk" in ev[0]["note"] and "ensure-main" in ev[0]["note"], ev
+    assert sgit(root, "show", "main:tool.txt").strip() == "base" and sgit(root, "rev-parse", "--abbrev-ref", "HEAD") == "side"
+
+
+def test_running_scriptorium_worktree_is_checkpointed_each_tick(tmp_path: Path, monkeypatch):
+    """The checkpoint step no longer skips a scriptorium task that has a worktree: its dirty tree is
+    committed on task/<id> every tick (nothing may exist only in a worktree); a task without one is
+    still flagged `tooling`."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", "returned")
+    sscr(root, "--quiet", "task", "new", "Tooling 2", "--id", "T-0009", "--workload", "scriptorium", "--files", "tool.txt", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0009", st)
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] T-0009")
+    spawn(root, ["T-0009"])
+    wt9 = tmp_path / "scriptorium-worktrees" / "T-0009"
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0009", "in_progress")
+    (wt9 / "tool.txt").write_text("work in progress\n", encoding="utf-8")
+    from scr.watch import Watcher
+    res = Watcher(root, quiet=True).tick()
+    row = next(r for r in res["rows"] if r["task"] == "T-0009")
+    assert "ckpt:" in row["flags"] and "tooling" not in row["flags"], row
+    assert sgit(wt9, "status", "--porcelain") == "" and "[checkpoint] T-0009" in sgit(wt9, "log", "-1", "--format=%s")
+    assert "drift" not in row["flags"]                                                        # base = the local trunk, not origin/main
+    # a scriptorium task with no worktree is a hotfix in the checkout: flagged tooling, nothing to checkpoint
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0010", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0010", st)
+    res = Watcher(root, quiet=True).tick()
+    assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
