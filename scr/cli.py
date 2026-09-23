@@ -218,6 +218,7 @@ def cmd_dispatch(args):
     root, store, log = _ctx(args)
     limits = store.config("limits")
     g = Graph.build(store.load_all())
+    # the slot-holders: the same set as scr.watch.SLOT_STATUSES; `escalated` and `returned` never count (T-0092)
     running = [t.id for t in g.tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"}]
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")

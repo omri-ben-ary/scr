@@ -16,6 +16,11 @@ Per tick:
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
                 -> otherwise one headless review session (auto-review)
+  stuck         -> escalated + one slot_freed event (auto-decide; T-0092): a task that cannot progress is
+                   escalated, never held — submitted > review_stale_hours with no Decision written, or
+                   in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours; the
+                   escalated task no longer counts against the cap, so auto-dispatch below fills the slot
+                   on the same tick
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
@@ -44,6 +49,17 @@ DEAD_LINE = "Background tasks still running after"
 # Only a task whose session should be running is ever declared dead. `dispatched` has no session yet and
 # cannot be returned; a `waiting` task (T-0069) is parked on purpose and is never dead.
 DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
+# What holds a concurrency slot (the watcher's n_running and cmd_dispatch's `running` count exactly these).
+# `escalated` and `returned` never do: an escalation is a queue item for Omri and its slot goes to the next
+# ready task on the same tick (T-0092; 2026-09-19..21 T-0050 and T-0061 held both slots for 35 h).
+SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}
+REVIEW_STALE_HOURS, HELP_STALE_HOURS = 2.0, 3.0      # limits.yaml: review_stale_hours / help_stale_hours
+# A HELP line the scriber cannot proceed past: plain `HELP:` or `HELP[blocks: …]:`. `HELP[proceeding: …]:`
+# (T-0068) is a question asked while working, never a block.
+_HELP_BLOCKING = re.compile(r"^\s*(-\s*)?HELP(\[blocks:[^\]]*\])?:")
+# an answer under it: the Steward's line (`[steward]`, also what the UI's answer box writes) or Omri's
+_HELP_ANSWER = re.compile(r"\[(steward|omri)(:[^\]]*)?\]")
+_LINE_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
 
 # ---- the Decision written in review.md (T-0091) ------------------------------------------------------
 VERDICTS = ("accepted", "returned", "escalated")
@@ -135,6 +151,80 @@ def review_digest(review_md: str) -> str:
     return hashlib.sha256(review_md.encode("utf-8")).hexdigest()[:12]
 
 
+# ---- a stuck task leaves the slot (T-0092): pure functions of (record, review.md, log.md, events, now) -------
+def _event_ts(e: dict) -> datetime | None:
+    ts = e.get("ts")
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+    except ValueError:
+        return None
+
+
+def _parse_ts(s: str) -> datetime | None:
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def submitted_since(events: list[dict], tid: str) -> datetime | None:
+    """When the task last became `submitted` (its current submission), from the event log."""
+    since = None
+    for e in events:
+        if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == "submitted":
+            since = _event_ts(e) or since
+    return since
+
+
+def submitted_stale(status: str, review_md: str, since: datetime | None, hours: float, now: datetime) -> dict | None:
+    """{since, age_h} when a `submitted` task has waited more than `hours` and review.md carries NO written
+    Decision. A written Decision — readable (T-0091 applies it) or not (T-0091 asks Omri to apply it by
+    hand) — wins over the timeout: the reviewer finished, the wait is not the review's. Until T-0075 lands
+    the wait is time-based only; with T-0075 the same check runs after its relaunch cap (review_relaunch_max)
+    is reached, so a review is relaunched first and escalated after."""
+    if status != "submitted" or since is None:
+        return None
+    verdict, problem = read_decision(review_md)
+    if verdict or problem:
+        return None
+    age_h = (now - since).total_seconds() / 3600
+    if age_h <= hours:
+        return None
+    return {"since": since, "age_h": round(age_h, 1)}
+
+
+def help_stale(log_md: str, hours: float, now: datetime, seen: dict[str, datetime] | None = None,
+               fallback: datetime | None = None) -> dict | None:
+    """{line, text, since, age_h} when the NEWEST blocking HELP line of log.md (`HELP:` or `HELP[blocks: …]:`;
+    a `HELP[proceeding: …]:` line is not a block) has no `[steward]` / `[omri]` line anywhere after it and is
+    older than `hours`. The line is dated by `seen` (the watcher's first `help` event for that line text),
+    else by a timestamp in the line itself, else by `fallback` (the caller's log.md mtime — right when the
+    HELP line is the last thing written, later than the truth otherwise, so never early); undatable -> None.
+    Once T-0069 lands, a blocked scriber exits with `WAITING:` and the task is `waiting`, not escalated —
+    that transition is T-0069's, not implemented here."""
+    lines = log_md.splitlines()
+    hits = [i for i, l in enumerate(lines) if _HELP_BLOCKING.match(l)]
+    if not hits:
+        return None
+    i = hits[-1]
+    if any(_HELP_ANSWER.search(nxt) for nxt in lines[i + 1:]):
+        return None
+    text = lines[i].strip()
+    since = (seen or {}).get(text[:300])
+    if since is None:
+        m = _LINE_TS.search(text)
+        since = _parse_ts(m.group(0)) if m else None
+    if since is None:
+        since = fallback
+    if since is None:
+        return None
+    age_h = (now - since).total_seconds() / 3600
+    if age_h <= hours:
+        return None
+    return {"line": i + 1, "text": text, "since": since, "age_h": round(age_h, 1)}
+
+
 class Watcher:
     def __init__(self, root: Path, *, stale_minutes: int = 45, auto_review=False, auto_decide=False, auto_dispatch=False,
                  allow_statements=False, auto_land=False, auto_intake=False, permission_mode=None, push=False,
@@ -162,6 +252,7 @@ class Watcher:
         self.report_tpl = tpl.read_text(encoding="utf-8").strip() if tpl.exists() else ""
         self.needs: list[str] = []
         self.rows: list[dict] = []
+        self.escalated: list[dict] = []            # the stuck tasks this tick moved to `escalated` (T-0092)
         self.events: list[dict] | None = None      # events.jsonl, read once per tick
 
     # ---- helpers ------------------------------------------------------------------
@@ -282,7 +373,7 @@ class Watcher:
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
-        self.needs, self.rows, self.events = [], [], None
+        self.needs, self.rows, self.escalated, self.events = [], [], [], None
         if (self.root / ".scr" / "paused").exists():
             self.log("paused (resume from the UI)")
             return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
@@ -435,6 +526,13 @@ class Watcher:
             tasks = self.store.load_all()                   # auto-land below sees an `accepted` applied this tick
             review = [t for t in tasks.values() if t.status == "submitted"]
 
+        # Order of the slot blocks (T-0092): T-0091's Decision application above, then T-0075's review relaunch
+        # (once it lands: relaunch first, escalate after its cap), then this escalation, then auto-dispatch, which
+        # reloads the records and so fills the slot a stuck task freed on the SAME tick.
+        if self.auto_decide and ok and self.escalation_checks(now, tasks):
+            tasks = self.store.load_all()
+            review = [t for t in tasks.values() if t.status == "submitted"]
+
         merged_now = 0
         if self.auto_land and ok:
             for t in [t for t in tasks.values() if t.status == "accepted"]:
@@ -473,7 +571,7 @@ class Watcher:
         if self.auto_dispatch and ok:
             cap = int(self.limits.get("concurrency", 3))
             tasks = self.store.load_all()
-            n_running = sum(1 for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"})
+            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES)   # escalated / returned never count (T-0092)
             if n_running < cap:
                 args = ["dispatch", "--quiet"] + (["--allow-statements"] if self.allow_statements else [])
                 out = self.scr("prioritizer", *args)
@@ -485,7 +583,89 @@ class Watcher:
 
         self.save_flags()
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
-        return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "needs": self.needs}
+        return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated, "needs": self.needs}
+
+    # ---- a stuck task leaves the slot (T-0092) --------------------------------------------------------
+    def escalation_checks(self, now: datetime, tasks: dict) -> int:
+        """The one rule of agents/_common.md applied to every slot-holder: a task that cannot progress is
+        escalated, never held. Two conditions, both pure functions above: `submitted` with no Decision written
+        after review_stale_hours (T-0075's relaunch, once landed, runs before this and its cap replaces the
+        clock); `in_progress`/`checkpoint` with the newest blocking HELP line unanswered after help_stale_hours
+        (once T-0069 lands that scriber has exited with `WAITING:` and the task is `waiting`, not escalated;
+        `waiting` is T-0069's transition and is not made here). Returns how many tasks were escalated. One
+        escalation per episode: the persisted flag `slot_freed:<id>:<since>` names the episode (the submission
+        time, the HELP line's first sighting), and only SLOT_STATUSES are looked at, so a task already
+        `escalated` never gets a second event. Nothing is stopped or deleted: the worktree, the branch and a
+        still-running session stay, and the note says where the work is."""
+        review_h = float(self.limits.get("review_stale_hours", REVIEW_STALE_HOURS))
+        help_h = float(self.limits.get("help_stale_hours", HELP_STALE_HOURS))
+        self.events = None                                     # the help events raised earlier this tick date the lines
+        events = self.read_events()
+        n = 0
+        for t in tasks.values():
+            if t.status == "submitted":
+                rev = t.dir / "review.md"
+                text = rev.read_text(encoding="utf-8", errors="replace") if rev.exists() else ""
+                row = submitted_stale(t.status, text, submitted_since(events, t.id), review_h, now)
+                if not row:
+                    continue
+                transcripts = sorted(p.name for p in t.dir.glob("review-session-*.txt"))
+                reason = (f"submitted for {row['age_h']} h with no Decision written in review.md "
+                          f"(review_stale_hours {review_h:g}); the review did not finish")
+                action = ("read the review transcript, then decide in the gate card (accept / return), or re-review: "
+                          f"delete `review:{t.id}` from .scr/watch.state.txt after `scr task set {t.id} returned` + `ready`")
+            elif t.status in {"in_progress", "checkpoint"}:
+                log_md = t.dir / "log.md"
+                if not log_md.exists():
+                    continue
+                seen: dict[str, datetime] = {}
+                for e in events:
+                    if e.get("kind") == "system" and e.get("name") == "help" and e.get("task") == t.id and e.get("note") and e["note"] not in seen:
+                        ts = _event_ts(e)
+                        if ts:
+                            seen[e["note"]] = ts
+                fallback = datetime.fromtimestamp(log_md.stat().st_mtime, tz=timezone.utc)
+                row = help_stale(log_md.read_text(encoding="utf-8", errors="replace"), help_h, now, seen, fallback)
+                if not row:
+                    continue
+                sess = self.session_of(t)
+                transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
+                reason = (f"HELP line unanswered for {row['age_h']} h (log.md:{row['line']}: {row['text'][:160]}; "
+                          f"help_stale_hours {help_h:g})" + (f"; its session pid {sess['pid']} is left running" if sess else ""))
+                action = (f"answer log.md:{row['line']} in the record as [omri] and `scr task set {t.id} returned` + `ready` so it is "
+                          "redispatched with the answer, or decide in the gate card")
+            else:
+                continue
+            if self._escalate(t, row["since"], reason, action, transcripts):
+                n += 1
+        return n
+
+    def _escalate(self, t, since: datetime, reason: str, action: str, transcripts: list[str]) -> bool:
+        """submitted / in_progress / checkpoint -> escalated as steward:<id>, then ONE `slot_freed` event whose note
+        is the needs-you card: the one action for Omri, the reason, where the work is, the transcript(s)."""
+        key = f"slot_freed:{t.id}:{since.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
+        if key in self.flags:
+            return False
+        wl = workload_for(self.root, self.store, t)
+        wt = task_worktree(wl, t)
+        where = f"work: {wt} on {t.rec.get('branch') or 'task/' + t.id}" + ("" if wt.exists() else " (worktree missing)")
+        tr = ", ".join(f"tasks/{t.dir.name}/{x}" for x in transcripts) if transcripts else "no transcript recorded"
+        note = (f"stuck: {reason}; escalated by the watcher — a task that cannot progress is escalated, never held "
+                f"(agents/_common.md); {where}; transcript(s): {tr}")
+        if self.scr(f"steward:{t.id}", "task", "set", t.id, "escalated", "--note", note[:900], "--quiet") is None:
+            self.needs.append(f"{t.id} is stuck ({reason}) but could not be escalated — see reports/steward_watch.log")
+            return False
+        self.flags.add(key)
+        self.unflag(f"review:{t.id}")          # it left `submitted`: a later re-submission gets a fresh review
+        card = (f"ACTION for Omri: {action}. Why: {reason}. Its slot is free (escalated never counts against the cap); "
+                f"{where}. Transcript: {tr}")
+        self.scr(f"steward:{t.id}", "event", "system", "--name", "slot_freed", "--task", t.id, "--note", card[:900], "--quiet")
+        self.log(f"{t.id} stuck -> escalated ({reason}); slot freed")
+        self.escalated.append({"task": t.id, "since": since.isoformat(), "reason": reason})
+        for r in self.rows:
+            if r["task"] == t.id:
+                r["flags"] = (r["flags"] + " ESCALATED").strip()
+        return True
 
     def apply_decision(self, t, decided: list[dict]) -> bool:
         """A `submitted` task whose review.md states a verdict: apply it as steward:<id> (T-0091). True when

@@ -693,3 +693,262 @@ def test_unattended_watch_turns_auto_decide_on(world, monkeypatch):
     cli.main(["--root", str(root), "watch", "--once"])
     assert [kw["auto_decide"] for kw in seen] == [True, True, False]
     assert seen[0]["auto_review"] and seen[0]["auto_dispatch"] and seen[0]["auto_land"] and seen[0]["auto_intake"]
+
+
+# ---- T-0092: a stuck task leaves the slot ----------------------------------------------------------------
+# 2026-09-19..21: T-0050 (review died, review.md blank) and T-0061 (verdict written, never applied) held both
+# slots for 35 h with ~30 tasks ready. `submitted_stale` / `help_stale` are pure functions of the record's
+# texts, the events and `now`; `escalation_checks` runs them on a tick with auto_decide on, after T-0091's
+# Decision application and before auto-dispatch, so the freed slot is filled on the same tick.
+import os  # noqa: E402
+import time  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from scr.watch import HELP_STALE_HOURS, REVIEW_STALE_HOURS, SLOT_STATUSES, Watcher, help_stale, submitted_since, submitted_stale  # noqa: E402
+
+NOW = datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc)
+FLAGS = Path(".scr") / "watch.state.txt"
+
+
+def _spy_scr(monkeypatch) -> list[tuple[str, tuple]]:
+    """Record every `scr` call the watcher makes (actor, args), in order, and still run it."""
+    calls: list[tuple[str, tuple]] = []
+    real = Watcher.scr
+
+    def spy(self, actor, *args):
+        calls.append((actor, args))
+        return real(self, actor, *args)
+
+    monkeypatch.setattr(Watcher, "scr", spy)
+    return calls
+
+
+def _ready_task(root: Path, tid: str, path: str) -> None:
+    scr(root, "--quiet", "task", "new", f"Prove {tid}", "--id", tid, "--files", path, "--origin", "omri")
+    for st in ("triaged", "ready"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+
+
+def _running(root: Path, tid: str = "T-0001") -> None:
+    for st in ("dispatched", "in_progress"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+
+
+def _flags(root: Path) -> set[str]:
+    return set((root / FLAGS).read_text(encoding="utf-8").split()) if (root / FLAGS).exists() else set()
+
+
+def test_stuck_submitted_stale_is_a_pure_function_of_review_and_time():
+    since = NOW - timedelta(hours=3)
+    assert submitted_stale("submitted", TEMPLATE, since, 2.0, NOW) == {"since": since, "age_h": 3.0}
+    assert submitted_stale("submitted", "", since, 2.0, NOW)["age_h"] == 3.0                    # no review.md at all
+    assert submitted_stale("submitted", TEMPLATE, NOW - timedelta(hours=1), 2.0, NOW) is None    # not yet
+    assert submitted_stale("submitted", TEMPLATE, None, 2.0, NOW) is None                        # undated
+    assert submitted_stale("in_progress", TEMPLATE, since, 2.0, NOW) is None
+    # a written Decision wins over the timeout, readable (T-0091 applies it) or not (T-0091 asks Omri)
+    for text in (_review(decision="escalated"), _review(feedback="Decision: accepted"), _review(feedback="Decision: maybe")):
+        assert submitted_stale("submitted", text, since, 2.0, NOW) is None, text
+    assert submitted_stale("submitted", "```\nDecision: accepted\n```\n", since, 2.0, NOW) is not None   # fenced = not written
+
+
+def test_stuck_help_stale_reads_the_newest_blocking_line_and_its_answer():
+    old = NOW - timedelta(hours=4)
+    log = "- 2026-09-20T19:00:00 [launcher] pid 1, transcript x\n- HELP[blocks: Phase C]: which lemma closes the goal?\n"
+    seen = {"- HELP[blocks: Phase C]: which lemma closes the goal?": old}
+    row = help_stale(log, 3.0, NOW, seen)
+    assert row and row["line"] == 2 and row["since"] == old and row["age_h"] == 4.0 and row["text"].startswith("- HELP[blocks")
+    assert help_stale(log, 5.0, NOW, seen) is None                                                # not yet
+    assert help_stale(log, 3.0, NOW, {}) is None                                                  # undatable: never early
+    assert help_stale(log, 3.0, NOW, {}, fallback=old)["since"] == old                            # the caller's mtime dates it
+    # an answer anywhere after it — the Steward's, the UI's answer box, Omri's — means it is not stuck
+    for ans in ("- 2026-09-20T21:00:00 [steward] (omri, via UI) use foo_bar\n", "[omri] use foo_bar\n", "  [steward:T-0001] see docs\n"):
+        assert help_stale(log + ans, 3.0, NOW, seen) is None, ans
+    # a `HELP[proceeding: …]` line is not a block; a plain `HELP:` line is
+    assert help_stale("- HELP[proceeding: assume N=2]: ok?\n", 0.0, NOW, {}, fallback=old) is None
+    plain = "HELP: please checkpoint\n"
+    assert help_stale(plain, 3.0, NOW, {"HELP: please checkpoint": old})["line"] == 1
+    # the newest blocking line is the one that counts: an old answered one above does not, a new one does
+    two = log + "[steward] use foo_bar\n- HELP: and now this?\n"
+    assert help_stale(two, 3.0, NOW, {**seen, "- HELP: and now this?": NOW - timedelta(minutes=5)}) is None
+    assert help_stale(two, 3.0, NOW, {**seen, "- HELP: and now this?": old})["line"] == 4
+    # a timestamp inside the line dates it when no event does
+    assert help_stale("- HELP: stuck since 2026-09-20T19:30:00Z on X\n", 3.0, NOW, {})["age_h"] == 4.5
+    assert help_stale("", 3.0, NOW, {}) is None
+
+
+def test_stuck_submitted_is_escalated_and_the_slot_refilled_on_the_same_tick(world, monkeypatch):
+    """DoD 1: submitted task older than review_stale_hours, review.md without Decision, cap 2, one ready task
+    -> after one tick() the task is escalated (actor steward:<id>), one slot_freed event, and the dispatch call
+    was made in the same tick — after the escalation — and launched the ready task."""
+    from scr.ui import state
+    root, repo, _ = world
+    _set_limit(root, "concurrency", 2); _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)                                                  # the review died before writing anything
+    (Store(root).get("T-0001").dir / "review-session-20260919-161106.txt").write_text("killed\n", encoding="utf-8")
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    launches = _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "escalated"
+    new = _state_events(root, "T-0001")[n_before:]
+    assert len(new) == 1 and (new[0]["from"], new[0]["to"], new[0]["actor"]) == ("submitted", "escalated", "steward:T-0001"), new
+    assert "never held" in new[0]["note"] and "no Decision written" in new[0]["note"], new[0]["note"]
+    assert "tasks/T-0001-prove-a/review-session-20260919-161106.txt" in new[0]["note"] and "task/T-0001" in new[0]["note"]
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and ev[0]["actor"] == "steward:T-0001", ev
+    assert ev[0]["note"].startswith("ACTION for Omri: read the review transcript") and "review-session-20260919-161106.txt" in ev[0]["note"]
+    assert res["escalated"] == [{"task": "T-0001", "since": res["escalated"][0]["since"], "reason": res["escalated"][0]["reason"]}] and res["review"] == []
+    assert "T-0001 stuck -> escalated" in (root / LOG).read_text(encoding="utf-8")
+    # the same tick: the dispatch call came AFTER the escalation and the slot went to T-0002
+    i_esc = next(i for i, (_, a) in enumerate(calls) if a[:2] == ("task", "set") and a[2:4] == ("T-0001", "escalated"))
+    i_disp = next(i for i, (_, a) in enumerate(calls) if a[0] == "dispatch")
+    assert i_esc < i_disp, calls
+    assert Store(root).get("T-0002").status == "in_progress" and len(launches) == 1
+    # one needs-you card for it, of the alarm kind, whose text is the action
+    cards = [c for c in state(root)["needs"] if c.get("id") == "T-0001" and c.get("name") == "slot_freed"]
+    assert len(cards) == 1 and cards[0]["text"].startswith("ACTION for Omri"), cards
+    # one escalation per episode: the flag is persisted, a second tick adds nothing
+    assert any(k.startswith("slot_freed:T-0001:") for k in _flags(root)) and "review:T-0001" not in _flags(root)
+    res2 = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert not res2["escalated"] and len(_events(root, "slot_freed", "T-0001")) == 1
+    assert Store(root).get("T-0001").status == "escalated" and len(_state_events(root, "T-0001")) == n_before + 1
+
+
+def test_stuck_escalation_frees_a_full_cap(world, monkeypatch):
+    """Cap 1: before the escalation nothing could be dispatched; the escalated task no longer counts, so the
+    ready task is dispatched on the very tick that escalated it."""
+    root, _, _ = world
+    _set_limit(root, "concurrency", 1); _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    _record_launches(monkeypatch)
+    assert "running: 1, cap 1" in scr(root, "dispatch", "--dry-run").stdout
+    Watcher(root, quiet=True, auto_dispatch=True).tick()                                    # auto_decide off: held, nothing dispatched
+    assert Store(root).get("T-0001").status == "submitted" and Store(root).get("T-0002").status == "ready"
+    Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert Store(root).get("T-0001").status == "escalated" and Store(root).get("T-0002").status == "in_progress"
+
+
+def test_stuck_submitted_with_a_decision_is_left_to_t0091(world):
+    """DoD 2: a submitted task with a Decision: line is untouched by the clock — T-0091 applies a readable one
+    and reports an unreadable one; neither is an escalation-by-timeout."""
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", _review(feedback="Decision: maybe"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and not res["escalated"] and not _events(root, "slot_freed", "T-0001")
+    assert res["review"] == ["T-0001"] and any("cannot read" in n for n in res["needs"])
+    _write_review(root, "T-0001", _review(decision="returned (feedback below)", feedback="Decision: returned (tests red)"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "returned" and res["decided"] and not res["escalated"]
+    assert not _events(root, "slot_freed", "T-0001") and _state_events(root, "T-0001")[-1]["note"].startswith(DECISION_NOTE)
+    # and a fresh submission is not stale while it is younger than the limit
+    for st in ("ready", "dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    _set_limit(root, "review_stale_hours", 2)
+    _write_review(root, "T-0001", TEMPLATE)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and not res["escalated"]
+
+
+def test_stuck_unanswered_blocking_help_is_escalated(world):
+    """DoD 3: in_progress task whose log.md has an unanswered `HELP[blocks: …]` older than help_stale_hours
+    -> escalated; the same with a [steward] answer after it -> untouched. The bracket form raises no `help`
+    event yet (that regex is T-0064/T-0068's), so the line is dated by log.md's mtime, backdated 4 h here."""
+    root, _, _ = world
+    _running(root)
+    t = Store(root).get("T-0001")
+    log = t.dir / "log.md"
+    log.write_text(log.read_text(encoding="utf-8") + "- HELP[blocks: Phase C]: which lemma closes the goal?\n", encoding="utf-8")
+    old = time.time() - 4 * 3600
+    os.utime(log, (old, old))
+    assert float(yaml.safe_load((root / "config" / "limits.yaml").read_text(encoding="utf-8"))["help_stale_hours"]) == HELP_STALE_HOURS == 3.0
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "answer log.md:" in ev[0]["note"] and "which lemma closes the goal?" in ev[0]["note"], ev
+    last = _state_events(root, "T-0001")[-1]
+    assert last["to"] == "escalated" and last["actor"] == "steward:T-0001" and "HELP line unanswered for 4.0 h" in last["note"], last
+    assert len(_state_events(root, "T-0001")) == n_before + 3                                 # checkpoint, in_progress, escalated
+    assert next(r for r in res["rows"] if r["task"] == "T-0001")["flags"].endswith("ESCALATED")
+    # the answered twin: untouched
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    _running(root, "T-0002")
+    log2 = Store(root).get("T-0002").dir / "log.md"
+    log2.write_text(log2.read_text(encoding="utf-8") + "- HELP[blocks: Phase C]: which lemma?\n- 2026-09-21T00:00:00 [steward] (omri, via UI) use foo_bar\n", encoding="utf-8")
+    os.utime(log2, (old, old))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0002").status == "in_progress" and not res["escalated"] and not _events(root, "slot_freed", "T-0002")
+
+
+def test_stuck_plain_help_is_dated_by_its_help_event(world):
+    """A plain `HELP:` line gets a `help` event the first time the watcher sees it; that timestamp dates the
+    wait, so the tick that first sees it never escalates (age 0) whatever log.md's mtime says."""
+    root, _, _ = world
+    _running(root)
+    log = Store(root).get("T-0001").dir / "log.md"
+    log.write_text(log.read_text(encoding="utf-8") + "HELP: please checkpoint\n", encoding="utf-8")
+    old = time.time() - 4 * 3600
+    os.utime(log, (old, old))                                    # mtime says 4 h; the help event says now (default limit 3 h)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "in_progress" and not res["escalated"] and len(_events(root, "help", "T-0001")) == 1
+    _set_limit(root, "help_stale_hours", 0)                      # any wait counts; the event's second-truncated ts is now behind us
+    time.sleep(1.1)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated" and len(_events(root, "slot_freed", "T-0001")) == 1
+    assert len(_events(root, "help", "T-0001")) == 1
+
+
+def test_stuck_auto_decide_off_or_verify_failed_holds(world):
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    res = Watcher(root, quiet=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and not res["escalated"] and not _events(root, "slot_freed", "T-0001")
+    import json
+    from scr.canon import canon
+    p = root / "events" / "events.jsonl"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    ev = json.loads(lines[1]); ev["actor"] = "mallory"; lines[1] = canon(ev)
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert not res["ok"] and Store(root).get("T-0001").status == "submitted" and not res["escalated"]
+
+
+def test_stuck_escalated_and_returned_never_count_against_the_cap(world, monkeypatch):
+    """DoD 4: neither counter — the watcher's n_running nor cmd_dispatch's running — counts escalated or
+    returned; with cap 1, one escalated and one returned task, the ready task is dispatched."""
+    root, _, _ = world
+    assert SLOT_STATUSES == {"dispatched", "in_progress", "checkpoint", "submitted"}
+    assert "escalated" not in SLOT_STATUSES and "returned" not in SLOT_STATUSES
+    _set_limit(root, "concurrency", 1)
+    _running(root)
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "escalated")
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    _running(root, "T-0002")
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0002", "returned")
+    _ready_task(root, "T-0003", "QuantumInsertion/C.lean")
+    out = scr(root, "dispatch", "--dry-run").stdout
+    assert "would dispatch: T-0003 (running: 0, cap 1)" in out, out
+    _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    Watcher(root, quiet=True, auto_dispatch=True).tick()
+    assert any(a[0] == "dispatch" for _, a in calls) and Store(root).get("T-0003").status == "in_progress"
+    assert Store(root).get("T-0001").status == "escalated" and Store(root).get("T-0002").status == "returned"
+    # and a task in any slot status fills the cap
+    for st in ("ready", "dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0002", st)
+    assert "(running: 2, cap 1)" in scr(root, "dispatch", "--dry-run").stdout
+
+
+def test_stuck_rule_is_written_in_the_agent_docs():
+    for name in ("_common.md", "steward.md"):
+        text = (REPO / "agents" / name).read_text(encoding="utf-8")
+        assert "never held" in text and "same tick" in text, name
+    assert submitted_since([{"kind": "state", "task": "T-1", "to": "submitted", "ts": "2026-09-19T16:11:02Z"}], "T-1") == datetime(2026, 9, 19, 16, 11, 2, tzinfo=timezone.utc)
+    assert REVIEW_STALE_HOURS == 2.0

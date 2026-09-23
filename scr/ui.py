@@ -114,8 +114,9 @@ _CHORE_CACHE: dict = {"ts": 0.0, "items": []}
 # System events that become a "needs you" card, one per (task, name). `stale` is a live condition: its card
 # shows only while the watcher's `stale:<task>` flag is set (idle >= stale_minutes, session alive) and
 # clears by itself when the scriber writes again; `session_dead` stays until dismissed (T-0063).
-ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale"}
-ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent"}
+ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale", "slot_freed"}
+ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent",
+                "slot_freed": "escalated: a stuck task left its slot — one action for you"}
 RUNNING = {"dispatched", "in_progress", "checkpoint"}
 
 
