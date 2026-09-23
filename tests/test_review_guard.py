@@ -223,6 +223,64 @@ def test_gate_accept_from_omri_queue_is_not_guarded(world):
     assert Store(root).get("T-0001").status == "accepted"
 
 
+# ---- T-0128: the guard on every route into accepted, --force included --------------------------------------
+# From the world fixture's `ready`; `triaged` is not reachable forward, so that one steps back with --force.
+STEPS = {"ready": (), "triaged": ("triaged",), "dispatched": ("dispatched",),
+         "in_progress": ("dispatched", "in_progress"), "checkpoint": ("dispatched", "in_progress", "checkpoint")}
+
+
+def _bring_to(root: Path, status: str, tid: str = "T-0001"):
+    for st in STEPS[status]:
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st, *(("--force",) if st == "triaged" else ()))
+    t = Store(root).get(tid)
+    assert t.status == status
+    return t
+
+
+@pytest.mark.parametrize("status", ["in_progress", "checkpoint", "dispatched", "triaged", "ready"])
+def test_force_does_not_skip_the_review_guard(world, status):
+    """`--force` overrides the lifecycle table, never the review: `task set <id> accepted --force` from a
+    status other than submitted was the T-0081 review's open item (a) — the guard keyed on
+    `old == "submitted"` and the forced route never read review.md."""
+    root, _, _ = world
+    t = _bring_to(root, status)
+    (t.dir / "review.md").write_text(TEMPLATE, encoding="utf-8")
+    n_state = len(_events(root, "T-0001", "state"))
+    r = scr(root, "--quiet", "--actor", "steward:T-0001", "task", "set", "T-0001", "accepted", "--force", check=False)
+    assert r.returncode != 0, r.stdout
+    assert "T-0001" in r.stderr and "review.md" in r.stderr and f"{status} -> accepted" in r.stderr, r.stderr
+    assert Store(root).get("T-0001").status == status
+    assert not _events(root, "T-0001", "state", to="accepted") and len(_events(root, "T-0001", "state")) == n_state
+    assert not _events(root, "T-0001", "system", name="accept_override")
+    # a written acceptance passes the same forced call, and the forced transition is logged as such
+    (t.dir / "review.md").write_text(_review("accepted"), encoding="utf-8")
+    r = scr(root, "--quiet", "--actor", "steward:T-0001", "task", "set", "T-0001", "accepted", "--force", check=False)
+    assert r.returncode == 0, r.stderr
+    assert Store(root).get("T-0001").status == "accepted"
+    ev = _events(root, "T-0001", "state", to="accepted")
+    assert len(ev) == 1 and ev[0]["from"] == status and ev[0]["actor"] == "steward:T-0001" and ev[0]["note"].endswith("[forced]"), ev
+    assert not _events(root, "T-0001", "system", name="accept_override")
+
+
+def test_omri_force_accept_from_in_progress_records_an_override_event(world):
+    """The only forced way past an unwritten review is Omri's --force-accept, on this route as on the
+    submitted one: exactly one accept_override event, before the state event."""
+    root, _, _ = world
+    t = _bring_to(root, "in_progress")
+    (t.dir / "review.md").write_text(TEMPLATE, encoding="utf-8")
+    # --force alone (the transition override) is still refused, and so is --force-accept from anyone else
+    r = scr(root, "--quiet", "--actor", "steward:T-0001", "task", "set", "T-0001", "accepted", "--force", "--force-accept", check=False)
+    assert r.returncode == 2 and "omri" in r.stderr and "review.md" in r.stderr and "in_progress -> accepted" in r.stderr, r.stderr
+    assert Store(root).get("T-0001").status == "in_progress" and not _events(root, "T-0001", "system", name="accept_override")
+    r = scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0001", "accepted", "--force", "--force-accept", "--note", "why", check=False)
+    assert r.returncode == 0, r.stderr
+    assert Store(root).get("T-0001").status == "accepted"
+    ov = _events(root, "T-0001", "system", name="accept_override")
+    assert len(ov) == 1 and ov[0]["actor"] == "omri" and "review.md" in ov[0]["note"] and "why" in ov[0]["note"], ov
+    st = _events(root, "T-0001", "state", to="accepted")
+    assert len(st) == 1 and st[0]["seq"] > ov[0]["seq"] and st[0]["from"] == "in_progress" and st[0]["note"] == "why [forced]", st
+
+
 # ---- the watcher's auto-decide goes through the same guard ------------------------------------------------
 def test_watcher_auto_decide_accepted_without_checks_is_refused(world):
     """`Decision: accepted` with an empty mechanical table: the watcher's `scr task set` is refused, the log
