@@ -483,9 +483,11 @@ def cmd_ensure_main(args):
 
 def cmd_up(args):
     root, _, _ = _ctx(args)
-    from .admin import up, stop
+    from .admin import up, stop, stop_failed
     if args.stop:
-        _print(stop(root, "ui") + stop(root, "watch")); return
+        lines = stop(root, "ui") + stop(root, "watch")
+        _print(lines)
+        sys.exit(1 if stop_failed(lines) else 0)      # T-0156: a surviving process must not read as a made stop
     lines = up(root, ui_only=args.ui_only, restart=args.restart, register_logon=args.register, port=args.port, open_browser=not args.no_browser)
     _print(lines)
     (root / "reports").mkdir(exist_ok=True)      # `up` also runs windowless from the Desktop shortcut: keep a trace

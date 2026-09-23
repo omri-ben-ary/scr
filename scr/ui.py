@@ -345,9 +345,9 @@ def _set_paused(root: Path, on: bool) -> dict:
 
 
 def _quit(root: Path) -> dict:
-    from .admin import stop
+    from .admin import stop, stop_failed
     lines = stop(root, "watch")
-    if any(l.startswith("FAILED") for l in lines):          # T-0150: a surviving watcher must not cost Omri the UI
+    if stop_failed(lines):                                       # T-0150: a surviving watcher must not cost Omri the UI
         return {"ok": False, "output": "\n".join(lines + [
             "UI stays up: the watcher pid above is still alive. Retry Quit, run `scr admin stop watch`, "
             "or end the pid in Task Manager"])}
