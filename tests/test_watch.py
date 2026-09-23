@@ -1373,8 +1373,7 @@ def _rename_workload(root: Path, tid: str = "T-0007") -> None:
     wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
     wl["tooling"] = dict(wl["scriptorium"])
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
-    t = Store(root).get(tid)
-    t.rec["workload"] = "tooling"; t.save()
+    sscr(root, "--quiet", "--actor", "s", "task", "field", tid, "workload", "tooling")
     sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] second key for the checkout")
 
 
@@ -1393,7 +1392,7 @@ def test_watch_land_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, 
     (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
     origin_before = sgit(origin, "rev-parse", "main")
     res = _tick(root)
-    assert res["ok"] and not calls, (calls, res["needs"])
+    assert res["ok"] and not calls, (calls, res)
     assert Store(root).get("T-0007").status == "merged", res["needs"]
     ev = _events(root, "landed", "T-0007")
     assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"], ev
@@ -1407,16 +1406,18 @@ def test_watch_review_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path
     rule flags a worktree-less task under that key `tooling` rather than `no-worktree`."""
     import scr.watch as watch
     from scr.watch import Watcher
-    root, _, wt = _land_world(tmp_path, monkeypatch)
-    _rename_workload(root)
-    t = Store(root).get("T-0007")
-    t.rec["status"] = "submitted"; t.save()                     # accepted -> submitted is no transition: set the record
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "task", "new", "Tooling 2", "--id", "T-0012", "--workload", "scriptorium", "--files", "tool.txt", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0012", st)
+    _rename_workload(root, "T-0012")
     tooling: list[str] = []
     lean: list[tuple] = []
     monkeypatch.setattr(Watcher, "start_tooling_review", lambda self, t: tooling.append(t.id))
     monkeypatch.setattr(watch, "start_claude", lambda *a, **kw: lean.append(a))
-    Watcher(root, quiet=True, auto_review=True).tick()
-    assert tooling == ["T-0007"] and not lean, (tooling, lean)
+    res = Watcher(root, quiet=True, auto_review=True).tick()
+    assert res["ok"] and "T-0012" in res["review"], res
+    assert tooling == ["T-0012"] and not lean, (tooling, lean)
     # the status flag: a worktree-less task under `tooling` is a hotfix in the checkout
     sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0010", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
     for st in ("triaged", "ready", "dispatched", "in_progress"):
