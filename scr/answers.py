@@ -27,6 +27,7 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
     d = t.dir
     ts = now_iso()
     msgs: list[str] = []
+    ok = True
     if kind == "help":
         with open(d / "log.md", "a", encoding="utf-8") as f:
             f.write(f"\n- {ts} [steward] ({actor}, via UI) {answer}\n")
@@ -71,9 +72,9 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
             msgs.append(scr_cmd(root, actor, "event", "system", "--name", "gate_note", "--task", tid, "--note", answer[:500], "--quiet")[1])
     else:
         raise RepoError(f"unknown answer kind {kind}")
-    if concierge and kind != "help":
+    if ok and concierge and kind != "help":
         start_concierge(root, tid, answer)
-    return {"ok": True, "log": [m for m in msgs if m]}
+    return {"ok": ok, "log": [m for m in msgs if m]}
 
 
 def start_concierge(root: Path, tid: str, answer: str) -> int | None:

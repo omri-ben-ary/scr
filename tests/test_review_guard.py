@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from scr.answers import apply
 from scr.events import EventLog
 from scr.gitops import Git
 from scr.ops import land, land_all_submitted, spawn
@@ -220,6 +221,52 @@ def test_gate_accept_from_omri_queue_is_not_guarded(world):
         scr(root, "--quiet", "--actor", "steward:T-0001", "task", "set", "T-0001", st)
     r = scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0001", "accepted", "--note", "Gate decision via UI: accept", check=False)
     assert r.returncode == 0, r.stderr
+    assert Store(root).get("T-0001").status == "accepted"
+
+
+# ---- T-0129: the gate answer on a task still `submitted` either lands (Omri's override) or says why not ---
+def test_gate_accept_on_submitted_task_by_omri_is_the_override(world):
+    """Omri's gate click on a submitted task with a blank review is the explicit override T-0081 designed:
+    apply passes --force-accept with the answer as the note, and the accept_override event records it."""
+    root, _, _ = world
+    t = _submit(root, worktree=False)
+    (t.dir / "review.md").write_text(TEMPLATE, encoding="utf-8")
+    r = apply(root, "T-0001", "accept", kind="gate", actor="omri", concierge=False)
+    assert r["ok"] is True, r
+    assert Store(root).get("T-0001").status == "accepted"
+    ov = _events(root, "T-0001", "system", name="accept_override")
+    assert len(ov) == 1 and ov[0]["actor"] == "omri", ov
+    assert "review.md" in ov[0]["note"] and "Gate decision via UI" in ov[0]["note"], ov[0]
+    st = _events(root, "T-0001", "state", to="accepted")
+    assert len(st) == 1 and st[0]["actor"] == "omri" and st[0]["seq"] > ov[0]["seq"], st
+
+
+def test_gate_accept_on_submitted_task_by_another_actor_is_refused(world):
+    """A Discuss session or the Concierge answering on Omri's behalf gets T-0081's refusal, not the
+    override: ok False, the refusal in log, the task still submitted, no event appended."""
+    root, _, _ = world
+    t = _submit(root, worktree=False)
+    (t.dir / "review.md").write_text(TEMPLATE, encoding="utf-8")
+    r = apply(root, "T-0001", "accept", kind="gate", actor="concierge", concierge=False)
+    assert r["ok"] is False, r
+    assert Store(root).get("T-0001").status == "submitted"
+    assert any("review.md" in m for m in r["log"]), r["log"]
+    assert not _events(root, "T-0001", "system", name="accept_override")
+    assert not _events(root, "T-0001", "state", to="accepted")
+
+
+def test_gate_refused_answer_does_not_start_the_concierge(world, monkeypatch):
+    """ok False means nothing to apply: start_concierge is not called; on the landed path it is."""
+    root, _, _ = world
+    t = _submit(root, worktree=False)
+    (t.dir / "review.md").write_text(TEMPLATE, encoding="utf-8")
+    calls: list[tuple] = []
+    monkeypatch.setattr("scr.answers.start_concierge", lambda *a, **k: calls.append(a))
+    r = apply(root, "T-0001", "accept", kind="gate", actor="concierge", concierge=True)
+    assert r["ok"] is False and calls == [], (r, calls)
+    assert Store(root).get("T-0001").status == "submitted"
+    r = apply(root, "T-0001", "accept", kind="gate", actor="omri", concierge=True)
+    assert r["ok"] is True and len(calls) == 1 and calls[0][1] == "T-0001", (r, calls)
     assert Store(root).get("T-0001").status == "accepted"
 
 
