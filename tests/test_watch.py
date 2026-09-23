@@ -75,10 +75,16 @@ def _add_dirs(argv: list[str]) -> list[str]:
 
 
 def _set_limit(root: Path, key: str, value) -> None:
+    """Edit config/limits.yaml and commit it, like the fixture's seed. Uncommitted, the next journaling scr
+    command would see a tooling path (`config/` is in hotfix.TOOLING) changed outside a task and open a hotfix
+    record — whose id collides with the test's own `task new --id`. Git.dirty() used to mangle the FIRST
+    porcelain line (T-0079 fixed it), which is the only reason this went unnoticed."""
     p = root / "config" / "limits.yaml"
     cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     cfg[key] = value
     p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    if (root / ".git").exists():
+        sgit(root, "add", "config/limits.yaml"); sgit(root, "commit", "-q", "-m", f"[test] limits: {key}={value}")
 
 
 def _five_call_sites(world, monkeypatch) -> dict[str, dict]:
