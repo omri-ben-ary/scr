@@ -180,6 +180,30 @@ def test_explicit_override_beats_the_config_default(world, monkeypatch):
     assert _mode(session_argv(root, root=root, permission_mode="dontAsk")) == "dontAsk"
 
 
+def test_review_brief_uses_default_base_and_fetch(world, monkeypatch):
+    """T-0117 (T-0060 R1 after T-0111): the workload review brief tells the Steward to run the checkers with
+    --fetch and their default base (merge-base of origin/<main> and HEAD), never with a --base flag."""
+    from scr.watch import Watcher
+    root, _, _ = world
+    _record_launches(monkeypatch)
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched"); spawn(root, ["T-0001"], lake=False)
+    for st in ("in_progress", "submitted"):
+        scr(root, "--actor", "s", "task", "set", "T-0001", st)
+    t = Store(root).get("T-0001")
+    Watcher(root, quiet=True).start_review(t)
+    brief = (t.dir / "review-brief.txt").read_text(encoding="utf-8")
+    assert "--fetch" in brief and "merge-base" in brief and "origin/" in brief, brief
+    assert "--base" not in brief, brief
+
+
+def test_workloads_yaml_checker_comment_has_no_bare_base():
+    text = (REPO / "config" / "workloads.yaml").read_text(encoding="utf-8")
+    assert "--base master" not in text
+    line = next(l for l in text.splitlines() if l.strip().startswith("done_when_checker:"))
+    assert "--fetch" in line and "merge-base" in line, line
+    assert isinstance(yaml.safe_load(text)["quantum-insertion"]["done_when_checker"], str)
+
+
 def _discuss_lines(root: Path, items: list[str], monkeypatch) -> dict[str, str]:
     """Run discuss() for each item without opening a terminal or touching ~/.claude; return the claude
     command line it built (the .launch.ps1's last line on Windows, the printed line elsewhere)."""
