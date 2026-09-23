@@ -385,3 +385,39 @@ def test_one_read_decision_definition_and_watch_reexports_it():
                         "from scr.review import decision_of as d2; assert decision_of is d2; print('ok')"],
                        cwd=REPO, capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+
+
+# ---- T-0130: the Discuss brief shows the Decision the same parser reads -------------------------------------
+HEADING = "review.md — Decision"
+
+
+@pytest.mark.parametrize("form, present, absent", [
+    ("section", ("accepted",), ()),                                            # (1) template form
+    ("explicit", ("returned",), (PLACEHOLDER,)),                               # (2) explicit line, placeholder untouched
+    ("template", (), (HEADING,)),                                              # (3) the blank template
+    ("fenced", (), (HEADING,)),                                                # (4) a verdict inside a fence only
+    ("feedback", ("returned (feedback below)", "- lemma `a` is misstated"), ()),
+    ("unreadable", ("unreadable", "Not yet"), ()),
+])
+def test_discuss_brief_shows_the_decision_the_parser_reads(world, form, present, absent):
+    """`scr.discuss._task_context` asks `scr.review.read_decision` — the guard's and the watcher's parser —
+    and shows the verdict on one line, feedback lines under it; never the placeholder, never a fence."""
+    from scr.discuss import _task_context
+    root, _, _ = world
+    t = Store(root).get("T-0001")
+    text = {"section": _review("accepted"),
+            "explicit": _review(PLACEHOLDER, tail="Decision: returned (fix the lemma)"),
+            "template": TEMPLATE,
+            "fenced": TEMPLATE.replace("## Decision\n" + PLACEHOLDER + "\n", "") + "```\n## Decision\naccepted\n\nDecision: accepted\n```\n",
+            "feedback": _review("returned (feedback below)\n- lemma `a` is misstated"),
+            "unreadable": _review("Not yet: the checks did not run.")}[form]
+    (t.dir / "review.md").write_text(text, encoding="utf-8")
+    brief = _task_context(root, "T-0001")
+    for s in present:
+        assert s in brief, (s, brief)
+    for s in absent:
+        assert s not in brief, (s, brief)
+    if present:                                                                # the block: heading, then one verdict line
+        lines = brief[brief.index(HEADING):].splitlines()
+        assert lines[1].startswith(present[0]), lines[:3]
+        assert review_decision(t.dir) in (None, lines[1].split()[0]), (review_decision(t.dir), lines[1])

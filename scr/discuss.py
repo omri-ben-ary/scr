@@ -36,6 +36,7 @@ from pathlib import Path
 
 from .events import EventLog
 from .ops import task_worktree, workload, workload_for
+from .review import read_decision
 from .run import claude_bin, permission_mode_for, scr_exe
 from .store import Store
 
@@ -128,6 +129,20 @@ def _section(text: str, heading: str, limit: int = 3000) -> str:
     return m.group(1).strip()[:limit] if m else ""
 
 
+def _decision_text(section: str, verdict: str | None, problem: str | None) -> str:
+    """The brief's verdict block (T-0130): one line for the verdict `scr.review.read_decision` read, plus
+    the feedback under it. `section` is the body of the review's decision section: when it opens with that
+    verdict (the template form) it is shown as written, verdict line first, feedback lines after; when the
+    verdict came from the explicit column-zero line the section is the placeholder or empty and the verdict
+    stands alone. A decision the parser cannot read shows its problem line instead of a guess."""
+    if problem:
+        return f"unreadable: {problem}"
+    first = next((l.strip().lstrip("*_`") for l in section.splitlines() if l.strip()), "")
+    if re.match(rf"{verdict}\b", first) and "|" not in first:
+        return section
+    return verdict or ""
+
+
 def _events_for(root: Path, tid: str, n: int = 12) -> str:
     evs = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("task") == tid][-n:]
     rows = []
@@ -163,9 +178,9 @@ def _task_context(root: Path, tid: str) -> str:
     if helps:
         parts.append("## Open HELP: lines in log.md (unanswered)\n" + "\n".join(f"- {h}" for h in helps))
     review = _read(d / "review.md", 40_000)
-    dec = re.search(r"(?m)^##\s*Decision\s*$\n(.*?)(?=^##|\Z)", review, re.S)
-    if dec and dec.group(1).strip() and "accepted | returned" not in dec.group(1):
-        parts.append(f"## review.md — Decision ({d / 'review.md'})\n" + dec.group(1).strip()[:1500])
+    verdict, problem = read_decision(review)          # the parser the T-0081 guard and the watcher use (T-0130)
+    if verdict or problem:
+        parts.append(f"## review.md — Decision ({d / 'review.md'})\n" + _decision_text(_section(review, "Decision", 1500), verdict, problem))
     report = _read(d / "report.md", 60_000)
     res = _section(report, "Result", 1200)
     if res and not res.startswith("What was proved"):
