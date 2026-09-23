@@ -16,7 +16,7 @@ import yaml
 
 from scr.ops import spawn
 from scr.store import Store
-from test_journal_ops import world, scr  # noqa: F401  (the shared fixture: scriptorium + workload repo + origin)
+from test_journal_ops import REPO, world, scr  # noqa: F401  (the shared fixture: scriptorium + workload repo + origin)
 
 FAKE_CLAUDE = str(Path(sys.executable).with_name("claude.exe"))   # a .exe path: claude_argv must not wrap it in `cmd /c`
 
@@ -421,3 +421,275 @@ def test_running_scriptorium_worktree_is_checkpointed_each_tick(tmp_path: Path, 
         sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0010", st)
     res = Watcher(root, quiet=True).tick()
     assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
+
+
+# ---- T-0091: the watcher applies a Decision written in review.md ----------------------------------------
+# T-0061's review wrote `Decision: escalated (...)` on 2026-09-19 with `scr` denied, and the task sat
+# `submitted` for 35 h. `decision_of` is a pure function of review.md's text; `apply_decision` runs it for
+# every submitted task on a tick with auto_decide on and applies the verdict as steward:<id>.
+from scr.watch import DECISION_NOTE, decision_of, read_decision  # noqa: E402
+
+TEMPLATE = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+LOG = Path("reports") / "steward_watch.log"
+
+
+def _review(**sections: str) -> str:
+    """The template with `## Decision` and/or `## Feedback / diagnosis` bodies replaced."""
+    text = TEMPLATE
+    if "decision" in sections:
+        text = text.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", sections["decision"])
+    if "feedback" in sections:
+        text = text.rstrip("\n") + "\n" + sections["feedback"] + "\n"
+    return text
+
+
+def test_decision_of_reads_the_explicit_line_for_each_verdict():
+    for v in ("accepted", "returned", "escalated"):
+        assert decision_of(_review(feedback=f"Decision: {v}")) == v
+        assert decision_of(_review(feedback=f"Decision: {v} (Gate 2, the reason)")) == v
+        assert decision_of(f"# Review\n\nsome prose\n\nDecision: {v}\n\nmore prose\n") == v
+    # the first `Decision:` line at column zero wins; an indented or bulleted one is not the explicit form
+    assert decision_of("Decision: returned (feedback)\nDecision: accepted\n") == "returned"
+    assert decision_of("  Decision: accepted\n- Decision: accepted\n") is None
+    # T-0061's review.md: the template form and the explicit form, agreeing
+    assert decision_of(_review(decision="escalated", feedback="Decision: escalated (fix uncommitted in an unreadable worktree)")) == "escalated"
+
+
+def test_decision_of_reads_the_template_form_under_the_heading():
+    """T-0062's review wrote its verdict exactly as the template lays it out: `## Decision` then the verdict
+    as the next line, with NO `Decision:` line at column zero."""
+    assert decision_of(_review(decision="escalated (landing path: spawned scriptorium task, uncommitted in its worktree)")) == "escalated"
+    assert decision_of(_review(decision="accepted")) == "accepted"
+    assert decision_of(_review(decision="returned (feedback below)")) == "returned"
+    assert decision_of(_review(decision="**accepted** — statement diff empty")) == "accepted"
+    assert decision_of(_review(decision="\n\nescalated\n")) == "escalated"                    # blank lines first
+    assert decision_of("## Decision\n\n## Feedback / diagnosis\naccepted is not a decision\n") is None   # an empty section
+
+
+def test_decision_of_ignores_the_placeholder_line():
+    assert decision_of(TEMPLATE) is None
+    assert read_decision(TEMPLATE) == (None, None)
+    assert decision_of(TEMPLATE.strip()) is None
+    # the brief's own wording copied as an explicit line is the placeholder too, not `accepted`
+    assert read_decision(_review(feedback="Decision: accepted | returned (feedback) | escalated (Gate N, reason)")) == (None, None)
+    # a half-edited placeholder names two verdicts: unreadable, never `accepted`
+    v, problem = read_decision(_review(decision="accepted | returned (feedback below)"))
+    assert v is None and problem and "unreadable" in problem
+
+
+def test_decision_of_ignores_a_decision_inside_a_code_fence():
+    """T-0050's transcript quoted a draft review.md in a ``` block, `Decision: PENDING` inside it."""
+    fenced = _review(feedback="**Draft review.md** (provisional):\n\n```\n# Review — T-0050\nDecision: PENDING — run pytest;\n  if both pass, accepted.\n```\n")
+    assert read_decision(fenced) == (None, None)
+    fenced_verdict = _review(feedback="```\nDecision: accepted\n```\n")
+    assert read_decision(fenced_verdict) == (None, None)
+    # ~~~ fences and a fenced `## Decision` heading are ignored the same way; the real line after the fence counts
+    assert decision_of("~~~\n## Decision\naccepted\n~~~\nDecision: returned\n") == "returned"
+    assert decision_of("```md\nDecision: accepted\n```\n\nDecision: escalated (Gate 1)\n") == "escalated"
+
+
+def test_read_decision_names_a_malformed_or_ambiguous_line():
+    v, problem = read_decision(_review(feedback="Decision: maybe"))
+    assert v is None and problem == "unreadable Decision line 'Decision: maybe'"
+    v, problem = read_decision(_review(feedback="Decision: PENDING — run the checks; if both pass, accepted."))
+    assert v is None and "unreadable" in problem
+    v, problem = read_decision(_review(decision="Not yet: the checks did not run."))
+    assert v is None and "unreadable" in problem
+    # the two forms disagreeing is ambiguous
+    v, problem = read_decision(_review(decision="accepted", feedback="Decision: returned (see above)"))
+    assert v is None and "disagree" in problem
+    # a malformed explicit line is not rescued by a readable section
+    v, problem = read_decision(_review(decision="accepted", feedback="Decision: see above"))
+    assert v is None and "unreadable" in problem
+
+
+def _submit(root: Path, tid: str = "T-0001") -> None:
+    for st in ("dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+
+
+def _state_events(root: Path, tid: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == tid]
+
+
+def _write_review(root: Path, tid: str, text: str) -> None:
+    (Store(root).get(tid).dir / "review.md").write_text(text, encoding="utf-8")
+
+
+def test_written_decision_is_applied_as_steward(world):
+    """DoD: submitted task, review.md with `Decision: escalated (reason)` -> after one tick the task is
+    escalated, one state event with actor steward:<id> and the note, the log says `decision applied`."""
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", _review(decision="escalated", feedback="Decision: escalated (Gate 2, no landing path)"))
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "escalated"
+    new = _state_events(root, "T-0001")[n_before:]
+    assert len(new) == 1 and new[0]["from"] == "submitted" and new[0]["to"] == "escalated", new
+    assert new[0]["actor"] == "steward:T-0001" and new[0]["note"].startswith(DECISION_NOTE), new[0]
+    assert res["decided"] == [{"task": "T-0001", "decision": "escalated"}] and res["review"] == []
+    assert "T-0001 decision applied: escalated" in (root / LOG).read_text(encoding="utf-8")
+    assert not any("T-0001" in n for n in res["needs"]), res["needs"]
+    # nothing to do next tick: the status has moved
+    res2 = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated" and len(_state_events(root, "T-0001")) == n_before + 1 and not res2["decided"]
+
+
+def test_template_form_decision_is_applied(world):
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", _review(decision="returned (feedback below)", feedback="The tests are red; see the log."))
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "returned"
+    assert _state_events(root, "T-0001")[-1]["actor"] == "steward:T-0001"
+
+
+def test_blank_template_review_is_no_decision(world):
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and res["review"] == ["T-0001"] and not res["decided"]
+    assert len(_state_events(root, "T-0001")) == n_before
+    assert not res["needs"], res["needs"]
+    assert "decision" not in (root / LOG).read_text(encoding="utf-8")
+    # no review.md at all is the same
+    (Store(root).get("T-0001").dir / "review.md").unlink()
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and not res["needs"] and len(_state_events(root, "T-0001")) == n_before
+
+
+def test_malformed_decision_is_left_for_omri(world):
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", _review(feedback="Decision: maybe"))
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and len(_state_events(root, "T-0001")) == n_before
+    assert not res["decided"]
+    needs = [n for n in res["needs"] if n.startswith("T-0001 ")]
+    assert len(needs) == 1 and "Decision" in needs[0] and "'Decision: maybe'" in needs[0] and "task set T-0001" in needs[0], res["needs"]
+    assert "T-0001 decision NOT applied: unreadable Decision line 'Decision: maybe'" in (root / LOG).read_text(encoding="utf-8")
+
+
+def test_auto_decide_off_applies_nothing(world):
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", _review(feedback="Decision: escalated (Gate 2)"))
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and len(_state_events(root, "T-0001")) == n_before
+    assert not res["decided"] and res["review"] == ["T-0001"] and not res["needs"]
+    assert "decision" not in (root / LOG).read_text(encoding="utf-8")
+
+
+def test_decided_task_gets_no_review_session(world, monkeypatch):
+    """auto_review and auto_decide together: a written Decision is applied and no review is launched for
+    it (the `review:<id>` flag stays clear); a submitted task without one still gets its review."""
+    from scr.watch import Watcher
+    root, repo, _ = world
+    calls = _record_launches(monkeypatch)
+    _submit(root)
+    _write_review(root, "T-0001", _review(feedback="Decision: escalated (Gate 2)"))
+    res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated" and not calls
+    assert "review:T-0001" not in (root / ".scr" / "watch.state.txt").read_text(encoding="utf-8").split()
+    # a second submitted task, no decision: reviewed as before
+    scr(root, "--quiet", "task", "new", "Prove b", "--id", "T-0002", "--files", "QuantumInsertion/A.lean", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0002", st)
+    spawn(root, ["T-0002"], lake=False)
+    for st in ("in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0002", st)
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert Store(root).get("T-0002").status == "submitted" and len(calls) == 1 and calls[0]["argv"][1] == "-p"
+    assert "review:T-0002" in (root / ".scr" / "watch.state.txt").read_text(encoding="utf-8").split()
+
+
+def test_same_review_is_never_applied_twice(world):
+    """Idempotent: the note names the review text by digest; a task moved back to `submitted` with the
+    old review.md still in place gets a NEEDS-YOU line, not a second application. A fresh review (new
+    text) is applied."""
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    stale = _review(feedback="Decision: returned (the tests are red)")
+    _write_review(root, "T-0001", stale)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "returned"
+    first = _state_events(root, "T-0001")[-1]
+    assert "[review.md " in first["note"]
+    # the task runs again and is submitted again; the old review.md is still there
+    for st in ("ready", "dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    n_before = len(_state_events(root, "T-0001"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and len(_state_events(root, "T-0001")) == n_before
+    assert not res["decided"] and res["review"] == ["T-0001"]
+    needs = [n for n in res["needs"] if n.startswith("T-0001 ")]
+    assert len(needs) == 1 and "already applied" in needs[0] and "returned" in needs[0] and "fresh review" in needs[0], res["needs"]
+    # Omri (or the Steward) rewrites the review: applied
+    _write_review(root, "T-0001", _review(decision="escalated (Gate 1, the statement changed)"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated" and res["decided"] == [{"task": "T-0001", "decision": "escalated"}]
+    assert not [n for n in res["needs"] if n.startswith("T-0001 ")]
+
+
+def test_accepted_decision_becomes_the_status(world):
+    """`accepted` written in review.md becomes the status through the same `scr task set` every other actor
+    uses, so T-0081's guard (no acceptance without a written review) applies to this path once it lands.
+    Landing is not driven here (auto_land off); the tick reloads tasks after a decision so auto-land sees it."""
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", _review(decision="accepted", feedback="Decision: accepted"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "accepted" and res["decided"] == [{"task": "T-0001", "decision": "accepted"}]
+
+
+def test_verify_failure_holds_the_decision(world):
+    """A tick whose verify fails touches no records: the decision waits (like every other transition)."""
+    from scr.watch import Watcher
+    root, _, _ = world
+    _submit(root)
+    _write_review(root, "T-0001", _review(feedback="Decision: escalated (Gate 2)"))
+    import json
+    from scr.canon import canon
+    p = root / "events" / "events.jsonl"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    ev = json.loads(lines[1]); ev["actor"] = "mallory"; lines[1] = canon(ev)            # test_scriptorium's tamper
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert not res["ok"] and Store(root).get("T-0001").status == "submitted" and not res["decided"]
+
+
+def test_unattended_watch_turns_auto_decide_on(world, monkeypatch):
+    """`scr watch --unattended` implies auto_decide like auto_review / auto_dispatch / auto_land / auto_intake;
+    the flag on its own works too; a bare `scr watch --once` leaves it off."""
+    import scr.cli as cli
+    import scr.watch as watch_mod
+    root, _, _ = world
+    seen: list[dict] = []
+
+    class FakeWatcher:
+        def __init__(self, root, **kw):
+            seen.append(kw)
+
+        def loop(self, interval, once=False):
+            pass
+
+    monkeypatch.setattr(watch_mod, "Watcher", FakeWatcher)
+    cli.main(["--root", str(root), "watch", "--once", "--unattended"])
+    cli.main(["--root", str(root), "watch", "--once", "--auto-decide"])
+    cli.main(["--root", str(root), "watch", "--once"])
+    assert [kw["auto_decide"] for kw in seen] == [True, True, False]
+    assert seen[0]["auto_review"] and seen[0]["auto_dispatch"] and seen[0]["auto_land"] and seen[0]["auto_intake"]

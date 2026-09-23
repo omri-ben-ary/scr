@@ -14,7 +14,8 @@ Per tick:
                     + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15)
     heartbeat    checkpoint -> in_progress
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
-  submitted     -> one headless review session (auto-review)
+  submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
+                -> otherwise one headless review session (auto-review)
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
@@ -22,6 +23,7 @@ Never deletes anything; never edits Lean; never answers a HELP: line itself.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,6 +44,95 @@ DEAD_LINE = "Background tasks still running after"
 # Only a task whose session should be running is ever declared dead. `dispatched` has no session yet and
 # cannot be returned; a `waiting` task (T-0069) is parked on purpose and is never dead.
 DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
+
+# ---- the Decision written in review.md (T-0091) ------------------------------------------------------
+VERDICTS = ("accepted", "returned", "escalated")
+# the explicit form the review brief asks for, anchored at column zero: `Decision: escalated (Gate 2, reason)`
+_DECISION_LINE = re.compile(r"^Decision:")
+_DECISION_VERDICT = re.compile(r"^Decision:\s*[*_`]*(accepted|returned|escalated)\b")
+# the template form: the first non-blank line under a `## Decision` heading, its first word the verdict
+_DECISION_HEADING = re.compile(r"^#{1,6}\s*Decision\b")
+_ANY_HEADING = re.compile(r"^#{1,6}\s")
+_SECTION_VERDICT = re.compile(r"^\s*[*_`]*(accepted|returned|escalated)\b")
+# templates/review.md's placeholder: `accepted | returned (feedback below) | escalated (Gate N, reason)`
+_PLACEHOLDER = re.compile(r"^\s*accepted\s*\|\s*returned\b.*\|\s*escalated\b")
+_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+DECISION_NOTE = "applied from review.md by the watcher"
+
+
+def _unfenced(text: str) -> list[str]:
+    """The lines of a markdown text that are not inside a fenced code block (a review that quotes a draft,
+    like T-0050's transcript, must not be read as a verdict)."""
+    out, fence = [], None
+    for line in text.splitlines():
+        m = _FENCE.match(line)
+        if m and (fence is None or m.group(1) == fence):
+            fence = None if fence else m.group(1)
+            continue
+        if fence is None:
+            out.append(line)
+    return out
+
+
+def _verdict(line: str, rx: re.Pattern) -> str | None:
+    """The verdict a candidate line states, or None when it names none or more than one
+    (`accepted | returned` left over from the placeholder is ambiguous, not a verdict)."""
+    m = rx.match(line)
+    if not m:
+        return None
+    others = [v for v in VERDICTS if v != m.group(1) and re.search(rf"\|\s*[*_`]*{v}\b", line)]
+    return None if others else m.group(1)
+
+
+def read_decision(review_md: str) -> tuple[str | None, str | None]:
+    """(verdict, problem) from a review.md text. The verdict comes from the FIRST `Decision:` line at column
+    zero outside a code fence (the explicit form the review brief asks for) or, failing that, from the
+    first non-blank line under a `## Decision` heading whose first word is a verdict (the template form
+    T-0062's review used). The untouched placeholder is no decision. When both forms are present they
+    must agree. `problem` is set — with the offending line — when a Decision is written but cannot be
+    read (`Decision: maybe`, a section that opens with prose, the two forms disagreeing): that is for
+    Omri, never a transition."""
+    lines = _unfenced(review_md)
+    explicit = next((l for l in lines if _DECISION_LINE.match(l)), None)
+    section = None
+    for i, line in enumerate(lines):
+        if _DECISION_HEADING.match(line):
+            for nxt in lines[i + 1:]:
+                if _ANY_HEADING.match(nxt):
+                    break
+                if nxt.strip():
+                    section = nxt
+                    break
+            break
+    if section is not None and _PLACEHOLDER.match(section):
+        section = None
+    if explicit is not None and _PLACEHOLDER.match(explicit[len("Decision:"):]):   # the brief's own wording, copied
+        explicit = None
+    if explicit is None and section is None:
+        return None, None
+    found: dict[str, str | None] = {}
+    if explicit is not None:
+        found[explicit] = _verdict(explicit, _DECISION_VERDICT)
+    if section is not None:
+        found[section] = _verdict(section, _SECTION_VERDICT)
+    bad = [l for l, v in found.items() if v is None]
+    if bad:
+        return None, f"unreadable Decision line {bad[0].strip()[:120]!r}"
+    verdicts = set(found.values())
+    if len(verdicts) > 1:
+        a, b = list(found.items())[:2]
+        return None, f"Decision lines disagree: {a[0].strip()[:60]!r} vs {b[0].strip()[:60]!r}"
+    return verdicts.pop(), None
+
+
+def decision_of(review_md: str) -> str | None:
+    """`accepted` / `returned` / `escalated` when review.md states one verdict unambiguously, else None."""
+    return read_decision(review_md)[0]
+
+
+def review_digest(review_md: str) -> str:
+    """Names one review text in the transition's note so the same review is never applied twice."""
+    return hashlib.sha256(review_md.encode("utf-8")).hexdigest()[:12]
 
 
 class Watcher:
@@ -332,9 +423,17 @@ class Watcher:
 
         tasks = self.store.load_all()
         review = [t for t in tasks.values() if t.status == "submitted"]
+        decided: list[dict] = []
         for t in review:
+            # A verdict the review wrote but could not execute (T-0061: `scr` denied, `escalated` sat 35 h)
+            # is applied here; a task whose decision is applied needs no review session.
+            if self.auto_decide and ok and self.apply_decision(t, decided):
+                continue
             if self.auto_review and ok and self.flag(f"review:{t.id}"):
                 self.start_review(t)
+        if decided:
+            tasks = self.store.load_all()                   # auto-land below sees an `accepted` applied this tick
+            review = [t for t in tasks.values() if t.status == "submitted"]
 
         merged_now = 0
         if self.auto_land and ok:
@@ -386,7 +485,41 @@ class Watcher:
 
         self.save_flags()
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
-        return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "needs": self.needs}
+        return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "needs": self.needs}
+
+    def apply_decision(self, t, decided: list[dict]) -> bool:
+        """A `submitted` task whose review.md states a verdict: apply it as steward:<id> (T-0091). True when
+        the transition was made (appended to `decided`). No Decision -> False, nothing said. An unreadable
+        or ambiguous one -> False, a log line and a NEEDS-YOU line. The note names the review text by
+        digest, and a review already applied under that digest is never applied again: a task moved back
+        to `submitted` with the old review.md still there gets a NEEDS-YOU line asking for a fresh review,
+        not a second application of a stale verdict."""
+        rev = t.dir / "review.md"
+        if not rev.exists():
+            return False
+        text = rev.read_text(encoding="utf-8", errors="replace")
+        verdict, problem = read_decision(text)
+        if problem:
+            self.log(f"{t.id} decision NOT applied: {problem}")
+            self.needs.append(f"{t.id} review.md has a Decision the watcher cannot read ({problem}) — apply it by hand: "
+                              f"scr --actor omri task set {t.id} accepted|returned|escalated")
+            return False
+        if not verdict:
+            return False
+        digest = review_digest(text)
+        note = f"{DECISION_NOTE} [review.md {digest}]"
+        prior = next((e for e in self.read_events() if e.get("kind") == "state" and e.get("task") == t.id
+                      and f"[review.md {digest}]" in (e.get("note") or "")), None)
+        if prior:
+            self.needs.append(f"{t.id} is submitted again but review.md is the review already applied "
+                              f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed")
+            return False
+        if self.scr(f"steward:{t.id}", "task", "set", t.id, verdict, "--note", note, "--quiet") is None:
+            self.needs.append(f"{t.id} decision {verdict} from review.md could not be applied — see reports/steward_watch.log")
+            return False
+        self.log(f"{t.id} decision applied: {verdict}")
+        decided.append({"task": t.id, "decision": verdict})
+        return True
 
     def land_scriptorium_task(self, t) -> bool:
         """accepted scriptorium task -> merged (T-0078). No worktree: a hotfix made in the checkout, whose
