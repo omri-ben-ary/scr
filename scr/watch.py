@@ -799,7 +799,9 @@ class Watcher:
         brief = (f"You are the Steward for Scriptorium task {t.id} (see {self.root / 'agents' / 'steward.md'} — follow its \"On submission\" section exactly).\n"
                  f"Record: {t.dir}  (spec.md, report.md, log.md; write review.md there).\n"
                  f"Worktree: {wt}   Workload config: {self.root / 'config' / 'workloads.yaml'} (done_when_checker, statement_diff, allowed_axioms, main_branch).\n"
-                 f"Run the mechanical checks from the worktree, run statement_diff against {wl.main}, fill review.md completely, and end with a "
+                 f"Run the mechanical checks from the worktree, run check_done.py and statement_diff.py with --fetch and their default base (the merge-base of "
+                 f"origin/{wl.main} and HEAD; never pass a bare {wl.main}: the stale local ref names every file merged since the branch point as out of scope), "
+                 f"fill review.md completely, and end with a "
                  f"Decision line: accepted | returned (feedback) | escalated (Gate N, reason).\n{decide}\n"
                  f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; never run git in the scriptorium folder (it journals itself).\n")
         bf = t.dir / "review-brief.txt"
