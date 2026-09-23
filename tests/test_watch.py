@@ -544,6 +544,66 @@ def test_scr_land_scriptorium_refuses_submitted_and_names_the_next_step(tmp_path
     assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "submitted"
 
 
+# ---- T-0154: `scr land <id>` on a checkout hotfix (accepted scriptorium task, no worktree) -----------------
+# land_any sent it to land_scriptorium, which raised `worktree missing`; the watcher records it merged.
+def _hotfix(root: Path, tid: str = "T-0008", status: str = "accepted") -> None:
+    """The hotfix test's task: workload scriptorium, never spawned, walked to `status` (review first)."""
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", tid, "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    if status == "accepted":
+        (Store(root).get(tid).dir / "review.md").write_text(accepted_review(), encoding="utf-8")   # T-0081
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, "accepted")
+
+
+def _merged_states(root: Path, tid: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == "merged"]
+
+
+def test_scr_land_hotfix_no_worktree_is_merged_like_the_watcher(tmp_path: Path, monkeypatch):
+    """`scr land T-0008` on the hotfix: rc 0, merged, one state event with the watcher's note and actor, the
+    trunk untouched, no landed event — the record test_accepted_hotfix_without_worktree_is_merged_without_a_merge
+    pins for the watcher. The note is one constant, and it is the watcher's word for word."""
+    import scr.ops as ops
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root)
+    assert not (tmp_path / "scriptorium-worktrees" / "T-0008").exists()
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0008")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "worktree missing" not in r.stdout + r.stderr and "T-0008 marked merged" in r.stdout, r.stdout
+    assert Store(root).get("T-0008").status == "merged"
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+    st = _merged_states(root, "T-0008")
+    assert len(st) == 1 and "already on main (journal)" in st[0]["note"], st
+    assert st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0008" and st[0]["from"] == "accepted", st
+    assert f'"{ops.HOTFIX_MERGED_NOTE}"' in (REPO / "scr" / "watch.py").read_text(encoding="utf-8")   # same wording as the watcher
+    assert Store(root).get("T-0007").status == "accepted"                                       # the spawned task is not touched
+
+
+def test_scr_land_hotfix_no_worktree_dry_run_changes_nothing(tmp_path: Path, monkeypatch):
+    """`scr land T-0008 --dry-run`: rc 0, the plan says `no worktree`, and nothing moved (status, trunk, events)."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root)
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0008", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no worktree: record merged only (change already on main via the journal)" in r.stdout and "dry run" in r.stdout, r.stdout
+    assert Store(root).get("T-0008").status == "accepted" and not _merged_states(root, "T-0008")
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+
+
+def test_scr_land_hotfix_no_worktree_submitted_still_refuses(tmp_path: Path, monkeypatch):
+    """No worktree does not skip the Decision: a submitted hotfix is refused as T-0119 made it, dry run too."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root, status="submitted")
+    for extra in ([], ["--dry-run"]):
+        r = sscr(root, "--actor", "omri", "land", "T-0008", *extra, check=False)
+        assert r.returncode == 2 and "T-0008 is submitted, not accepted — write the Decision first (T-0081)" in r.stderr, r.stdout + r.stderr
+    assert Store(root).get("T-0008").status == "submitted" and not _merged_states(root, "T-0008")
+
+
 # ---- T-0091: the watcher applies a Decision written in review.md ----------------------------------------
 # T-0061's review wrote `Decision: escalated (...)` on 2026-09-19 with `scr` denied, and the task sat
 # `submitted` for 35 h. `decision_of` is a pure function of review.md's text; `apply_decision` runs it for
