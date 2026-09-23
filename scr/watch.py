@@ -48,7 +48,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import LOG_PATHS, checkpoint, land, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
+from .ops import LOG_PATHS, checkpoint, is_scriptorium_task, land, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
 from .run import kill, pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -397,7 +397,7 @@ class Watcher:
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "scope_drift", "--task", t.id, "--note", note[:900], "--quiet")
                 if drift:
                     flags.append(f"drift:{len(drift)}")
-            elif t.rec.get("workload") == "scriptorium":
+            elif is_scriptorium_task(self.root, self.store, t):
                 flags.append("tooling")          # a hotfix in the checkout; the journal records its commits
             else:
                 flags.append("no-worktree")
@@ -498,7 +498,7 @@ class Watcher:
             for t in [t for t in tasks.values() if t.status == "accepted"]:
                 if not self.flag(f"land:{t.id}"):
                     continue
-                if t.rec.get("workload") == "scriptorium":
+                if is_scriptorium_task(self.root, self.store, t):
                     if self.land_scriptorium_task(t):
                         merged_now += 1
                     continue
@@ -791,7 +791,7 @@ class Watcher:
     def start_review(self, t) -> None:
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        if t.rec.get("workload") == "scriptorium":
+        if is_scriptorium_task(self.root, self.store, t):
             return self.start_tooling_review(t)
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): accepted only if the statement diff is EMPTY and every "
                   "mechanical check passes; otherwise returned or escalated. Never merge a branch yourself; never edit Lean."
