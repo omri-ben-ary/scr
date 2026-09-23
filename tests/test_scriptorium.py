@@ -103,6 +103,49 @@ def test_verify_clean_after_seed(repo: Path):
     assert "0 errors" in r.stdout
 
 
+def _set_workload(root: Path, tid: str, key: str | None):
+    """Edit a record's `workload:` (None deletes the key) and re-snapshot so only the new check fires."""
+    t = Store(root).get(tid)
+    if key is None:
+        t.rec.pop("workload", None)
+    else:
+        t.rec["workload"] = key
+    t.save()
+    scr(root, "--quiet", "snapshot")
+
+
+def test_verify_warns_on_unregistered_workload(repo: Path):
+    seed(repo)
+    before = State(repo).verify()
+    first = next(iter(Store(repo).config("workloads")))
+    _set_workload(repo, "T-0002", "nosuch")
+    v = State(repo).verify()
+    hits = [w for w in v["warnings"] if w.startswith("T-0002:") and "nosuch" in w]
+    assert hits and f"'{first}'" in hits[0]
+    assert v["errors"] == before["errors"]
+
+
+def test_verify_warns_on_missing_workload(repo: Path):
+    seed(repo)
+    before = State(repo).verify()
+    _set_workload(repo, "T-0003", None)
+    v = State(repo).verify()
+    assert any(w.startswith("T-0003:") and "workload" in w and "not registered" in w for w in v["warnings"])
+    assert v["errors"] == before["errors"]
+    # a merged record is closed: its workload no longer resolves anything, so no warning
+    for s in ("dispatched", "in_progress", "submitted"):
+        scr(repo, "--quiet", "task", "set", "T-0002", s)
+    review = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    review = review.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted").replace("|---|---|\n", "|---|---|\n| build | ok |\n")
+    (Store(repo).get("T-0002").dir / "review.md").write_text(review, encoding="utf-8")
+    scr(repo, "--quiet", "task", "set", "T-0002", "accepted")
+    scr(repo, "--quiet", "task", "set", "T-0002", "merged")
+    _set_workload(repo, "T-0002", "nosuch")
+    v = State(repo).verify()
+    assert not any(w.startswith("T-0002:") and "workload" in w for w in v["warnings"])
+    assert not v["errors"]
+
+
 def test_merge_cascades_to_ready(repo: Path):
     seed(repo)
     for s in ("dispatched", "in_progress", "submitted"):
