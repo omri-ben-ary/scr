@@ -30,6 +30,12 @@ KEY_ORDER = [
 ]
 
 
+def file_hash(p: Path) -> str:
+    """sha256 of a text file's bytes with CRLF normalised to LF (nothing else), so a checkout's
+    line endings (core.autocrlf) never change docs_hash / config_hash."""
+    return sha256_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
+
+
 class RepoError(Exception):
     pass
 
@@ -83,7 +89,7 @@ class Task:
         parts = []
         for f in DOC_FILES:
             p = self.dir / f
-            parts.append(sha256_bytes(p.read_bytes()) if p.exists() else sha256_bytes(b""))
+            parts.append(file_hash(p) if p.exists() else sha256_bytes(b""))
         return H("docs", *parts)
 
     def leaf(self) -> str:
@@ -158,5 +164,5 @@ class Store:
         if cdir.exists():
             for f in sorted(cdir.iterdir()):
                 if f.is_file():
-                    parts.append(f.name + ":" + sha256_bytes(f.read_bytes()))
+                    parts.append(f.name + ":" + file_hash(f))
         return H("config", *parts)

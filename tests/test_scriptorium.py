@@ -156,6 +156,54 @@ def test_tamper_docs_detected(repo: Path):
     assert "0 errors" in scr(repo, "verify").stdout
 
 
+# ---- line endings (T-0100) ------------------------------------------------------
+def _write_eol(p: Path, text: str, eol: str) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(text.replace("\n", eol).encode("utf-8"))
+
+
+def test_docs_and_config_hash_ignore_crlf(tmp_path: Path):
+    from scr.store import DOC_FILES, Task
+    docs = {f: f"# {f}\n\nline one\nline two\n" for f in DOC_FILES}
+    cfg = {"a.yaml": "x: 1\ny: [1, 2]\n", "b.yaml": "z: two\n"}
+    roots = {}
+    for eol in ("\n", "\r\n"):
+        root = tmp_path / ("crlf" if eol == "\r\n" else "lf")
+        for f, text in docs.items():
+            _write_eol(root / "tasks" / "T-0001-x" / f, text, eol)
+        for f, text in cfg.items():
+            _write_eol(root / "config" / f, text, eol)
+        roots[eol] = root
+    lf, crlf = roots["\n"], roots["\r\n"]
+    assert b"\r\n" in (crlf / "config" / "a.yaml").read_bytes()
+    t_lf, t_crlf = Task(lf / "tasks" / "T-0001-x", {"id": "T-0001"}), Task(crlf / "tasks" / "T-0001-x", {"id": "T-0001"})
+    assert t_lf.docs_hash() == t_crlf.docs_hash()
+    assert Store(lf).config_hash() == Store(crlf).config_hash()
+    # a real content change still changes both
+    before_docs, before_cfg = t_crlf.docs_hash(), Store(crlf).config_hash()
+    _write_eol(crlf / "tasks" / "T-0001-x" / "spec.md", "# spec.md\n\nline one\nline 2\n", "\r\n")
+    _write_eol(crlf / "config" / "b.yaml", "z: three\n", "\r\n")
+    assert t_crlf.docs_hash() != before_docs
+    assert Store(crlf).config_hash() != before_cfg
+
+
+def test_verify_clean_after_crlf_rewrite(repo: Path):
+    seed(repo)
+    texts = [p for sub in ("tasks", "config") for p in (repo / sub).rglob("*") if p.is_file() and p.suffix in (".md", ".yaml")]
+    assert len(texts) > 10
+    # write_text emits CRLF on Windows, so make the snapshotted tree LF first; the CRLF rewrite must change bytes
+    for p in texts:
+        p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
+    scr(repo, "refresh", "--quiet")
+    assert "0 errors" in scr(repo, "verify").stdout
+    for p in texts:
+        b = p.read_bytes()
+        p.write_bytes(b.replace(b"\n", b"\r\n"))
+        assert p.read_bytes() != b or b"\n" not in b
+    r = State(repo).verify()
+    assert r["errors"] == [], r["errors"]
+
+
 def test_tamper_events_detected(repo: Path):
     seed(repo)
     p = repo / "events" / "events.jsonl"
