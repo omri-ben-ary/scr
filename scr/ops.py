@@ -630,6 +630,10 @@ _LAND_NEXT = {
     "scope": "widen the record's scope or revert the [checkpoint-drift] commit on {br}, then `scr land {tid}` again",
 }
 
+# The merged note of a checkout hotfix (an accepted scriptorium task with no worktree): the journal already
+# put its commits on the trunk. Word for word the note Watcher.land_scriptorium_task sets (T-0154).
+HOTFIX_MERGED_NOTE = "tooling task: change already on main (journal)"
+
 
 def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False) -> dict:
     """The one place that decides which landing a task gets (T-0119): a scriptorium task (is_scriptorium_task)
@@ -638,6 +642,8 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
     The QI flags do not apply to the scriptorium path; dry_run there reports the plan and changes nothing.
     land_scriptorium is the post-acceptance step, so a scriptorium task must be `accepted` (land() accepts a
     reviewed `submitted` task because the PR merge implies the review; here the Decision comes first).
+    An accepted scriptorium task with no worktree is a checkout hotfix, already on the trunk through the
+    journal: it is recorded merged with HOTFIX_MERGED_NOTE and nothing else, as the watcher does (T-0154).
     A failure returns ok False with one closing line naming the reason and what to do next."""
     store = Store(root)
     t = store.get(tid)
@@ -649,9 +655,15 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
         raise RepoError(f"{tid} is {t.status}, not accepted — only an accepted scriptorium task lands")
     wl = workload_for(root, store, t)
     wt, br, trunk = task_worktree(wl, t), f"task/{tid}", wl.main
+    if not wt.exists():
+        # T-0154: a checkout hotfix — the watcher's outcome: merged with its note, no merge, no landed event
+        head = f"=== {tid} [{t.status}] no worktree ({wt}) -> {trunk} (scriptorium"
+        if dry_run:
+            return {"ok": True, "reason": None, "sha": None, "tip": None, "url": None,
+                    "out": [head + ", dry run: nothing changed)", f"  no worktree: record merged only (change already on {trunk} via the journal)"]}
+        out = [head + ")"] + _record_merged(root, store, tid, HOTFIX_MERGED_NOTE) + [f"  {tid} marked merged ({HOTFIX_MERGED_NOTE})"]
+        return {"ok": True, "reason": None, "out": out, "sha": None, "tip": None, "url": None}
     if dry_run:
-        if not wt.exists():
-            raise RepoError(f"worktree missing: {wt}")
         g, mg = Git(wt), Git(root)
         dirty = g.dirty()
         out = [f"=== {tid} [{t.status}] {br} -> {trunk} (scriptorium, dry run: nothing changed)",

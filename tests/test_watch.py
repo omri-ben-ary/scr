@@ -544,6 +544,66 @@ def test_scr_land_scriptorium_refuses_submitted_and_names_the_next_step(tmp_path
     assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "submitted"
 
 
+# ---- T-0154: `scr land <id>` on a checkout hotfix (accepted scriptorium task, no worktree) -----------------
+# land_any sent it to land_scriptorium, which raised `worktree missing`; the watcher records it merged.
+def _hotfix(root: Path, tid: str = "T-0008", status: str = "accepted") -> None:
+    """The hotfix test's task: workload scriptorium, never spawned, walked to `status` (review first)."""
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", tid, "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    if status == "accepted":
+        (Store(root).get(tid).dir / "review.md").write_text(accepted_review(), encoding="utf-8")   # T-0081
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, "accepted")
+
+
+def _merged_states(root: Path, tid: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == "merged"]
+
+
+def test_scr_land_hotfix_no_worktree_is_merged_like_the_watcher(tmp_path: Path, monkeypatch):
+    """`scr land T-0008` on the hotfix: rc 0, merged, one state event with the watcher's note and actor, the
+    trunk untouched, no landed event — the record test_accepted_hotfix_without_worktree_is_merged_without_a_merge
+    pins for the watcher. The note is one constant, and it is the watcher's word for word."""
+    import scr.ops as ops
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root)
+    assert not (tmp_path / "scriptorium-worktrees" / "T-0008").exists()
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0008")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "worktree missing" not in r.stdout + r.stderr and "T-0008 marked merged" in r.stdout, r.stdout
+    assert Store(root).get("T-0008").status == "merged"
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+    st = _merged_states(root, "T-0008")
+    assert len(st) == 1 and "already on main (journal)" in st[0]["note"], st
+    assert st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0008" and st[0]["from"] == "accepted", st
+    assert f'"{ops.HOTFIX_MERGED_NOTE}"' in (REPO / "scr" / "watch.py").read_text(encoding="utf-8")   # same wording as the watcher
+    assert Store(root).get("T-0007").status == "accepted"                                       # the spawned task is not touched
+
+
+def test_scr_land_hotfix_no_worktree_dry_run_changes_nothing(tmp_path: Path, monkeypatch):
+    """`scr land T-0008 --dry-run`: rc 0, the plan says `no worktree`, and nothing moved (status, trunk, events)."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root)
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0008", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no worktree: record merged only (change already on main via the journal)" in r.stdout and "dry run" in r.stdout, r.stdout
+    assert Store(root).get("T-0008").status == "accepted" and not _merged_states(root, "T-0008")
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+
+
+def test_scr_land_hotfix_no_worktree_submitted_still_refuses(tmp_path: Path, monkeypatch):
+    """No worktree does not skip the Decision: a submitted hotfix is refused as T-0119 made it, dry run too."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root, status="submitted")
+    for extra in ([], ["--dry-run"]):
+        r = sscr(root, "--actor", "omri", "land", "T-0008", *extra, check=False)
+        assert r.returncode == 2 and "T-0008 is submitted, not accepted — write the Decision first (T-0081)" in r.stderr, r.stdout + r.stderr
+    assert Store(root).get("T-0008").status == "submitted" and not _merged_states(root, "T-0008")
+
+
 # ---- T-0091: the watcher applies a Decision written in review.md ----------------------------------------
 # T-0061's review wrote `Decision: escalated (...)` on 2026-09-19 with `scr` denied, and the task sat
 # `submitted` for 35 h. `decision_of` is a pure function of review.md's text; `apply_decision` runs it for
@@ -1364,3 +1424,64 @@ def test_run_kill_reports_a_refused_taskkill(monkeypatch):
     for rc, want in ((0, True), (128, False)):
         monkeypatch.setattr(run_mod, "subprocess", _Shim(subprocess, run=lambda *a, rc=rc, **k: R(rc)))
         assert run_mod.kill(99999) is want
+
+
+# ---- T-0153: the watcher routes by ops.is_scriptorium_task (repo identity), not the `workload:` string --------
+# The hand path (T-0119, land_any) and the watcher's land step, review launch and status flag share one decider.
+def _rename_workload(root: Path, tid: str = "T-0007") -> None:
+    """Register the checkout a second time, as `tooling` (`repo: .`), and point the task's record at that key."""
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["tooling"] = dict(wl["scriptorium"])
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    sscr(root, "--quiet", "--actor", "s", "task", "field", tid, "workload", "tooling")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] second key for the checkout")
+
+
+def test_watch_land_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, monkeypatch):
+    """An accepted worktree task whose `workload:` is `tooling` (the checkout under another key) lands through
+    land_scriptorium on the tick: landed event, a `[land]` commit on the trunk, and the QI land() (push/PR)
+    is never called."""
+    import scr.ops as ops
+    import scr.watch as watch
+    root, origin, wt = _land_world(tmp_path, monkeypatch)
+    _rename_workload(root)
+    store = Store(root)
+    assert ops.is_scriptorium_task(root, store, store.get("T-0007"))
+    calls: list[str] = []
+    monkeypatch.setattr(watch, "land", lambda root, tid, **kw: calls.append(tid) or {"ok": False, "url": None, "out": ["QI land called"]})
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    origin_before = sgit(origin, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and not calls, (calls, res)
+    assert Store(root).get("T-0007").status == "merged", res["needs"]
+    ev = _events(root, "landed", "T-0007")
+    assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"], ev
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok"
+    assert any(s.startswith("[land] T-0007") for s in sgit(root, "log", "--format=%s", "main").splitlines())
+    assert sgit(origin, "rev-parse", "main") == origin_before and sgit(origin, "branch", "--list", "task/T-0007") == ""
+
+
+def test_watch_review_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, monkeypatch):
+    """A submitted task under the renamed key gets the tooling review, not the Lean review brief; the same
+    rule flags a worktree-less task under that key `tooling` rather than `no-worktree`."""
+    import scr.watch as watch
+    from scr.watch import Watcher
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "task", "new", "Tooling 2", "--id", "T-0012", "--workload", "scriptorium", "--files", "tool.txt", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0012", st)
+    _rename_workload(root, "T-0012")
+    tooling: list[str] = []
+    lean: list[tuple] = []
+    monkeypatch.setattr(Watcher, "start_tooling_review", lambda self, t: tooling.append(t.id))
+    monkeypatch.setattr(watch, "start_claude", lambda *a, **kw: lean.append(a))
+    res = Watcher(root, quiet=True, auto_review=True).tick()
+    assert res["ok"] and "T-0012" in res["review"], res
+    assert tooling == ["T-0012"] and not lean, (tooling, lean)
+    # the status flag: a worktree-less task under `tooling` is a hotfix in the checkout
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0010", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0010", st)
+    _rename_workload(root, "T-0010")
+    res = Watcher(root, quiet=True).tick()
+    assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
