@@ -94,6 +94,20 @@ def cmd_task_set(args):
     old = t.status
     if not lifecycle.allowed(t.rec, args.status) and not args.force:
         raise RepoError(f"{args.id}: {old} -> {args.status} is not an allowed transition (use --force to override; it is logged)")
+    if args.status == "accepted" and old == "submitted":
+        # T-0081: no acceptance without a written review. The same reading as ops.land and the watcher's
+        # auto-decide (scr/review.py). Only Omri may go past it, explicitly, and that leaves an event.
+        from .review import acceptance_problem
+        problem = acceptance_problem(t.dir)
+        if problem:
+            if getattr(args, "force_accept", False) and args.actor == "omri":
+                log.append("system", name="accept_override", task=args.id, actor=args.actor,
+                           note=f"{problem}; accepted anyway by Omri (--force-accept)" + (f": {args.note}" if args.note else ""))
+            elif getattr(args, "force_accept", False):
+                raise RepoError(f"{args.id}: submitted -> accepted refused — {problem}; --force-accept is Omri's alone (--actor omri)")
+            else:
+                raise RepoError(f"{args.id}: submitted -> accepted refused — {problem}; write the review in "
+                                f"tasks/{t.dir.name}/review.md first (Omri may override with --actor omri --force-accept --note <why>; it is logged)")
     lifecycle.apply(t.rec, args.status)
     if args.tokens:
         t.rec["tokens_used"] = int(t.rec.get("tokens_used", 0)) + args.tokens
@@ -572,6 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
     n.set_defaults(fn=cmd_task_new)
     st = t.add_parser("set", parents=[common], help="status transition")
     st.add_argument("id"); st.add_argument("status"); st.add_argument("--note"); st.add_argument("--tokens", type=int); st.add_argument("--force", action="store_true")
+    st.add_argument("--force-accept", action="store_true", help="(--actor omri only) accept a submitted task whose review.md does not decide `accepted`; logs an accept_override event with --note")
     st.set_defaults(fn=cmd_task_set)
     br = t.add_parser("brief", parents=[common], help="print the standard scriber launch prompt for a task")
     br.add_argument("id"); br.set_defaults(fn=cmd_task_brief)

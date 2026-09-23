@@ -24,6 +24,14 @@ from scr.store import Store
 REPO = Path(__file__).resolve().parents[1]
 
 
+def accepted_review(row: str = "| `pytest tests -q` | passed |") -> str:
+    """templates/review.md with `## Decision` reading `accepted` and one mechanical row: what T-0081's guard
+    needs before a submitted task may become accepted or land."""
+    text = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    text = text.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted")
+    return text.replace("|---|---|\n", "|---|---|\n" + row + "\n")
+
+
 def scr(root: Path, *args: str, journal_on: bool = True, check: bool = True):
     env = {**os.environ, "SCRIPTORIUM_ROOT": str(root), "PYTHONPATH": str(REPO)}
     env["SCR_NO_JOURNAL"] = "0" if journal_on else "1"
@@ -137,6 +145,7 @@ def test_spawn_checkpoint_land_retire(world):
     t = Store(root).get("T-0001")
     (t.dir / "report.md").write_text("# report\n\n## Result\n\nProved a.\n\n## Statement changes\n\nnone\n")
     scr(root, "--actor", "steward:T-0001", "task", "set", "T-0001", "submitted")
+    (t.dir / "review.md").write_text(accepted_review(), encoding="utf-8")        # T-0081: no landing without a written review
     r = land(root, "T-0001")
     assert r["ok"], r["out"]
     assert "task/T-0001" in git(repo, "branch", "-r")                      # pushed to origin
@@ -481,6 +490,7 @@ def test_hotfix_lifecycle(world, monkeypatch):
     assert "0 errors" in scr(root, "verify").stdout
     # 4. the watcher lands a tooling task without a worktree: accepted -> merged
     from scr.watch import Watcher
+    (t.dir / "review.md").write_text(accepted_review(), encoding="utf-8")        # T-0081: the review is written first
     scr(root, "--actor", "steward:" + tid, "task", "set", tid, "accepted")
     Watcher(root, quiet=True, auto_land=True).tick()
     assert Store(root).get(tid).status == "merged"

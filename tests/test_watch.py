@@ -16,7 +16,7 @@ import yaml
 
 from scr.ops import spawn
 from scr.store import Store
-from test_journal_ops import REPO, world, scr  # noqa: F401  (the shared fixture: scriptorium + workload repo + origin)
+from test_journal_ops import REPO, accepted_review, world, scr  # noqa: F401  (the shared fixture: scriptorium + workload repo + origin)
 
 FAKE_CLAUDE = str(Path(sys.executable).with_name("claude.exe"))   # a .exe path: claude_argv must not wrap it in `cmd /c`
 
@@ -258,8 +258,10 @@ def _land_world(tmp_path: Path, monkeypatch, journal: bool = False) -> tuple[Pat
     spawn(root, ["T-0007"])
     wt = tmp_path / "scriptorium-worktrees" / "T-0007"
     assert wt.is_dir() and sgit(wt, "rev-parse", "--abbrev-ref", "HEAD") == "task/T-0007"
-    for st in ("in_progress", "submitted", "accepted"):
+    for st in ("in_progress", "submitted"):
         sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", st)
+    (Store(root).get("T-0007").dir / "review.md").write_text(accepted_review(), encoding="utf-8")   # T-0081: the review comes first
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", "accepted")
     sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] accepted")     # the trunk moves after the spawn, as it always does
     return root, origin, wt
 
@@ -308,8 +310,10 @@ def test_accepted_hotfix_without_worktree_is_merged_without_a_merge(tmp_path: Pa
     trunk untouched, with the note that says why."""
     root, _, _ = _land_world(tmp_path, monkeypatch)
     sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0008", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
-    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted", "accepted"):
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
         sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0008", st)
+    (Store(root).get("T-0008").dir / "review.md").write_text(accepted_review(), encoding="utf-8")   # T-0081
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0008", "accepted")
     (tmp_path / "scriptorium-worktrees" / "T-0007").rename(tmp_path / "T-0007-parked")   # keep this tick to the hotfix
     sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0007", "returned")
     main_before = sgit(root, "rev-parse", "main")
@@ -438,6 +442,8 @@ def _review(**sections: str) -> str:
     text = TEMPLATE
     if "decision" in sections:
         text = text.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", sections["decision"])
+    if "mechanical" in sections:                                # a row under the table's rule (T-0081's guard needs one to accept)
+        text = text.replace("|---|---|\n", "|---|---|\n" + sections["mechanical"] + "\n")
     if "feedback" in sections:
         text = text.rstrip("\n") + "\n" + sections["feedback"] + "\n"
     return text
@@ -651,7 +657,7 @@ def test_accepted_decision_becomes_the_status(world):
     from scr.watch import Watcher
     root, _, _ = world
     _submit(root)
-    _write_review(root, "T-0001", _review(decision="accepted", feedback="Decision: accepted"))
+    _write_review(root, "T-0001", _review(decision="accepted", mechanical="| tests | pass |", feedback="Decision: accepted"))
     res = Watcher(root, quiet=True, auto_decide=True).tick()
     assert Store(root).get("T-0001").status == "accepted" and res["decided"] == [{"task": "T-0001", "decision": "accepted"}]
 

@@ -16,6 +16,11 @@ Per tick:
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
                 -> otherwise one headless review session (auto-review)
+                   The review is written BEFORE anything lands (T-0081): `accepted` is refused by
+                   `scr task set` and by `land` unless review.md's Decision reads `accepted` and its
+                   mechanical table has a row (scr/review.py acceptance_problem); a refusal here is a
+                   FAILED line in the log and a NEEDS-YOU line, never a transition. T-0021 was merged on
+                   the blank template before this.
   stuck         -> escalated + one slot_freed event (auto-decide; T-0092): a task that cannot progress is
                    escalated, never held — submitted > review_stale_hours with no Decision written, or
                    in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours; the
@@ -28,7 +33,6 @@ Never deletes anything; never edits Lean; never answers a HELP: line itself.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -61,94 +65,10 @@ _HELP_BLOCKING = re.compile(r"^\s*(-\s*)?HELP(\[blocks:[^\]]*\])?:")
 _HELP_ANSWER = re.compile(r"\[(steward|omri)(:[^\]]*)?\]")
 _LINE_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
 
-# ---- the Decision written in review.md (T-0091) ------------------------------------------------------
-VERDICTS = ("accepted", "returned", "escalated")
-# the explicit form the review brief asks for, anchored at column zero: `Decision: escalated (Gate 2, reason)`
-_DECISION_LINE = re.compile(r"^Decision:")
-_DECISION_VERDICT = re.compile(r"^Decision:\s*[*_`]*(accepted|returned|escalated)\b")
-# the template form: the first non-blank line under a `## Decision` heading, its first word the verdict
-_DECISION_HEADING = re.compile(r"^#{1,6}\s*Decision\b")
-_ANY_HEADING = re.compile(r"^#{1,6}\s")
-_SECTION_VERDICT = re.compile(r"^\s*[*_`]*(accepted|returned|escalated)\b")
-# templates/review.md's placeholder: `accepted | returned (feedback below) | escalated (Gate N, reason)`
-_PLACEHOLDER = re.compile(r"^\s*accepted\s*\|\s*returned\b.*\|\s*escalated\b")
-_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
-DECISION_NOTE = "applied from review.md by the watcher"
-
-
-def _unfenced(text: str) -> list[str]:
-    """The lines of a markdown text that are not inside a fenced code block (a review that quotes a draft,
-    like T-0050's transcript, must not be read as a verdict)."""
-    out, fence = [], None
-    for line in text.splitlines():
-        m = _FENCE.match(line)
-        if m and (fence is None or m.group(1) == fence):
-            fence = None if fence else m.group(1)
-            continue
-        if fence is None:
-            out.append(line)
-    return out
-
-
-def _verdict(line: str, rx: re.Pattern) -> str | None:
-    """The verdict a candidate line states, or None when it names none or more than one
-    (`accepted | returned` left over from the placeholder is ambiguous, not a verdict)."""
-    m = rx.match(line)
-    if not m:
-        return None
-    others = [v for v in VERDICTS if v != m.group(1) and re.search(rf"\|\s*[*_`]*{v}\b", line)]
-    return None if others else m.group(1)
-
-
-def read_decision(review_md: str) -> tuple[str | None, str | None]:
-    """(verdict, problem) from a review.md text. The verdict comes from the FIRST `Decision:` line at column
-    zero outside a code fence (the explicit form the review brief asks for) or, failing that, from the
-    first non-blank line under a `## Decision` heading whose first word is a verdict (the template form
-    T-0062's review used). The untouched placeholder is no decision. When both forms are present they
-    must agree. `problem` is set — with the offending line — when a Decision is written but cannot be
-    read (`Decision: maybe`, a section that opens with prose, the two forms disagreeing): that is for
-    Omri, never a transition."""
-    lines = _unfenced(review_md)
-    explicit = next((l for l in lines if _DECISION_LINE.match(l)), None)
-    section = None
-    for i, line in enumerate(lines):
-        if _DECISION_HEADING.match(line):
-            for nxt in lines[i + 1:]:
-                if _ANY_HEADING.match(nxt):
-                    break
-                if nxt.strip():
-                    section = nxt
-                    break
-            break
-    if section is not None and _PLACEHOLDER.match(section):
-        section = None
-    if explicit is not None and _PLACEHOLDER.match(explicit[len("Decision:"):]):   # the brief's own wording, copied
-        explicit = None
-    if explicit is None and section is None:
-        return None, None
-    found: dict[str, str | None] = {}
-    if explicit is not None:
-        found[explicit] = _verdict(explicit, _DECISION_VERDICT)
-    if section is not None:
-        found[section] = _verdict(section, _SECTION_VERDICT)
-    bad = [l for l, v in found.items() if v is None]
-    if bad:
-        return None, f"unreadable Decision line {bad[0].strip()[:120]!r}"
-    verdicts = set(found.values())
-    if len(verdicts) > 1:
-        a, b = list(found.items())[:2]
-        return None, f"Decision lines disagree: {a[0].strip()[:60]!r} vs {b[0].strip()[:60]!r}"
-    return verdicts.pop(), None
-
-
-def decision_of(review_md: str) -> str | None:
-    """`accepted` / `returned` / `escalated` when review.md states one verdict unambiguously, else None."""
-    return read_decision(review_md)[0]
-
-
-def review_digest(review_md: str) -> str:
-    """Names one review text in the transition's note so the same review is never applied twice."""
-    return hashlib.sha256(review_md.encode("utf-8")).hexdigest()[:12]
+# ---- the Decision written in review.md (T-0091) lives in scr/review.py since T-0081, so that ops.land and
+# `scr task set` read it the same way this watcher does; re-exported here so callers and tests keep working.
+from .review import (DECISION_NOTE, VERDICTS, _ANY_HEADING, _DECISION_HEADING, _DECISION_LINE, _DECISION_VERDICT, _FENCE,  # noqa: E402,F401
+                     _PLACEHOLDER, _SECTION_VERDICT, _unfenced, _verdict, acceptance_problem, decision_of, read_decision, review_digest)
 
 
 # ---- a stuck task leaves the slot (T-0092): pure functions of (record, review.md, log.md, events, now) -------
