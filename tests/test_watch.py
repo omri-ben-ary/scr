@@ -958,3 +958,156 @@ def test_stuck_rule_is_written_in_the_agent_docs():
         assert "never held" in text and "same tick" in text, name
     assert submitted_since([{"kind": "state", "task": "T-1", "to": "submitted", "ts": "2026-09-19T16:11:02Z"}], "T-1") == datetime(2026, 9, 19, 16, 11, 2, tzinfo=timezone.utc)
     assert REVIEW_STALE_HOURS == 2.0
+
+
+# ---- T-0122: dispatch_timeout_minutes is enforced ---------------------------------------------------------
+# limits.yaml carried the key and nothing read it (T-0092 review, item 2): a dispatch whose launch failed after
+# `scr dispatch` sat in `dispatched` (a slot status) forever. `dispatch_stale` is a pure function of the log and
+# `now`; `dispatch_checks` runs it on a tick with auto_decide on, before the stuck checks and auto-dispatch, so
+# the slot is refilled on the same tick. The dispatch is backdated by rewriting its event's `ts` and re-chaining
+# the log (then `scr snapshot`, so `scr verify` stays green), which keeps the default limit in force.
+import json  # noqa: E402
+
+from scr.canon import ZERO, canon  # noqa: E402
+from scr.events import event_hash  # noqa: E402
+from scr.watch import DISPATCH_TIMEOUT_MINUTES, dispatch_stale  # noqa: E402
+
+
+def _dispatched(root: Path, tid: str = "T-0001") -> None:
+    scr(root, "--quiet", "--actor", "prioritizer", "task", "set", tid, "dispatched")
+
+
+def _launched(root: Path, tid: str = "T-0001", pid: int = 4242) -> None:
+    """The launcher's `launch` event, pid recorded in `data` as scr/launch.py writes it."""
+    scr(root, "--quiet", "--actor", f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid,
+        "--note", f"headless pid {pid}", "--data", json.dumps({"pid": pid, "transcript": "session-20260923-000000.txt"}))
+
+
+def _backdate(root: Path, tid: str, to: str, minutes: float) -> None:
+    """Move the newest `to` state event of `tid` `minutes` into the past and re-chain every later event."""
+    p = root / "events" / "events.jsonl"
+    evs = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    i = max(i for i, e in enumerate(evs) if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == to)
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0)
+    evs[i]["ts"] = ts.isoformat().replace("+00:00", "Z")
+    prev = evs[i - 1]["h"] if i else ZERO
+    for e in evs[i:]:
+        e["prev"] = prev
+        e["h"] = prev = event_hash(e)
+    p.write_text("\n".join(canon(e) for e in evs) + "\n", encoding="utf-8")
+    scr(root, "--quiet", "snapshot")
+
+
+def _state_event_count(root: Path, tid: str) -> int:
+    return len(_state_events(root, tid))
+
+
+def test_dispatch_stale_is_a_pure_function_of_the_log_and_time():
+    old = (NOW - timedelta(minutes=45)).isoformat().replace("+00:00", "Z")
+    young = (NOW - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    disp = {"kind": "state", "task": "T-1", "from": "ready", "to": "dispatched", "ts": old}
+    launch = {"kind": "system", "name": "launch", "task": "T-1", "ts": old}
+    other = {"kind": "system", "name": "launch", "task": "T-2", "ts": old}
+    row = dispatch_stale([disp], "T-1", 30, NOW)
+    assert row == {"since": NOW - timedelta(minutes=45), "age_min": 45.0}
+    assert dispatch_stale([{**disp, "ts": young}], "T-1", 30, NOW) is None                   # not yet
+    assert dispatch_stale([disp], "T-1", 45, NOW) is None                                    # at the limit: not over it
+    assert dispatch_stale([disp, launch], "T-1", 30, NOW) is None                            # the launcher has it
+    assert dispatch_stale([disp, other], "T-1", 30, NOW)["age_min"] == 45.0                  # another task's launch
+    assert dispatch_stale([], "T-1", 30, NOW) is None and dispatch_stale([launch], "T-1", 30, NOW) is None
+    assert dispatch_stale([{**disp, "ts": "not a time"}], "T-1", 30, NOW) is None            # undatable: never early
+    # only the newest dispatch counts: the first run's launch event is history once the task is dispatched again
+    run1 = [disp, launch, {"kind": "state", "task": "T-1", "from": "dispatched", "to": "in_progress", "ts": old},
+            {"kind": "state", "task": "T-1", "from": "in_progress", "to": "returned", "ts": old},
+            {"kind": "state", "task": "T-1", "from": "returned", "to": "ready", "ts": old}]
+    assert dispatch_stale(run1 + [disp], "T-1", 30, NOW)["age_min"] == 45.0
+    assert dispatch_stale(run1 + [disp, launch], "T-1", 30, NOW) is None
+    assert dispatch_stale(run1 + [{**disp, "ts": young}], "T-1", 30, NOW) is None
+
+
+def test_dispatched_without_a_session_times_out_to_ready(world, monkeypatch):
+    """DoD 1: dispatched, the state event older than dispatch_timeout_minutes, no launch event, auto_decide on
+    -> after one tick() the task is ready (actor steward:<id>), exactly one dispatch_timeout event; a second
+    tick adds no second event."""
+    root, _, _ = world
+    assert float(yaml.safe_load((root / "config" / "limits.yaml").read_text(encoding="utf-8"))["dispatch_timeout_minutes"]) == DISPATCH_TIMEOUT_MINUTES == 30
+    _dispatched(root)
+    _backdate(root, "T-0001", "dispatched", 45)
+    assert scr(root, "verify", "--quiet").returncode == 0
+    n_before = _state_event_count(root, "T-0001")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "ready"
+    new = _state_events(root, "T-0001")[n_before:]
+    assert len(new) == 1 and (new[0]["from"], new[0]["to"], new[0]["actor"]) == ("dispatched", "ready", "steward:T-0001"), new
+    assert new[0]["note"].startswith("dispatch timed out: waited 45.0 min in dispatched (dispatch_timeout_minutes 30)"), new[0]["note"]
+    ev = _events(root, "dispatch_timeout", "T-0001")
+    assert len(ev) == 1 and ev[0]["actor"] == "steward:T-0001", ev
+    assert ev[0]["note"] == "waited 45.0 min in dispatched (dispatch_timeout_minutes 30); no launch event; redispatch is automatic"
+    assert res["timed_out"] == [{"task": "T-0001", "since": res["timed_out"][0]["since"], "age_min": 45.0}] and not res["escalated"]
+    assert next(r for r in res["rows"] if r["task"] == "T-0001")["flags"].endswith("DISPATCH-TIMEOUT")
+    assert "T-0001 dispatch timed out -> ready" in (root / LOG).read_text(encoding="utf-8")
+    assert scr(root, "verify", "--quiet").returncode == 0
+    res2 = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res2["ok"] and not res2["timed_out"]
+    assert Store(root).get("T-0001").status == "ready" and len(_events(root, "dispatch_timeout", "T-0001")) == 1
+    assert _state_event_count(root, "T-0001") == n_before + 1
+
+
+def test_dispatched_younger_than_the_limit_is_left_alone(world, monkeypatch):
+    """DoD 2: the same task younger than the limit -> still dispatched, no event; with auto_decide off an old
+    one is held too (the check is an automatic transition like the others)."""
+    root, _, _ = world
+    _dispatched(root)
+    _backdate(root, "T-0001", "dispatched", 20)
+    calls = _spy_scr(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and not res["timed_out"], res
+    assert Store(root).get("T-0001").status == "dispatched" and not _events(root, "dispatch_timeout", "T-0001")
+    assert not any(a[:2] == ("task", "set") for _, a in calls), calls
+    _backdate(root, "T-0001", "dispatched", 45)
+    res = Watcher(root, quiet=True).tick()                                                  # auto_decide off: held
+    assert Store(root).get("T-0001").status == "dispatched" and not res["timed_out"] and not _events(root, "dispatch_timeout", "T-0001")
+
+
+def test_dispatched_with_a_launch_event_is_left_to_the_launcher(world, monkeypatch):
+    """DoD 3: a dispatched task with a launch event (pid recorded) older than the limit -> still dispatched, no
+    event: the launcher owns the in_progress transition, and a dead launched session is T-0063's business."""
+    root, _, _ = world
+    _dispatched(root)
+    _launched(root)
+    _backdate(root, "T-0001", "dispatched", 45)
+    calls = _spy_scr(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and not res["timed_out"], res
+    assert Store(root).get("T-0001").status == "dispatched" and not _events(root, "dispatch_timeout", "T-0001")
+    assert not any(a[:2] == ("task", "set") for _, a in calls), calls
+
+
+def test_dispatch_timeout_frees_the_slot_for_the_next_ready_task(world, monkeypatch):
+    """DoD 4: cap 1, the timed-out task plus one ready task -> on the same tick the ready task is dispatched
+    (and launched: start_claude is mocked), after the timeout; the timed-out task is ready, not dispatched."""
+    root, _, _ = world
+    _set_limit(root, "concurrency", 1)
+    _dispatched(root)
+    _backdate(root, "T-0001", "dispatched", 45)
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    assert "(running: 1, cap 1)" in scr(root, "dispatch", "--dry-run").stdout
+    launches = _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert res["ok"] and res["timed_out"][0]["task"] == "T-0001", res
+    assert Store(root).get("T-0001").status == "ready"
+    assert Store(root).get("T-0002").status == "in_progress" and len(launches) == 1
+    assert [e["to"] for e in _state_events(root, "T-0002")][-2:] == ["dispatched", "in_progress"]
+    i_out = next(i for i, (_, a) in enumerate(calls) if a[:2] == ("task", "set") and a[2:4] == ("T-0001", "ready"))
+    i_disp = next(i for i, (_, a) in enumerate(calls) if a[0] == "dispatch")
+    assert i_out < i_disp, calls
+    assert len(_events(root, "dispatch_timeout", "T-0001")) == 1
+
+
+def test_dispatch_timeout_key_is_read_and_mirrored():
+    src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
+    assert "dispatch_timeout_minutes" in src and "dispatch_timeout" in src
+    limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    assert float(limits["dispatch_timeout_minutes"]) == DISPATCH_TIMEOUT_MINUTES == 30

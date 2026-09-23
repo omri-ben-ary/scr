@@ -26,6 +26,10 @@ Per tick:
                    in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours; the
                    escalated task no longer counts against the cap, so auto-dispatch below fills the slot
                    on the same tick
+  dispatched    -> ready after dispatch_timeout_minutes with no `launch` event (auto-decide; T-0122): a launch
+                   that failed after `scr dispatch` never holds a slot; one dispatch_timeout event, and the slot
+                   goes to the next ready task on the same tick (a dispatched task WITH a launch event is the
+                   launcher's and is left alone)
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
@@ -58,6 +62,7 @@ DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 # ready task on the same tick (T-0092; 2026-09-19..21 T-0050 and T-0061 held both slots for 35 h).
 SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}
 REVIEW_STALE_HOURS, HELP_STALE_HOURS = 2.0, 3.0      # limits.yaml: review_stale_hours / help_stale_hours
+DISPATCH_TIMEOUT_MINUTES = 30                        # limits.yaml: dispatch_timeout_minutes (T-0122)
 # A HELP line the scriber cannot proceed past: plain `HELP:` or `HELP[blocks: …]:`. `HELP[proceeding: …]:`
 # (T-0068) is a question asked while working, never a block.
 _HELP_BLOCKING = re.compile(r"^\s*(-\s*)?HELP(\[blocks:[^\]]*\])?:")
@@ -95,6 +100,30 @@ def submitted_since(events: list[dict], tid: str) -> datetime | None:
         if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == "submitted":
             since = _event_ts(e) or since
     return since
+
+
+def dispatch_stale(events: list[dict], tid: str, minutes: float, now: datetime) -> dict | None:
+    """{since, age_min} when the task's CURRENT dispatch — its newest `dispatched` state event — is older than
+    `minutes` and no `launch` system event follows it in the log (T-0122). The launcher (scr/launch.py)
+    records `launch` right after it moves the task to in_progress, so a `dispatched` task with a later
+    `launch` event is the launcher's and one without has no session: the launch failed after `scr dispatch`
+    (claude not on PATH, a spawn failure, a watcher killed between the two). Only the newest dispatch counts:
+    a redispatched task's earlier run, launch event and all, is history. An undatable dispatch -> None
+    (never early)."""
+    since, launched = None, False
+    for e in events:
+        if e.get("task") != tid:
+            continue
+        if e.get("kind") == "state" and e.get("to") == "dispatched":
+            since, launched = _event_ts(e), False
+        elif e.get("kind") == "system" and e.get("name") == "launch":
+            launched = True
+    if since is None or launched:
+        return None
+    age_min = (now - since).total_seconds() / 60
+    if age_min <= minutes:
+        return None
+    return {"since": since, "age_min": round(age_min, 1)}
 
 
 def submitted_stale(status: str, review_md: str, since: datetime | None, hours: float, now: datetime) -> dict | None:
@@ -173,6 +202,7 @@ class Watcher:
         self.needs: list[str] = []
         self.rows: list[dict] = []
         self.escalated: list[dict] = []            # the stuck tasks this tick moved to `escalated` (T-0092)
+        self.timed_out: list[dict] = []            # the dispatches this tick moved back to `ready` (T-0122)
         self.events: list[dict] | None = None      # events.jsonl, read once per tick
 
     # ---- helpers ------------------------------------------------------------------
@@ -293,7 +323,7 @@ class Watcher:
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
-        self.needs, self.rows, self.escalated, self.events = [], [], [], None
+        self.needs, self.rows, self.escalated, self.timed_out, self.events = [], [], [], [], None
         if (self.root / ".scr" / "paused").exists():
             self.log("paused (resume from the UI)")
             return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
@@ -449,6 +479,10 @@ class Watcher:
         # Order of the slot blocks (T-0092): T-0091's Decision application above, then T-0075's review relaunch
         # (once it lands: relaunch first, escalate after its cap), then this escalation, then auto-dispatch, which
         # reloads the records and so fills the slot a stuck task freed on the SAME tick.
+        # A dispatch the launcher never picked up (T-0122) goes back to `ready` first: its slot is then free for
+        # the auto-dispatch below, which may hand it to the next ready task or to this one again.
+        if self.auto_decide and ok and self.dispatch_checks(now, tasks):
+            tasks = self.store.load_all()
         if self.auto_decide and ok and self.escalation_checks(now, tasks):
             tasks = self.store.load_all()
             review = [t for t in tasks.values() if t.status == "submitted"]
@@ -503,7 +537,46 @@ class Watcher:
 
         self.save_flags()
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
-        return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated, "needs": self.needs}
+        return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
+                "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- a failed dispatch leaves the slot (T-0122) ---------------------------------------------------
+    def dispatch_checks(self, now: datetime, tasks: dict) -> int:
+        """`dispatched` -> `ready` for every task whose dispatch is older than dispatch_timeout_minutes with no
+        `launch` event after it (`dispatch_stale`, a pure function of the log and `now`): the launcher never
+        got to it, nothing will ever move it to in_progress, and `dispatched` is a slot status — until this
+        check it held its slot forever (T-0092 review, item 2). The transition is lifecycle's sanctioned
+        `dispatched -> ready` (dispatch_failed, redispatch), made as steward:<id>, then ONE `dispatch_timeout`
+        system event whose note says how long it waited, the limit, and that the redispatch is automatic.
+        Once per episode by construction: the task is no longer `dispatched`, and a redispatch writes a new
+        `dispatched` event that starts a new clock — so a launch that keeps failing cycles
+        ready -> dispatched -> ready at most once per limit, each round leaving its event in the journal.
+        Auto-dispatch runs after this on the same tick and may pick the task again or the next ready one.
+        A `dispatched` task WITH a launch event is the launcher's (it owns the in_progress transition) and is
+        never touched here; a dead launched session is the dead check's business once it is in_progress
+        (T-0063). Nothing is escalated: a failed dispatch needs no one. Returns how many were moved."""
+        minutes = float(self.limits.get("dispatch_timeout_minutes", DISPATCH_TIMEOUT_MINUTES))
+        events = self.read_events()
+        n = 0
+        for t in tasks.values():
+            if t.status != "dispatched":
+                continue
+            row = dispatch_stale(events, t.id, minutes, now)
+            if not row:
+                continue
+            note = (f"waited {row['age_min']} min in dispatched (dispatch_timeout_minutes {minutes:g}); "
+                    "no launch event; redispatch is automatic")
+            if self.scr(f"steward:{t.id}", "task", "set", t.id, "ready", "--note", f"dispatch timed out: {note}", "--quiet") is None:
+                self.needs.append(f"{t.id} dispatch timed out ({note}) but could not be set ready — see reports/steward_watch.log")
+                continue
+            self.scr(f"steward:{t.id}", "event", "system", "--name", "dispatch_timeout", "--task", t.id, "--note", note, "--quiet")
+            self.log(f"{t.id} dispatch timed out -> ready ({note})")
+            self.timed_out.append({"task": t.id, "since": row["since"].isoformat(), "age_min": row["age_min"]})
+            for r in self.rows:
+                if r["task"] == t.id:
+                    r["flags"] = (r["flags"] + " DISPATCH-TIMEOUT").strip()
+            n += 1
+        return n
 
     # ---- a stuck task leaves the slot (T-0092) --------------------------------------------------------
     def escalation_checks(self, now: datetime, tasks: dict) -> int:
