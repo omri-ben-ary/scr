@@ -1364,3 +1364,63 @@ def test_run_kill_reports_a_refused_taskkill(monkeypatch):
     for rc, want in ((0, True), (128, False)):
         monkeypatch.setattr(run_mod, "subprocess", _Shim(subprocess, run=lambda *a, rc=rc, **k: R(rc)))
         assert run_mod.kill(99999) is want
+
+
+# ---- T-0153: the watcher routes by ops.is_scriptorium_task (repo identity), not the `workload:` string --------
+# The hand path (T-0119, land_any) and the watcher's land step, review launch and status flag share one decider.
+def _rename_workload(root: Path, tid: str = "T-0007") -> None:
+    """Register the checkout a second time, as `tooling` (`repo: .`), and point the task's record at that key."""
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["tooling"] = dict(wl["scriptorium"])
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    t = Store(root).get(tid)
+    t.rec["workload"] = "tooling"; t.save()
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] second key for the checkout")
+
+
+def test_watch_land_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, monkeypatch):
+    """An accepted worktree task whose `workload:` is `tooling` (the checkout under another key) lands through
+    land_scriptorium on the tick: landed event, a `[land]` commit on the trunk, and the QI land() (push/PR)
+    is never called."""
+    import scr.ops as ops
+    import scr.watch as watch
+    root, origin, wt = _land_world(tmp_path, monkeypatch)
+    _rename_workload(root)
+    store = Store(root)
+    assert ops.is_scriptorium_task(root, store, store.get("T-0007"))
+    calls: list[str] = []
+    monkeypatch.setattr(watch, "land", lambda root, tid, **kw: calls.append(tid) or {"ok": False, "url": None, "out": ["QI land called"]})
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    origin_before = sgit(origin, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and not calls, (calls, res["needs"])
+    assert Store(root).get("T-0007").status == "merged", res["needs"]
+    ev = _events(root, "landed", "T-0007")
+    assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"], ev
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok"
+    assert any(s.startswith("[land] T-0007") for s in sgit(root, "log", "--format=%s", "main").splitlines())
+    assert sgit(origin, "rev-parse", "main") == origin_before and sgit(origin, "branch", "--list", "task/T-0007") == ""
+
+
+def test_watch_review_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, monkeypatch):
+    """A submitted task under the renamed key gets the tooling review, not the Lean review brief; the same
+    rule flags a worktree-less task under that key `tooling` rather than `no-worktree`."""
+    import scr.watch as watch
+    from scr.watch import Watcher
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    _rename_workload(root)
+    t = Store(root).get("T-0007")
+    t.rec["status"] = "submitted"; t.save()                     # accepted -> submitted is no transition: set the record
+    tooling: list[str] = []
+    lean: list[tuple] = []
+    monkeypatch.setattr(Watcher, "start_tooling_review", lambda self, t: tooling.append(t.id))
+    monkeypatch.setattr(watch, "start_claude", lambda *a, **kw: lean.append(a))
+    Watcher(root, quiet=True, auto_review=True).tick()
+    assert tooling == ["T-0007"] and not lean, (tooling, lean)
+    # the status flag: a worktree-less task under `tooling` is a hotfix in the checkout
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0010", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0010", st)
+    _rename_workload(root, "T-0010")
+    res = Watcher(root, quiet=True).tick()
+    assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
