@@ -198,11 +198,12 @@ def pid_alive(pid: int | None) -> bool:
 
 
 def kill(pid: int) -> bool:
+    """Stop a process and, on Windows, its children (`taskkill /T /F`). True when the stop was made; False
+    when taskkill refused it (no such pid, access denied) or raised (T-0124: the escalation note says so)."""
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-        else:
-            os.kill(pid, 9)
+            return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True).returncode == 0
+        os.kill(pid, 9)
         return True
     except Exception:
         return False

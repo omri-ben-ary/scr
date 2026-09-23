@@ -25,7 +25,8 @@ Per tick:
                    escalated, never held — submitted > review_stale_hours with no Decision written, or
                    in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours; the
                    escalated task no longer counts against the cap, so auto-dispatch below fills the slot
-                   on the same tick
+                   on the same tick. A running task's launched session is checkpointed, then stopped
+                   (T-0124), so the refill never makes cap + 1 sessions
   dispatched    -> ready after dispatch_timeout_minutes with no `launch` event (auto-decide; T-0122): a launch
                    that failed after `scr dispatch` never holds a slot; one dispatch_timeout event, and the slot
                    goes to the next ready task on the same tick (a dispatched task WITH a launch event is the
@@ -48,7 +49,7 @@ from .events import EventLog
 from .gitops import Git
 from .journal import journal
 from .ops import LOG_PATHS, checkpoint, land, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
-from .run import pid_alive, scr_cmd, start_claude
+from .run import kill, pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
 
@@ -593,8 +594,9 @@ class Watcher:
         `waiting` is T-0069's transition and is not made here). Returns how many tasks were escalated. One
         escalation per episode: the persisted flag `slot_freed:<id>:<since>` names the episode (the submission
         time, the HELP line's first sighting), and only SLOT_STATUSES are looked at, so a task already
-        `escalated` never gets a second event. Nothing is stopped or deleted: the worktree, the branch and a
-        still-running session stay, and the note says where the work is."""
+        `escalated` never gets a second event. Nothing is deleted: the worktree and the branch stay, and the note
+        says where the work is; an in_progress/checkpoint task's launched session is stopped by `_escalate`
+        after a checkpoint commit (T-0124)."""
         review_h = float(self.limits.get("review_stale_hours", REVIEW_STALE_HOURS))
         help_h = float(self.limits.get("help_stale_hours", HELP_STALE_HOURS))
         self.events = None                                     # the help events raised earlier this tick date the lines
@@ -629,7 +631,7 @@ class Watcher:
                 sess = self.session_of(t)
                 transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
                 reason = (f"HELP line unanswered for {row['age_h']} h (log.md:{row['line']}: {row['text'][:160]}; "
-                          f"help_stale_hours {help_h:g})" + (f"; its session pid {sess['pid']} is left running" if sess else ""))
+                          f"help_stale_hours {help_h:g})")
                 action = (f"answer log.md:{row['line']} in the record as [omri] and `scr task set {t.id} returned` + `ready` so it is "
                           "redispatched with the answer, or decide in the gate card")
             else:
@@ -640,13 +642,22 @@ class Watcher:
 
     def _escalate(self, t, since: datetime, reason: str, action: str, transcripts: list[str]) -> bool:
         """submitted / in_progress / checkpoint -> escalated as steward:<id>, then ONE `slot_freed` event whose note
-        is the needs-you card: the one action for Omri, the reason, where the work is, the transcript(s)."""
+        is the needs-you card: the one action for Omri, the reason, where the work is, the transcript(s).
+        An in_progress / checkpoint task whose launched session is alive is first checkpoint-committed HERE (not
+        by the tick's earlier pass, so nothing written since is lost), then that pid is stopped with run.kill:
+        otherwise auto-dispatch fills the freed slot and cap + 1 sessions run, and the old session's
+        `task set submitted` is refused unexplained (T-0124, T-0092 review item 3). Only the pid session_of
+        returns is ever stopped; a `submitted` task has no scriber session (its review is T-0075's). The
+        escalation never depends on the stop: a failed checkpoint or kill is said in the note, not fatal."""
         key = f"slot_freed:{t.id}:{since.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
         if key in self.flags:
             return False
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        where = f"work: {wt} on {t.rec.get('branch') or 'task/' + t.id}" + ("" if wt.exists() else " (worktree missing)")
+        branch = t.rec.get("branch") or "task/" + t.id
+        where = f"work: {wt} on {branch}" + ("" if wt.exists() else " (worktree missing)")
+        if t.status in DEAD_CHECK_STATUSES and (sess := self.session_of(t)):
+            where = f"{self.stop_session(t, sess['pid'], wt, branch)}; {where}"
         tr = ", ".join(f"tasks/{t.dir.name}/{x}" for x in transcripts) if transcripts else "no transcript recorded"
         note = (f"stuck: {reason}; escalated by the watcher — a task that cannot progress is escalated, never held "
                 f"(agents/_common.md); {where}; transcript(s): {tr}")
@@ -664,6 +675,30 @@ class Watcher:
             if r["task"] == t.id:
                 r["flags"] = (r["flags"] + " ESCALATED").strip()
         return True
+
+    def stop_session(self, t, pid: int, wt: Path, branch: str) -> str:
+        """Checkpoint-commit the worktree, then stop the launched session `pid` (T-0124). Returns the clause for
+        the escalation note; never raises."""
+        if not pid_alive(pid):
+            return f"session pid {pid} was already gone"
+        sha = None
+        try:
+            c = checkpoint(self.root, t.id, push=self.push) if wt.exists() else None
+            sha = (c.head if c else None) or (Git(wt).head(short=True) if wt.exists() else None)
+            ckpt = f"checkpoint {sha}" if sha else "checkpoint (no commit: no worktree)"
+        except Exception as e:  # noqa: BLE001 — the uncommitted files stay in the worktree; the stop still happens
+            self.log(f"{t.id} checkpoint before stopping pid {pid} failed: {e}")
+            ckpt = f"a FAILED checkpoint ({str(e)[-120:]}; uncommitted files stay in the worktree)"
+        try:
+            stopped = kill(pid)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} stopping session pid {pid} raised: {e}")
+            stopped = False
+        if not stopped:
+            self.log(f"{t.id} stopping session pid {pid} FAILED")
+            return f"stopping session pid {pid} FAILED after {ckpt}: it may still be running, stop it by hand; the work is on {branch}"
+        self.log(f"{t.id} session pid {pid} stopped after {ckpt}")
+        return f"session pid {pid} stopped after {ckpt}; the work is on {branch}"
 
     def apply_decision(self, t, decided: list[dict]) -> bool:
         """A `submitted` task whose review.md states a verdict: apply it as steward:<id> (T-0091). True when

@@ -1117,3 +1117,139 @@ def test_dispatch_timeout_key_is_read_and_mirrored():
     assert "dispatch_timeout_minutes" in src and "dispatch_timeout" in src
     limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
     assert float(limits["dispatch_timeout_minutes"]) == DISPATCH_TIMEOUT_MINUTES == 30
+
+
+# ---- T-0124: escalating a running task stops its session ---------------------------------------------------
+# `_escalate` left the launched scriber running (T-0092 review, item 3): auto-dispatch refilled the slot on the
+# same tick, so cap + 1 claude sessions ran, and the old one's `task set submitted` was later refused unexplained.
+# Now an alive session_of pid is checkpoint-committed, then stopped with run.kill; no real process is touched:
+# pid_alive and kill are replaced in scr.watch and every call recorded.
+from scr.gitops import Git  # noqa: E402
+from scr.ops import task_worktree, workload_for  # noqa: E402
+
+
+def _stuck_running(root: Path, tid: str = "T-0001", pid: int = 4242) -> Path:
+    """An in_progress task with a worktree, a launch event (pid recorded) and a blocking HELP line 4 h old."""
+    _dispatched(root, tid)
+    spawn(root, [tid], lake=False)
+    scr(root, "--quiet", "--actor", f"steward:{tid}", "task", "set", tid, "in_progress")
+    _launched(root, tid, pid)
+    t = Store(root).get(tid)
+    log = t.dir / "log.md"
+    log.write_text(log.read_text(encoding="utf-8") + "- HELP[blocks: Phase C]: which lemma closes the goal?\n", encoding="utf-8")
+    old = time.time() - 4 * 3600
+    os.utime(log, (old, old))
+    return task_worktree(workload_for(root, Store(root), t), t)
+
+
+def _mock_session(monkeypatch, alive, kill_result=True, wt: Path | None = None) -> list[tuple]:
+    """Replace pid_alive / kill / checkpoint in scr.watch; return the ordered calls. A live pid_alive also
+    writes to the worktree, as a running scriber would, so a checkpoint made after it has something to commit."""
+    import scr.watch as watch_mod
+    calls: list[tuple] = []
+    real_ckpt = watch_mod.checkpoint
+
+    def fake_alive(pid):
+        calls.append(("alive", pid))
+        if alive and wt is not None:
+            (wt / "QuantumInsertion" / "A.lean").write_text(f"theorem a : True := trivial -- {len(calls)}\n", encoding="utf-8")
+        return alive
+
+    def fake_kill(pid):
+        calls.append(("kill", pid))
+        if isinstance(kill_result, Exception):
+            raise kill_result
+        return kill_result
+
+    def spy_ckpt(root, tid, **kw):
+        c = real_ckpt(root, tid, **kw)
+        calls.append(("checkpoint", tid, c.head if c else None))
+        return c
+
+    monkeypatch.setattr(watch_mod, "pid_alive", fake_alive)
+    monkeypatch.setattr(watch_mod, "kill", fake_kill)
+    monkeypatch.setattr(watch_mod, "checkpoint", spy_ckpt)
+    return calls
+
+
+def test_escalating_a_running_task_checkpoints_then_stops_its_session(world, monkeypatch):
+    """DoD 2: pid recorded and alive, a stale blocking HELP line -> after one tick() escalated; the checkpoint
+    made inside _escalate (it commits what the session wrote after the tick's own pass) precedes the one kill,
+    of that pid, and the slot_freed note says the session was stopped after that checkpoint, on the branch."""
+    root, _, _ = world
+    wt = _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    kills = [c for c in calls if c[0] == "kill"]
+    assert kills == [("kill", 4242)], calls
+    i_kill = calls.index(("kill", 4242))
+    ckpts = [(i, c) for i, c in enumerate(calls) if c[0] == "checkpoint"]
+    assert len(ckpts) == 2 and ckpts[-1][0] < i_kill, calls                  # the tick's pass, then _escalate's own
+    sha = ckpts[-1][1][2]
+    assert sha and sha != ckpts[0][1][2] and Git(wt).head().startswith(sha), calls   # a new commit: the work after the pass
+    assert not Git(wt).dirty()
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "session pid 4242 stopped after checkpoint " + sha in ev[0]["note"], ev
+    assert "the work is on task/T-0001" in ev[0]["note"] and "left running" not in ev[0]["note"]
+    last = _state_events(root, "T-0001")[-1]
+    assert last["to"] == "escalated" and "stopped after checkpoint" in last["note"], last
+    # one escalation per episode: a second tick neither escalates nor kills again
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)] and len(_events(root, "slot_freed", "T-0001")) == 1
+
+
+def test_escalating_a_task_whose_session_is_gone_kills_nothing(world, monkeypatch):
+    """DoD 3: the same task with pid_alive False -> no kill, the note says the session was already gone. (On a
+    whole tick the dead check returns such a task first, so the escalation pass is driven directly: the pid
+    can die between the two.)"""
+    root, _, _ = world
+    _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=False)
+    w = Watcher(root, quiet=True, auto_decide=True)
+    assert w.escalation_checks(datetime.now(timezone.utc), Store(root).load_all()) == 1
+    assert Store(root).get("T-0001").status == "escalated"
+    assert not [c for c in calls if c[0] in {"kill", "checkpoint"}], calls
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "session pid 4242 was already gone" in ev[0]["note"], ev
+
+
+def test_escalating_a_submitted_task_never_kills(world, monkeypatch):
+    """DoD 4: a stuck `submitted` task has no scriber session (its review session is T-0075's): kill is never
+    called, even with a launch event on record and every pid alive."""
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _launched(root)
+    calls = _mock_session(monkeypatch, alive=True)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert not [c for c in calls if c[0] == "kill"], calls
+    assert "stopped" not in _events(root, "slot_freed", "T-0001")[0]["note"]
+
+
+@pytest.mark.parametrize("result", [False, OSError("taskkill missing")])
+def test_escalation_does_not_depend_on_the_kill(world, monkeypatch, result):
+    """DoD 5: kill returning False or raising -> the task is still escalated and the note says the stop failed,
+    naming the pid."""
+    root, _, _ = world
+    wt = _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=True, kill_result=result, wt=wt)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)]
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "stopping session pid 4242 FAILED" in ev[0]["note"] and "may still be running" in ev[0]["note"], ev
+
+
+@pytest.mark.skipif(os.name != "nt", reason="taskkill is the Windows path")
+def test_run_kill_reports_a_refused_taskkill(monkeypatch):
+    """run.kill's return value is what the note trusts: a non-zero taskkill exit (no such pid) is False."""
+    import scr.run as run_mod
+
+    class R:
+        def __init__(self, rc):
+            self.returncode = rc
+    for rc, want in ((0, True), (128, False)):
+        monkeypatch.setattr(run_mod, "subprocess", _Shim(subprocess, run=lambda *a, rc=rc, **k: R(rc)))
+        assert run_mod.kill(99999) is want
