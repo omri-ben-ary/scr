@@ -8,7 +8,9 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -61,6 +63,9 @@ def cmd_task_new(args):
     root, store, log = _ctx(args)
     tasks = store.load_all()
     tid = args.id or store.next_id()
+    # `--max-attempts` unset -> limits.yaml default_max_attempts (3 when the key is absent); T-0125
+    if args.max_attempts is None:
+        args.max_attempts = int(store.config("limits").get("default_max_attempts", 3))
     rec = {
         "id": tid, "title": args.title, "queue": args.queue, "kind": args.kind, "status": "proposed",
         "workload": args.workload, "created": now_iso(),
@@ -214,6 +219,20 @@ def cmd_score(args):
         _out([{"task": r["task"], "score": r["score"], **{k: round(v, 3) for k, v in r["terms"].items()}} for r in rows], args.json)
 
 
+def statement_window_open(window, now: datetime | None = None) -> bool:
+    """True when `now` (Asia/Jerusalem; local time when tzdata is missing) falls in limits.yaml
+    statement_window, a "HH:MM-HH:MM" string; an absent or empty window is always open (T-0125)."""
+    if not window:
+        return True
+    lo, hi = (s.strip() for s in str(window).split("-", 1))
+    try:
+        now = now or datetime.now(ZoneInfo("Asia/Jerusalem"))
+    except ZoneInfoNotFoundError:
+        now = datetime.now()
+    t = now.strftime("%H:%M")
+    return lo <= t <= hi if lo <= hi else t >= lo or t <= hi     # "22:00-06:00" wraps midnight
+
+
 def cmd_dispatch(args):
     root, store, log = _ctx(args)
     limits = store.config("limits")
@@ -223,7 +242,10 @@ def cmd_dispatch(args):
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")
     ranked = [r["task"] for r in rows]
-    if not args.allow_statements:
+    # may_touch_statements tasks need --allow-statements and the limits.yaml statement_window to be open (T-0125)
+    if not args.allow_statements or not statement_window_open(limits.get("statement_window")):
+        if args.allow_statements:
+            print(f"statement_window {limits.get('statement_window')} is closed now: may_touch_statements tasks held back")
         ranked = [t for t in ranked if not (g.tasks[t].rec.get("scope") or {}).get("may_touch_statements")]
     # never co-dispatch with something already running that conflicts
     ranked = [t for t in ranked if all(tuple(sorted((t, r))) not in g.conflicts for r in running)]
@@ -567,7 +589,7 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--files", nargs="*"); n.add_argument("--decls", nargs="*"); n.add_argument("--may-touch-statements", action="store_true")
     n.add_argument("--blocked-by", nargs="*"); n.add_argument("--reason", help="justification for blocks edges without shared scope")
     n.add_argument("--origin"); n.add_argument("--omri-weight", type=float, default=0.0); n.add_argument("--verifiability", type=float, default=1.0)
-    n.add_argument("--risk", type=float, default=0.2); n.add_argument("--max-attempts", type=int, default=3)
+    n.add_argument("--risk", type=float, default=0.2); n.add_argument("--max-attempts", type=int, default=None, help="default: limits.yaml default_max_attempts")
     n.add_argument("--max-tokens", type=int, default=2_000_000); n.add_argument("--max-wall-hours", type=float, default=6); n.add_argument("--note")
     n.set_defaults(fn=cmd_task_new)
     st = t.add_parser("set", parents=[common], help="status transition")
