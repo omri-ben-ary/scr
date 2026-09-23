@@ -37,6 +37,8 @@ Never deletes anything; never edits Lean; never answers a HELP: line itself.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,7 +47,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import checkpoint_commit, in_scope, land, land_scriptorium, retire, self_workload, task_worktree, workload, workload_for
+from .ops import LOG_PATHS, checkpoint, land, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
 from .run import pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -352,7 +354,6 @@ class Watcher:
             newest = max([x for x in (self.newest_change(wt), datetime.fromtimestamp(log_md.stat().st_mtime, tz=timezone.utc) if log_md.exists() else None) if x], default=None)
             idle = int((now - newest).total_seconds() // 60) if newest else -1
             flags: list[str] = []
-            scope = (t.rec.get("scope") or {}).get("files") or []
 
             # A spawned worktree is checkpointed whatever its workload: until T-0078 (2026-09-21) a scriptorium
             # task was assumed to live in the checkout ("tooling") and its worktree was never committed, so
@@ -361,14 +362,18 @@ class Watcher:
             if wt.exists():
                 if ok:
                     try:
-                        c = checkpoint_commit(self.root, t.id, push=self.push)
-                        if c:
-                            flags.append(f"ckpt:{c}")
+                        c = checkpoint(self.root, t.id, push=self.push)
+                        if c and c.head:
+                            flags.append(f"ckpt:{c.head}")
+                        # T-0079: the checkpoint put these in a [checkpoint-drift] commit and raised the ONE
+                        # scope_drift event for them; the drift block below must not raise a second one
+                        for p in (c.drift if c else []):
+                            self.flag(f"drift:{t.id}:{p}")
                     except Exception as e:  # noqa: BLE001 — a checkpoint failure must not stop the tick
                         self.log(f"{t.id} checkpoint commit failed: {e}")
                         self.needs.append(f"{t.id} checkpoint commit failed: {str(e)[-200:]}")
                 g = Git(wt)
-                changed = [p for p in g.dirty() if not p.startswith((".loopy/", "missions/LOOPY/runs/"))]
+                changed = [p for p in g.dirty() if not p.startswith(LOG_PATHS)]
                 # After a checkpoint commit the tree is clean, so drift is the branch's OWN commits: its diff to
                 # the merge-base with the branch it was spawned from, origin/<main> (ops.spawn uses the same
                 # rule). Never the local main: that can sit far behind origin and then every file merged since
@@ -382,7 +387,7 @@ class Watcher:
                         base = f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
                     r = g.run("diff", "--name-only", f"{base}...HEAD")
                     changed = [l.strip() for l in r.out.splitlines() if l.strip()] if r.ok else []
-                drift = [p for p in changed if scope and not in_scope(p, scope)]
+                drift = scope_drift(changed, t, repo=wt)        # the checkpoint's rule, verbatim (T-0079)
                 new = [p for p in drift if self.flag(f"drift:{t.id}:{p}")]
                 if new:
                     # ONE event per task per tick, listing the files (the UI shows one card per task and kind)
@@ -709,10 +714,14 @@ class Watcher:
             self.log(f"{t.id} tooling task (no worktree) -> merged")
             return True
         g, mg = Git(wt), Git(self.root)
-        tip = g.head() if not g.dirty() else None
+        # The retry key is the branch tip PLUS the record's scope (T-0079): a landing refused for out-of-scope
+        # paths is retried when the Steward widens scope.files / scope.mission, not only on a new commit.
+        sc = t.rec.get("scope") or {}
+        scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
+        tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
         if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
-            self.needs.append(f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit retries) or merge it into {wl.main} by hand")
+            self.needs.append(f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand")
             self.unflag(f"land:{t.id}")
             return False
         self.log(f"{t.id} auto-land (scriptorium worktree): commit, merge {wl.main} in, tests, merge into {wl.main}")
@@ -725,9 +734,10 @@ class Watcher:
         if not res["ok"]:
             why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
             self.needs.append(f"{t.id} landing failed ({res['reason']}) — {why[:200]}; see reports/steward_watch.log")
-            for k in failed - {f"land_failed:{t.id}:{res.get('tip') or 'unknown'}"}:   # only the current tip is remembered
+            key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
+            for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
                 self.unflag(k)
-            if self.flag(f"land_failed:{t.id}:{res.get('tip') or 'unknown'}"):
+            if self.flag(key):
                 self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
             self.unflag(f"land:{t.id}")
             return False

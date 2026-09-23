@@ -81,6 +81,140 @@ def in_scope(path: str, scope: list[str]) -> bool:
     return False
 
 
+# ---- the scope rule (T-0079) ---------------------------------------------------------------
+# Run-log paths every task may write: the watcher excluded exactly these two from drift since 2026-09-16.
+LOG_PATHS = (".loopy/", "missions/LOOPY/runs/")
+MISSIONS_DIR = "missions"
+
+
+def scope_prefixes(t: Task) -> list[str]:
+    """Every prefix a task may write under: `scope.files`, `missions/<mission>/` for a mission the RECORD
+    names (`scope.mission`, a name or a list; `missions/QI26/` accepted), and LOG_PATHS — but LOG_PATHS only
+    when the task declares some scope at all (a record without one cannot drift and needs no allowlist)."""
+    sc = t.rec.get("scope") or {}
+    out = [str(f).replace("\\", "/").strip().rstrip("/") for f in (sc.get("files") or []) if str(f).strip()]
+    val = sc.get("mission")
+    for m in (val if isinstance(val, (list, tuple)) else ([val] if val else [])):
+        m = str(m).replace("\\", "/").strip().strip("/")
+        if m.startswith(MISSIONS_DIR + "/"):
+            m = m[len(MISSIONS_DIR) + 1:]
+        m = m.split("/", 1)[0]
+        if m and f"{MISSIONS_DIR}/{m}" not in out:
+            out.append(f"{MISSIONS_DIR}/{m}")
+    if out:
+        out += [lp.rstrip("/") for lp in LOG_PATHS if lp.rstrip("/") not in out]
+    return out
+
+
+def git_ignored(repo: Path | None, paths: list[str]) -> set[str]:
+    """The subset of `paths` the repo's git ignores (`git check-ignore --stdin -z`, one call). A tracked file
+    is never reported, so a real change to a tracked file under an ignore pattern still counts. Empty when
+    there is no repo or git fails."""
+    paths = [p for p in paths if p]
+    if not repo or not paths or not Path(repo).exists():
+        return set()
+    try:
+        r = subprocess.run(["git", "check-ignore", "--stdin", "-z"], cwd=str(repo), input="\0".join(paths) + "\0",
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if r.returncode not in (0, 1):     # 0 = some ignored, 1 = none; anything else is an error
+        return set()
+    return {l.replace("\\", "/") for l in r.stdout.split("\0") if l.strip()}
+
+
+def scope_drift(paths: list[str], t: Task, repo: Path | None = None) -> list[str]:
+    """The paths a task may NOT touch, in input order, deduplicated: not under `scope.files`, not under its
+    own mission folder, not a run-log path, and not ignored by the workload's git. A task that declares no
+    scope never drifts (the watcher's old `scope and not in_scope(...)` guard, kept). ONE rule for the
+    checkpoint, the watcher's drift block and both `land`s, so they cannot disagree about a file.
+
+    T-0082 makes `scr/scope.py` THE allowlist (it also infers the mission from the spec's Scope and knows the
+    transient handshake files); its `drift(paths, task, repo=)` has this signature on purpose. While that
+    module is not on the trunk the rule above stands in; the day it lands, every consumer here switches to
+    it at once and this fallback is dead code to delete."""
+    try:
+        from . import scope as _scope  # type: ignore[attr-defined]  # T-0082's module, when it is on the trunk
+    except ImportError:
+        _scope = None
+    if _scope is not None:
+        return list(_scope.drift(paths, t, repo=repo))
+    prefixes = scope_prefixes(t)
+    if not prefixes:
+        return []
+    cands: list[str] = []
+    for raw in paths:
+        p = str(raw).replace("\\", "/").strip().rstrip("/")
+        if not p or p in cands or in_scope(p, prefixes):
+            continue
+        cands.append(p)
+    if not cands:
+        return []
+    ign = git_ignored(repo, cands)
+    return [p for p in cands if p not in ign]
+
+
+def branch_base(root: Path, wl: Workload, g: Git) -> str:
+    """The ref a task branch is measured against — what `spawn` based it on: the local trunk for the
+    scriptorium's own workload (spawned from the checkout's HEAD, T-0061), `origin/<main>` otherwise
+    (never the local main, which can sit far behind origin: 465 false drift files on T-0029, 2026-09-16)."""
+    if wl.repo == root.resolve():
+        return wl.main
+    return f"origin/{wl.main}" if g.ok("rev-parse", "--verify", "--quiet", f"origin/{wl.main}") else wl.main
+
+
+def branch_changes(g: Git, base: str) -> list[str]:
+    """Paths the branch's own commits touch: `git diff --name-only <base>...HEAD` (merge-base), NUL-separated
+    so a quoted non-ASCII name comes back verbatim."""
+    r = g.run("diff", "--name-only", "-z", f"{base}...HEAD")
+    return [l.replace("\\", "/") for l in r.out.split("\0") if l.strip()] if r.ok else []
+
+
+def branch_drift(root: Path, wl: Workload, g: Git, t: Task) -> list[str]:
+    """The out-of-scope paths the task branch's commits carry (a `[checkpoint-drift]` commit, or anything
+    else that got there). `land` refuses to merge while this is non-empty."""
+    return scope_drift(branch_changes(g, branch_base(root, wl, g)), t, repo=g.cwd)
+
+
+@dataclass
+class Checkpoint:
+    """What one scoped commit pass produced: the `[checkpoint]` commit of the in-scope paths (`sha`), the
+    `[checkpoint-drift]` commit of the out-of-scope ones (`drift_sha`) and those paths (`drift`)."""
+    sha: str | None
+    drift_sha: str | None
+    drift: list[str]
+
+    @property
+    def head(self) -> str | None:
+        """The branch tip after the pass: the drift commit when there was one, else the checkpoint."""
+        return self.drift_sha or self.sha
+
+
+DRIFT_MESSAGE = ("[checkpoint-drift] {tid} {stamp}\n\n{n} path(s) outside the task's scope, found in its worktree and committed apart so "
+                 "nothing exists only there; `land` refuses task/{tid} while it carries them — widen scope.files "
+                 "(or scope.mission) in the record if the task may own them, else revert this commit.\n\n{files}\n")
+
+
+def scoped_commit(g: Git, t: Task, message: str, tid: str | None = None) -> Checkpoint:
+    """The dirty tree as at most two commits: the in-scope paths with `message` (`[checkpoint]` / the landing
+    message), then the out-of-scope paths as a `[checkpoint-drift]` commit of their own. This is the design
+    the brief offered for the conflict between the crash-safety rule (nothing may exist only in a worktree)
+    and the scope rule (a checkpoint never carries a file the task may not touch): both hold — the drift is
+    in git, in a commit of its own that `land` refuses to merge, and never in a commit that carries the
+    task's work. Noise (build.log, __pycache__, .lake, .loopy: gitops.NOISE_RE) stays uncommitted as before;
+    ignored paths never reach `dirty()`."""
+    dirty = g.dirty()
+    if not dirty:
+        return Checkpoint(None, None, [])
+    drift = scope_drift(dirty, t, repo=g.cwd)
+    keep = [p for p in dirty if p not in set(drift)]
+    sha = g.commit_paths(message, keep) if keep else None
+    dsha = None
+    if drift:
+        dsha = g.commit_paths(DRIFT_MESSAGE.format(tid=tid or t.id, stamp=now_iso(), n=len(drift), files="\n".join(drift)), drift)
+    return Checkpoint(sha, dsha, drift if dsha else [])
+
+
 # ---- spawn ---------------------------------------------------------------------------
 def _share_lake(repo: Path, wt: Path, out: list[str]) -> None:
     """.lake/packages -> junction/symlink to the main checkout; .lake/build copied (per-worktree oleans)."""
@@ -173,9 +307,15 @@ def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, w
 
 
 # ---- checkpoint commit -------------------------------------------------------------------
-def checkpoint_commit(root: Path, tid: str, push: bool = False, wl_name: str | None = None) -> str | None:
+def checkpoint(root: Path, tid: str, push: bool = False, wl_name: str | None = None) -> Checkpoint | None:
     """Commit whatever a running task's worktree holds, on its task branch. Nothing may exist only
-    in a worktree: a crashed session or a crashed git (QI23, 2026-09-07) must cost at most one tick."""
+    in a worktree: a crashed session or a crashed git (QI23, 2026-09-07) must cost at most one tick.
+    Since T-0079 the `[checkpoint]` commit stages only what the task may own (ops.scope_drift: scope.files,
+    its mission folder, the run-log paths, ignored paths excluded as before); anything else goes into a
+    separate `[checkpoint-drift]` commit on the same branch and is surfaced as ONE `scope_drift` event
+    naming the files (the watcher's drift block consumes it and does not raise a second one). T-0021 had
+    copied `missions/SCRIPTORIUM/` into its worktree to run the checker, and `git add -A` shipped the four
+    files through PR #49. None when there is no worktree, the branch is wrong, or the tree is clean."""
     store = Store(root)
     t = store.get(tid)
     wl = workload(root, store, wl_name) if wl_name else workload_for(root, store, t)
@@ -188,12 +328,24 @@ def checkpoint_commit(root: Path, tid: str, push: bool = False, wl_name: str | N
         return None
     if not g.dirty():
         return None
-    sha = g.commit_all(f"[checkpoint] {tid} {now_iso()}\n\nAutomatic checkpoint by the Steward watcher; content unreviewed.")
-    if sha:
-        _log(root).append("system", name="checkpoint_commit", task=tid, actor=f"steward:{tid}", note=sha)
-        if push:
-            g.push(f"task/{tid}")
-    return sha
+    c = scoped_commit(g, t, f"[checkpoint] {tid} {now_iso()}\n\nAutomatic checkpoint by the Steward watcher; content unreviewed.", tid)
+    log = _log(root)
+    if c.sha:
+        log.append("system", name="checkpoint_commit", task=tid, actor=f"steward:{tid}", note=c.sha)
+    if c.drift_sha:
+        note = ", ".join(c.drift[:12]) + (f" (+{len(c.drift) - 12} more)" if len(c.drift) > 12 else "")
+        log.append("system", name="scope_drift", task=tid, actor=f"steward:{tid}",
+                   note=(note + f" — outside scope, committed apart as [checkpoint-drift] {c.drift_sha}; land refuses task/{tid} while it carries them")[:900],
+                   data={"commit": c.drift_sha, "files": c.drift[:50]})
+    if c.head and push:
+        g.push(f"task/{tid}")
+    return c
+
+
+def checkpoint_commit(root: Path, tid: str, push: bool = False, wl_name: str | None = None) -> str | None:
+    """`checkpoint`, returning only the branch tip it produced (the sha of the last commit made) or None."""
+    c = checkpoint(root, tid, push=push, wl_name=wl_name)
+    return c.head if c else None
 
 
 # ---- land --------------------------------------------------------------------------------
@@ -226,7 +378,6 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
     if br != f"task/{tid}":
         raise RepoError(f"worktree is on '{br}', expected task/{tid} — not landing from the wrong branch")
     title = t.rec.get("title", tid)
-    scope = (t.rec.get("scope") or {}).get("files") or []
     out.append(f"=== {tid} [{t.status}] on {br}")
 
     report = (t.dir / "report.md").read_text(encoding="utf-8") if (t.dir / "report.md").exists() else ""
@@ -235,15 +386,28 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
     msg = f"[{tid}] {title}\n\n{summary}\n\nScriptorium task {tid}; report: scriptorium/tasks/{t.dir.name}/report.md"
     dirty = g.dirty()
     if dirty:
-        outside = [p for p in dirty if scope and not in_scope(p, scope)]
-        out.append(f"  staging {len(dirty)} file(s)" + (f"; outside scope.files: {', '.join(outside)}" if outside else ""))
+        outside = scope_drift(dirty, t, repo=wt)
+        out.append(f"  staging {len(dirty)} file(s)" + (f"; outside scope: {', '.join(outside)} (a [checkpoint-drift] commit of their own)" if outside else ""))
         if dry_run:
             out.append("--- commit message ---\n" + msg)
-            return {"ok": True, "url": None, "out": out}
-        sha = g.commit_all(msg)
-        out.append(f"  committed {sha}")
+        else:
+            c = scoped_commit(g, t, msg, tid)
+            if c.sha:
+                out.append(f"  committed {c.sha}")
+            if c.drift_sha:
+                out.append(f"  committed {c.drift_sha} [checkpoint-drift] ({len(c.drift)} out-of-scope path(s))")
     else:
         out.append("  nothing to commit (already committed)")
+    # T-0079: a branch whose commits touch paths outside the task's scope is not pushed, gets no PR and is not
+    # merged — T-0021's four missions/SCRIPTORIUM/ files would have stopped here, named. The Steward widens
+    # scope.files / scope.mission in the record when the task may own them, or reverts the drift commit.
+    drift = branch_drift(root, wl, g, t)
+    if dry_run and dirty:
+        drift = list(dict.fromkeys(drift + scope_drift(dirty, t, repo=wt)))
+    if drift:
+        out.append(f"  REFUSED: {br} carries {len(drift)} path(s) outside {tid}'s scope — " + ", ".join(drift[:12])
+                   + (f" (+{len(drift) - 12} more)" if len(drift) > 12 else "") + "; not pushed, no PR")
+        return {"ok": False, "url": None, "out": out}
     if dry_run:
         return {"ok": True, "url": None, "out": out}
 
@@ -386,8 +550,18 @@ def land_scriptorium(root: Path, tid: str) -> dict:
     dirty = g.dirty()
     if dirty:
         summary = "\n".join([l for l in _section(report, "Result").splitlines() if l.strip() and not l.startswith(("|", "#"))][:6])
-        sha = g.commit_all(f"[{tid}] {title}\n\n{summary}\n\nScriptorium task {tid}; report: tasks/{t.dir.name}/report.md")
-        out.append(f"  committed {sha} ({len(dirty)} file(s)) on {br}")
+        c = scoped_commit(g, t, f"[{tid}] {title}\n\n{summary}\n\nScriptorium task {tid}; report: tasks/{t.dir.name}/report.md", tid)
+        if c.sha:
+            out.append(f"  committed {c.sha} ({len(dirty) - len(c.drift)} file(s)) on {br}")
+        if c.drift_sha:
+            out.append(f"  committed {c.drift_sha} [checkpoint-drift] ({len(c.drift)} out-of-scope path(s)) on {br}")
+    # 1b. T-0079: the branch must not carry paths outside the task's scope (a [checkpoint-drift] commit, or
+    # anything else): the trunk never gets them. The Steward widens scope.files / scope.mission in the record
+    # when the task may own them (the watcher retries on that), or reverts the commit (a new tip retries).
+    drift = branch_drift(root, wl, g, t)
+    if drift:
+        return fail("scope", f"{br} carries {len(drift)} path(s) outside {tid}'s scope: " + ", ".join(drift[:12])
+                    + (f" (+{len(drift) - 12} more)" if len(drift) > 12 else "") + " — widen the record's scope or revert the [checkpoint-drift] commit")
     # 2. the checkout must sit on the trunk (scr ensure-main is the way to get there)
     cur = mg.branch()
     if cur != trunk:
