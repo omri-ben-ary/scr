@@ -66,8 +66,6 @@
   .card .status { font-size: 13px; color: var(--muted); font-style: italic; }
   .out { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-top: 8px; max-height: 260px; overflow: auto; }
   .out.err { border-color: var(--danger); }
-  details.done { margin-bottom: 6px; } details.done summary { cursor: pointer; font-size: 14px; display: flex; gap: 8px; align-items: center; }
-  details.done .ts { color: var(--muted); font-size: 12px; margin-left: auto; }
   .row { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: 14px; }
   .row .id { font-family: var(--mono); color: var(--accent); cursor: pointer; }
   .row .st { font-size: 12px; color: var(--muted); }
@@ -119,13 +117,6 @@
   <section class="col" aria-label="Needs you">
     <h2>Needs you <span class="n" id="needsN">0</span></h2>
     <div id="needs"></div>
-    <h2>Add an idea to the Inbox</h2>
-    <form id="inboxForm"><label class="sr-only" for="inboxText">Idea</label>
-      <textarea id="inboxText" rows="2" placeholder="One line; Intake turns it into a task at the next run"></textarea>
-      <div class="actions" style="margin-top:6px"><button type="submit" class="small primary">Add to Inbox</button></div>
-    </form>
-    <h2>Done <span class="n" id="doneN">0</span></h2>
-    <div id="done"></div>
   </section>
 
   <section class="col" id="detail" aria-label="Workspace">
@@ -182,7 +173,7 @@ async function refresh() {
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
   $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
   $('#pauseBtn').textContent = STATE.paused ? 'Resume' : 'Pause';
-  renderNeeds(); renderDone(); renderLists(); renderTabs();
+  renderNeeds(); renderLists(); renderTabs();
 }
 
 function jobFor(key) {
@@ -206,7 +197,7 @@ function pollJobs() {
   POLL = setInterval(async () => {
     const jobs = await api('/api/jobs');
     const running = jobs.some(j => j.state === 'running');
-    if (STATE) { STATE.jobs = jobs; renderNeeds(); renderDone(); }
+    if (STATE) { STATE.jobs = jobs; renderNeeds(); }
     if (!running) { clearInterval(POLL); POLL = null; refresh(); }
   }, 2000);
 }
@@ -251,18 +242,6 @@ function renderNeeds() {
     }
     if (n.id && n.id !== '-') { c.addEventListener('click', e => { if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'A') select(n.id); }); c.addEventListener('keydown', e => { if (e.key === 'Enter') select(n.id); }); }
     box.append(c);
-  }
-}
-
-function renderDone() {
-  const box = $('#done'); box.innerHTML = '';
-  const done = ((STATE && STATE.jobs) || []).filter(j => j.state !== 'running');
-  $('#doneN').textContent = done.length;
-  if (!done.length) { box.innerHTML = '<div class="empty">Nothing yet today.</div>'; return; }
-  for (const j of done.slice(0, 40)) {
-    const d = document.createElement('details'); d.className = 'done';
-    d.innerHTML = `<summary><span class="badge ${j.state}">${j.state === 'done' ? '✓ done' : '✖ failed'}</span> <span>${esc(j.title)}</span><span class="ts">${fmtTs(j.finished || j.started)}</span></summary><div class="out${j.state === 'failed' ? ' err' : ''}">${esc(j.output || '(no output)')}</div>`;
-    box.append(d);
   }
 }
 
@@ -319,7 +298,6 @@ $('#planTasks').onclick = () => start({ kind: 'discuss', item: 'plan' }, 'discus
 $('#fixBug').onclick = () => { const sm = prompt('What is broken? (one line; the Toolsmith session opens with it)'); if (sm !== null && sm.trim()) start({ kind: 'hotfix_open', symptom: sm.trim() }, 'hotfix:new'); };
 $('#pauseBtn').onclick = () => start({ kind: STATE && STATE.paused ? 'resume' : 'pause' }, 'system:pause');
 $('#quitBtn').onclick = async () => { await start({ kind: 'quit' }, 'system:quit'); setTimeout(() => { document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; }, 1500); };
-$('#inboxForm').onsubmit = async e => { e.preventDefault(); const v = $('#inboxText').value.trim(); if (!v) return; $('#inboxText').value = ''; await start({ kind: 'inbox', text: v }, 'inbox'); };
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (e.key === 'r') refresh();

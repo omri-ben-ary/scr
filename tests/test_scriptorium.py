@@ -343,3 +343,14 @@ def test_watcher_journal_push_comes_from_config(tmp_path: Path):
     wl["scriptorium"]["push"] = False
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
     assert not Watcher(root, quiet=True).push_journal and Watcher(root, quiet=True, push=True).push_journal
+
+
+def test_ui_page_has_no_inbox_form_or_done_list():
+    """T-0086: the left panel no longer carries the 'Add an idea to the Inbox' form or the 'Done' list.
+    Reads the file scr.ui serves (UI_DIR/index.html) so a moved UI_DIR would still be checked."""
+    from scr.ui import UI_DIR
+    page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    for needle in ("inboxForm", "inboxText", 'id="done"', "doneN", "renderDone", "Add an idea to the Inbox", "details.done"):
+        assert needle not in page, needle
+    assert 'id="needs"' in page  # the rest of the panel is untouched
+    assert "planTasks" in page  # the add-task button stays
