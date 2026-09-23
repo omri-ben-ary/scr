@@ -614,6 +614,61 @@ def _log_md(t: Task, line: str) -> None:
         pass
 
 
+def is_scriptorium_task(root: Path, store: Store | None, t: Task) -> bool:
+    """True when the task's workload IS this checkout (`repo: .`): the repo identity, the same test
+    land_scriptorium makes — not the task id or the `workload:` string. A record naming an unregistered
+    workload resolves as workload_for does (the first entry)."""
+    return workload_for(root, store, t).repo == root.resolve()
+
+
+# What the operator does after a hand-path landing failure, per land_scriptorium reason (the watcher's
+# land_failed note names the same reasons).
+_LAND_NEXT = {
+    "conflict": "merge {trunk} into {br} in {wt}, resolve, commit, then `scr land {tid}` again",
+    "tests": "fix {br} in {wt} (committed or not), then `scr land {tid}` again",
+    "trunk": "`scr ensure-main` in the checkout, then `scr land {tid}` again",
+    "scope": "widen the record's scope or revert the [checkpoint-drift] commit on {br}, then `scr land {tid}` again",
+}
+
+
+def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False) -> dict:
+    """The one place that decides which landing a task gets (T-0119): a scriptorium task (is_scriptorium_task)
+    goes through land_scriptorium — commit, trunk merged in, tests, merge into the trunk, merged — exactly the
+    watcher's land step; every other workload goes through the quantum-insertion land() with the QI flags.
+    The QI flags do not apply to the scriptorium path; dry_run there reports the plan and changes nothing.
+    land_scriptorium is the post-acceptance step, so a scriptorium task must be `accepted` (land() accepts a
+    reviewed `submitted` task because the PR merge implies the review; here the Decision comes first).
+    A failure returns ok False with one closing line naming the reason and what to do next."""
+    store = Store(root)
+    t = store.get(tid)
+    if not is_scriptorium_task(root, store, t):
+        return land(root, tid, no_pr=no_pr, draft=draft, dry_run=dry_run, merge=merge)
+    if t.status == "submitted":
+        raise RepoError(f"{tid} is submitted, not accepted — write the Decision first (T-0081)")
+    if t.status != "accepted":
+        raise RepoError(f"{tid} is {t.status}, not accepted — only an accepted scriptorium task lands")
+    wl = workload_for(root, store, t)
+    wt, br, trunk = task_worktree(wl, t), f"task/{tid}", wl.main
+    if dry_run:
+        if not wt.exists():
+            raise RepoError(f"worktree missing: {wt}")
+        g, mg = Git(wt), Git(root)
+        dirty = g.dirty()
+        out = [f"=== {tid} [{t.status}] {br} -> {trunk} (scriptorium, dry run: nothing changed)",
+               f"  worktree {wt} on '{g.branch()}'; {len(dirty)} uncommitted file(s) to commit on {br}",
+               f"  checkout on '{mg.branch()}'" + ("" if mg.branch() == trunk else f" — not {trunk}: `scr ensure-main` first"),
+               f"  {br} already contained in {trunk}: record merged only" if not dirty and mg.is_ancestor(br, trunk)
+               else f"  would merge {trunk} into {br}, run `{wl.cfg.get('tests') or 'pytest tests -q'}` in the worktree, merge {br} into {trunk}"]
+        return {"ok": True, "reason": None, "out": out, "sha": None, "tip": g.head(), "url": None}
+    r = land_scriptorium(root, tid)
+    if not r["ok"]:
+        nxt = _LAND_NEXT.get(r["reason"], "see the FAILED line above, then `scr land {tid}` again").format(trunk=trunk, br=br, wt=wt, tid=tid)
+        r["out"].append(f"{tid}: NOT landed ({r['reason']}) — next: {nxt}")
+    else:
+        r["out"].append(f"  next: `scr retire {tid} --execute` quarantines the worktree (the watcher does this itself)")
+    return {**r, "url": None}
+
+
 # ---- sweep -------------------------------------------------------------------------------
 def sweep(root: Path, merge: bool = False, dry_run: bool = False, wl_name: str | None = None) -> list[dict]:
     """Every non-task worktree (missions like qi-mission-24) with uncommitted work: commit on its
@@ -725,7 +780,8 @@ def park(root: Path, tid: str, note: str, actor: str | None = None) -> list[str]
 # ---- chore helpers -------------------------------------------------------------------------
 def land_all_submitted(root: Path) -> list[str]:
     """Land + merge every submitted/accepted task, one after the other; failures are reported, not fatal.
-    A submitted task whose review.md does not support `accepted` (T-0081) is skipped with the reason."""
+    A submitted task whose review.md does not support `accepted` (T-0081) is skipped with the reason.
+    Each task is routed by land_any: a scriptorium task lands through land_scriptorium (T-0119)."""
     out: list[str] = []
     for t in sorted(Store(root).load_all().values(), key=lambda t: t.id):
         if t.status not in {"submitted", "accepted"}:
@@ -736,7 +792,7 @@ def land_all_submitted(root: Path) -> list[str]:
                 out.append(f"{t.id}: skipped, not landed — {problem}")
                 continue
         try:
-            r = land(root, t.id, merge=True)
+            r = land_any(root, t.id, merge=True)
             out += r["out"]
             if not r["ok"]:
                 out.append(f"{t.id}: NOT landed")

@@ -457,6 +457,93 @@ def test_running_scriptorium_worktree_is_checkpointed_each_tick(tmp_path: Path, 
     assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
 
 
+# ---- T-0119: `scr land <id>` routes a scriptorium task to land_scriptorium ---------------------------------
+# Until T-0119 cmd_land and land_all_submitted called the QI land() for every id: on a scriptorium task that
+# pushed task/<id> to origin and opened a PR on the scriptorium repo. ops.land_any decides, by repo identity.
+def test_scr_land_scriptorium_task_lands_like_the_watcher_tick(tmp_path: Path, monkeypatch):
+    """`scr land T-0007` on the accepted scriptorium task: committed, trunk merged in, tests, merged into the
+    trunk, `merged` with one landed event and a log.md line naming the trunk commit — and nothing pushed,
+    no PR (origin untouched). --merge is accepted and ignored with one line."""
+    root, origin, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    origin_before = sgit(origin, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--merge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.splitlines()[0] == "scriptorium task: --merge is implied, --no-pr/--draft do not apply", r.stdout
+    assert "(scriptorium)" in r.stdout and "pushed" not in r.stdout and "PR" not in r.stdout, r.stdout
+    t = Store(root).get("T-0007")
+    assert t.status == "merged"
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok" and sgit(root, "merge-base", "--is-ancestor", "task/T-0007", "main") == ""
+    subject = sgit(root, "log", "-1", "--format=%s", "main")
+    assert subject.startswith("[land] T-0007:") or subject.startswith("[T-0007]"), subject
+    ev = _events(root, "landed", "T-0007")
+    assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"], ev
+    sha = ev[0]["note"].split("@")[1].split()[0]
+    assert sgit(root, "rev-parse", "--short", "main") == sha
+    assert f"landed: task/T-0007 -> main @ {sha}" in (t.dir / "log.md").read_text(encoding="utf-8")
+    # the QI path's traces are absent: origin's main unmoved, no task branch on origin, no PR body written
+    assert sgit(origin, "rev-parse", "main") == origin_before
+    assert sgit(origin, "branch", "--list", "task/T-0007") == "" and not (t.dir / "pr-body.md").exists()
+    assert not _events(root, "land_failed", "T-0007") and not _events(root, "pr", "T-0007")
+
+
+def test_scr_land_dry_run_scriptorium_changes_nothing(tmp_path: Path, monkeypatch):
+    """`scr land T-0007 --dry-run` prints the plan (branch, trunk, dirty-file count, containment) and stops
+    before step 1: trunk sha, task status, branch tip and the worktree's dirty file are as they were."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    main_before, tip_before, dirty_before = sgit(root, "rev-parse", "main"), sgit(wt, "rev-parse", "HEAD"), sgit(wt, "status", "--porcelain")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "task/T-0007 -> main (scriptorium, dry run" in r.stdout and "1 uncommitted file(s)" in r.stdout, r.stdout
+    assert "would merge main into task/T-0007" in r.stdout and "check.py" in r.stdout, r.stdout
+    assert sgit(root, "rev-parse", "main") == main_before and sgit(wt, "rev-parse", "HEAD") == tip_before
+    assert sgit(wt, "status", "--porcelain") == dirty_before != ""
+    assert Store(root).get("T-0007").status == "accepted" and not _events(root, "landed", "T-0007")
+
+
+def test_scr_land_qi_task_still_reaches_ops_land(tmp_path: Path, monkeypatch):
+    """A quantum-insertion task in the same world goes to ops.land with the QI flags; a task naming an
+    unregistered workload falls back to the first entry (QI) as workload_for does; land_all_submitted routes
+    the accepted scriptorium task to land_scriptorium, never to land()."""
+    import scr.ops as ops
+    from scr.cli import main
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "task", "new", "QI", "--id", "T-0011", "--workload", "quantum-insertion", "--files", "Foo.lean", "--origin", "omri")
+    calls: list[tuple] = []
+    monkeypatch.setattr(ops, "land", lambda root, tid, **kw: calls.append((tid, kw)) or {"ok": True, "url": None, "out": [f"fake land {tid}"]})
+    main(["land", "T-0011", "--root", str(root), "--no-pr", "--merge"])
+    assert calls == [("T-0011", {"no_pr": True, "draft": False, "dry_run": False, "merge": True})], calls
+    store = Store(root)
+    t = store.get("T-0011")
+    t.rec["workload"] = "nonesuch"
+    assert not ops.is_scriptorium_task(root, store, t) and ops.is_scriptorium_task(root, store, store.get("T-0007"))
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    out = ops.land_all_submitted(root)
+    assert len(calls) == 1 and Store(root).get("T-0007").status == "merged", out
+    assert any("(scriptorium)" in l for l in out) and len(_events(root, "landed", "T-0007")) == 1, out
+
+
+def test_scr_land_scriptorium_refuses_submitted_and_names_the_next_step(tmp_path: Path, monkeypatch):
+    """The hand path is post-acceptance: a submitted scriptorium task is refused before anything moves. A
+    landing failure exits 1 with the watcher's reason (tests) and the next action on one line, and raises
+    no land_failed event (that event is the watcher's)."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("broken\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", check=False)
+    assert r.returncode == 1, r.stdout + r.stderr
+    last = r.stdout.strip().splitlines()[-1]
+    assert last.startswith("T-0007: NOT landed (tests) — next: fix task/T-0007") and "scr land T-0007" in last, r.stdout
+    assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "accepted"
+    assert not _events(root, "land_failed", "T-0007")
+    t = Store(root).get("T-0007")
+    t.rec["status"] = "submitted"; t.save()                     # accepted -> submitted is no transition: set the record
+    r = sscr(root, "--actor", "omri", "land", "T-0007", check=False)
+    assert r.returncode == 2 and "T-0007 is submitted, not accepted — write the Decision first (T-0081)" in r.stderr, r.stdout + r.stderr
+    assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "submitted"
+
+
 # ---- T-0091: the watcher applies a Decision written in review.md ----------------------------------------
 # T-0061's review wrote `Decision: escalated (...)` on 2026-09-19 with `scr` denied, and the task sat
 # `submitted` for 35 h. `decision_of` is a pure function of review.md's text; `apply_decision` runs it for

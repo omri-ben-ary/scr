@@ -357,9 +357,13 @@ def _print(lines):
 
 
 def cmd_land(args):
-    root, _, _ = _ctx(args)
-    from .ops import land
-    r = land(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
+    """One command for both landings (T-0119): ops.land_any routes a scriptorium task to land_scriptorium
+    (the watcher's land step), every other workload to the QI push/PR land()."""
+    root, store, _ = _ctx(args)
+    from .ops import is_scriptorium_task, land_any
+    if is_scriptorium_task(root, store, store.get(args.id)) and (args.no_pr or args.draft or args.merge):
+        print("scriptorium task: --merge is implied, --no-pr/--draft do not apply")
+    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
     _print(r["out"])
     if not r["ok"]:
         sys.exit(1)
@@ -645,7 +649,10 @@ def build_parser() -> argparse.ArgumentParser:
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)
     j = sub.add_parser("journal", parents=[common], help="commit the scriptorium tree if dirty (journal mode; every mutating command does this itself)")
     j.add_argument("--note", default="journal"); j.add_argument("--push", action="store_true"); j.set_defaults(fn=cmd_journal)
-    ld = sub.add_parser("land", parents=[common], help="commit + push a task's worktree, open its PR (--merge: merge and mark merged)")
+    land_help = ("land a task: a scriptorium task via land_scriptorium (commit, merge the trunk in, tests, merge into the trunk, merged; "
+                 "--dry-run prints the plan, --no-pr/--draft/--merge do not apply); any other workload via the PR path "
+                 "(commit + push, open its PR; --merge: merge and mark merged)")
+    ld = sub.add_parser("land", parents=[common], help=land_help, description=land_help)
     ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true"); ld.set_defaults(fn=cmd_land)
     sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
     sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true"); sw.set_defaults(fn=cmd_sweep)
