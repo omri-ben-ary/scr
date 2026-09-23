@@ -105,8 +105,13 @@ def test_verify_clean_after_seed(repo: Path):
 
 def test_merge_cascades_to_ready(repo: Path):
     seed(repo)
-    for s in ("dispatched", "in_progress", "submitted", "accepted"):
+    for s in ("dispatched", "in_progress", "submitted"):
         scr(repo, "--quiet", "task", "set", "T-0002", s)
+    # T-0081: submitted -> accepted needs review.md to decide `accepted` with a mechanical row
+    review = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    review = review.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted").replace("|---|---|\n", "|---|---|\n| build | ok |\n")
+    (Store(repo).get("T-0002").dir / "review.md").write_text(review, encoding="utf-8")
+    scr(repo, "--quiet", "task", "set", "T-0002", "accepted")
     scr(repo, "--quiet", "task", "set", "T-0002", "merged", "--tokens", "1000")
     t3 = Store(repo).get("T-0003")
     assert t3.status == "ready"

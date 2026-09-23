@@ -18,6 +18,7 @@ from pathlib import Path
 from .events import EventLog, now_iso
 from .gitops import Git, GitError, NOISE, gh_available, pr_create, pr_merge, pr_url_for
 from .journal import _Lock as _JournalLock, journal
+from .review import acceptance_problem
 from .store import RepoError, Store, Task
 
 
@@ -203,9 +204,17 @@ def _section(text: str, name: str) -> str:
 
 def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False, wl_name: str | None = None) -> dict:
     """Commit the task's worktree, push its branch, open the PR (and with merge=True merge it and
-    mark the task merged after verifying origin/<main> contains the branch)."""
+    mark the task merged after verifying origin/<main> contains the branch). A `submitted` task is
+    accepted here only when its review.md decides `accepted` with at least one mechanical check row
+    (scr/review.py, T-0081): otherwise RepoError, no commit, no push, no PR, status untouched. T-0021
+    was accepted and merged (PR #49) on the untouched review template before this guard existed."""
     store = Store(root)
     t = store.get(tid)
+    if t.status == "submitted":                  # T-0081: no acceptance without a written review
+        problem = acceptance_problem(t.dir)
+        if problem:
+            raise RepoError(f"{tid}: not landing a submitted task without a written review — {problem}; "
+                            f"fill tasks/{t.dir.name}/review.md first")
     wl = workload(root, store, wl_name) if wl_name else workload_for(root, store, t)
     log = _log(root)
     out: list[str] = []
@@ -541,11 +550,17 @@ def park(root: Path, tid: str, note: str, actor: str | None = None) -> list[str]
 
 # ---- chore helpers -------------------------------------------------------------------------
 def land_all_submitted(root: Path) -> list[str]:
-    """Land + merge every submitted/accepted task, one after the other; failures are reported, not fatal."""
+    """Land + merge every submitted/accepted task, one after the other; failures are reported, not fatal.
+    A submitted task whose review.md does not support `accepted` (T-0081) is skipped with the reason."""
     out: list[str] = []
     for t in sorted(Store(root).load_all().values(), key=lambda t: t.id):
         if t.status not in {"submitted", "accepted"}:
             continue
+        if t.status == "submitted":
+            problem = acceptance_problem(t.dir)
+            if problem:
+                out.append(f"{t.id}: skipped, not landed — {problem}")
+                continue
         try:
             r = land(root, t.id, merge=True)
             out += r["out"]
