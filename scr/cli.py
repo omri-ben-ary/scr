@@ -99,9 +99,12 @@ def cmd_task_set(args):
     old = t.status
     if not lifecycle.allowed(t.rec, args.status) and not args.force:
         raise RepoError(f"{args.id}: {old} -> {args.status} is not an allowed transition (use --force to override; it is logged)")
-    if args.status == "accepted" and old == "submitted":
+    if args.status == "accepted" and old != "omri_queue":
         # T-0081: no acceptance without a written review. The same reading as ops.land and the watcher's
         # auto-decide (scr/review.py). Only Omri may go past it, explicitly, and that leaves an event.
+        # T-0128: on every route into accepted, whatever the previous status and even under --force
+        # (--force overrides the lifecycle table above, never the review); omri_queue -> accepted is
+        # the gate click, where Omri's decision is the review.
         from .review import acceptance_problem
         problem = acceptance_problem(t.dir)
         if problem:
@@ -109,9 +112,9 @@ def cmd_task_set(args):
                 log.append("system", name="accept_override", task=args.id, actor=args.actor,
                            note=f"{problem}; accepted anyway by Omri (--force-accept)" + (f": {args.note}" if args.note else ""))
             elif getattr(args, "force_accept", False):
-                raise RepoError(f"{args.id}: submitted -> accepted refused — {problem}; --force-accept is Omri's alone (--actor omri)")
+                raise RepoError(f"{args.id}: {old} -> accepted refused — {problem}; --force-accept is Omri's alone (--actor omri)")
             else:
-                raise RepoError(f"{args.id}: submitted -> accepted refused — {problem}; write the review in "
+                raise RepoError(f"{args.id}: {old} -> accepted refused — {problem}; write the review in "
                                 f"tasks/{t.dir.name}/review.md first (Omri may override with --actor omri --force-accept --note <why>; it is logged)")
     lifecycle.apply(t.rec, args.status)
     if args.tokens:
