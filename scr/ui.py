@@ -347,6 +347,10 @@ def _set_paused(root: Path, on: bool) -> dict:
 def _quit(root: Path) -> dict:
     from .admin import stop
     lines = stop(root, "watch")
+    if any(l.startswith("FAILED") for l in lines):          # T-0150: a surviving watcher must not cost Omri the UI
+        return {"ok": False, "output": "\n".join(lines + [
+            "UI stays up: the watcher pid above is still alive. Retry Quit, run `scr admin stop watch`, "
+            "or end the pid in Task Manager"])}
     threading.Timer(1.0, lambda: os._exit(0)).start()      # the child exits 0 -> the supervisor stops too
     return {"ok": True, "output": "\n".join(lines + ["UI shutting down; start it again from the Scriptorium shortcut"])}
 
