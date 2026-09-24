@@ -457,6 +457,146 @@ def test_running_scriptorium_worktree_is_checkpointed_each_tick(tmp_path: Path, 
     assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
 
 
+# ---- T-0120: record paths on task/<id> follow the trunk; one landing per task at a time ---------------------
+# A scriber that runs `scr` with its worktree as root journals there as [omri] and can open a phantom hotfix
+# task on the branch (T-0059: b4a70dc, phantom T-0108 59a57e2): events.jsonl, STATE.json, a tasks/ folder.
+def _phantom_journal_commit(wt: Path) -> list[str]:
+    """The shape of a worktree journal commit, committed on task/T-0007: an event appended to the branch's
+    events.jsonl, STATE.json rewritten, a phantom task folder. Returns the three paths."""
+    from scr.events import EventLog
+    EventLog(wt / "events" / "events.jsonl").append("system", name="phantom", task="T-0099", actor="omri", note="journaled in a worktree")
+    (wt / "state").mkdir(exist_ok=True)
+    (wt / "state" / "STATE.json").write_text('{"phantom": "T-0099"}\n', encoding="utf-8")
+    (wt / "tasks" / "T-0099-phantom").mkdir(parents=True)
+    (wt / "tasks" / "T-0099-phantom" / "task.yaml").write_text("id: T-0099\ntitle: phantom hotfix\n", encoding="utf-8")
+    paths = ["events/events.jsonl", "state/STATE.json", "tasks/T-0099-phantom/task.yaml"]
+    sgit(wt, "add", "--", *paths); sgit(wt, "commit", "-q", "-m", "[omri] phantom journal commit in the worktree")
+    return paths
+
+
+def _trunk_journals(root: Path) -> str:
+    """The checkout journals after the spawn: its own event appended (the same last line the branch appended
+    to — a conflict). Returns main's events.jsonl as committed."""
+    sscr(root, "--quiet", "--actor", "steward", "event", "system", "--name", "trunk_moved", "--note", "a journal commit on the trunk")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk journals")
+    return sgit(root, "show", "main:events/events.jsonl")
+
+
+def test_records_follow_the_trunk_on_a_phantom_journal_commit(tmp_path: Path, monkeypatch):
+    """T-0120 (a): the branch carries a phantom journal commit and the trunk journals too, so events.jsonl
+    conflicts. The conflict is on record paths only: they take the trunk's side, the leftovers (STATE.json,
+    the phantom task folder) are reverted before the tests, the task lands with its tool change, and the
+    log.md landing line lists every record path that followed the trunk. No land_failed, no scope refusal."""
+    root, _, wt = _land_world(tmp_path, monkeypatch, journal=True)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    paths = _phantom_journal_commit(wt)
+    trunk_events = _trunk_journals(root)
+    res = _tick(root)
+    assert res["ok"], res
+    t = Store(root).get("T-0007")
+    assert t.status == "merged", (t.status, res["needs"])
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok"
+    assert "T-0099-phantom" not in sgit(root, "ls-tree", "--name-only", "main", "tasks/")
+    main_events = sgit(root, "show", "main:events/events.jsonl")
+    assert main_events.startswith(trunk_events) and '"phantom"' not in main_events       # the trunk's chain, plus the landing's own events
+    from scr.events import EventLog
+    assert EventLog(root / "events" / "events.jsonl").verify_chain() == []
+    landed = [l for l in (t.dir / "log.md").read_text(encoding="utf-8").splitlines() if "landed: task/T-0007 -> main @" in l]
+    assert len(landed) == 1 and "records follow the trunk" in landed[0], landed
+    assert all(p in landed[0] for p in paths), landed[0]
+    # both halves ran on task/T-0007: the conflicted events.jsonl took the trunk's side in the step-3 merge
+    # commit, the clean leftovers were reverted by the step-3b commit
+    msgs = sgit(root, "log", "--format=%B", "main")
+    assert "records follow the trunk: " in msgs and "events/events.jsonl" in msgs.split("records follow the trunk: ")[1].splitlines()[0], msgs[:800]
+    assert "[land] T-0007: record paths follow the trunk (" in msgs and "tasks/T-0099-phantom/task.yaml" in msgs
+    assert not _events(root, "land_failed", "T-0007") and not res["needs"], res["needs"]
+
+
+def test_record_conflict_next_to_a_tool_conflict_still_aborts(tmp_path: Path, monkeypatch):
+    """T-0120 (b): the same phantom commit, but the branch's tool.txt also conflicts with the trunk. The
+    trunk's side is taken by path, never for the whole merge: a non-record conflict aborts as before —
+    land_failed (conflict) naming tool.txt, the worktree clean, the trunk untouched."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    _phantom_journal_commit(wt)
+    (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
+    _trunk_journals(root)
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    assert Store(root).get("T-0007").status == "accepted"
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "conflict" in ev[0]["note"] and "tool.txt" in ev[0]["note"], ev
+    assert any(n.startswith("T-0007 landing failed (conflict)") for n in res["needs"]), res["needs"]
+    assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "trunk edit"
+    assert not (root / ".git" / "worktrees" / "T-0007" / "MERGE_HEAD").exists()
+    assert sgit(wt, "status", "--porcelain") == "" and not _events(root, "landed", "T-0007")
+
+
+def test_record_report_written_in_worktree_fails_the_landing_by_name(tmp_path: Path, monkeypatch):
+    """T-0120 (c): the task's own report.md was written in the worktree, not the live root. It is never
+    dropped: one land_failed (records) names report.md and the one action, the trunk is untouched; once the
+    branch takes main's report.md back, the next tick lands."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    rel = f"tasks/{Store(root).get('T-0007').dir.name}/report.md"
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    (wt / rel).write_text("# Report\n\nwritten in the worktree by mistake\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "records" in ev[0]["note"] and "report.md" in ev[0]["note"] and "live root" in ev[0]["note"], ev
+    assert any("landing failed (records)" in n for n in res["needs"]), res["needs"]
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
+    # the Steward moved the text to the live root; the branch takes main's copy back -> lands
+    sgit(wt, "checkout", "main", "--", rel)
+    res2 = _tick(root)
+    assert Store(root).get("T-0007").status == "merged", res2["needs"]
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "land_failed", "T-0007")) == 1
+
+
+def test_land_lock_held_makes_a_second_landing_busy(tmp_path: Path, monkeypatch):
+    """T-0120 (from T-0119's review): while one landing of T-0007 holds .scr/land-T-0007.lock, a second
+    land_scriptorium returns busy and touches nothing; a lock whose holder is dead is taken over, and a
+    landing releases its lock."""
+    from scr.ops import _LandLock, land_scriptorium
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    status, head, main_before = sgit(wt, "status", "--porcelain"), sgit(wt, "rev-parse", "HEAD"), sgit(root, "rev-parse", "main")
+    lock = _LandLock(root, "T-0007")
+    assert lock.acquire() and lock.path == root / ".scr" / "land-T-0007.lock"
+    try:
+        r = land_scriptorium(root, "T-0007")
+    finally:
+        lock.release()
+    assert not r["ok"] and r["reason"] == "busy" and any("FAILED (busy)" in l for l in r["out"]), r
+    assert sgit(wt, "status", "--porcelain") == status and sgit(wt, "rev-parse", "HEAD") == head
+    assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "accepted"
+    assert not lock.path.exists()
+    # a dead holder's lock is stale: taken over, the landing runs, the lock is gone afterwards
+    p = subprocess.Popen([sys.executable, "-c", "pass"]); p.wait()
+    lock.path.write_text(f"{p.pid} 0\n", encoding="utf-8")
+    r2 = land_scriptorium(root, "T-0007")
+    assert r2["ok"], r2["out"]
+    assert Store(root).get("T-0007").status == "merged" and not lock.path.exists()
+
+
+def test_land_lock_older_than_the_journal_stale_limit_is_taken_over(tmp_path: Path):
+    """A lock held by a live pid is busy until it is older than LOCK_STALE_S (the holder's heartbeat keeps
+    a real landing fresh); then it is stale."""
+    from scr.journal import LOCK_STALE_S
+    from scr.ops import _LandLock
+    lock = _LandLock(tmp_path, "T-0007")
+    lock.path.parent.mkdir(parents=True)
+    lock.path.write_text(f"{os.getpid()} 0\n", encoding="utf-8")
+    assert not lock.stale() and not _LandLock(tmp_path, "T-0007").acquire()
+    old = lock.path.stat().st_mtime - LOCK_STALE_S - 10
+    os.utime(lock.path, (old, old))
+    assert lock.stale() and lock.acquire()
+    lock.release()
+    assert not lock.path.exists()
+
+
 # ---- T-0119: `scr land <id>` routes a scriptorium task to land_scriptorium ---------------------------------
 # Until T-0119 cmd_land and land_all_submitted called the QI land() for every id: on a scriptorium task that
 # pushed task/<id> to origin and opened a PR on the scriptorium repo. ops.land_any decides, by repo identity.
