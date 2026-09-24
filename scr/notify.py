@@ -93,9 +93,13 @@ def toast_argv(cards: list[dict], exe: str = "powershell", dry: bool = False) ->
 def toast(cards: list[dict], ch: dict, cfg: dict) -> str:
     if _under_pytest():
         return "skipped (pytest)"
-    exe = shutil.which("powershell") or shutil.which("pwsh")
+    # Windows PowerShell 5.1 only (T-0179): the script loads its types with `ContentType = WindowsRuntime`, which
+    # PowerShell 7 (pwsh, .NET 5+) cannot do, so a pwsh fallback would only turn this clear error into an opaque rc
+    exe = shutil.which("powershell")
     if not exe:
-        raise RuntimeError("no powershell on PATH: toast unavailable")
+        raise RuntimeError("Windows PowerShell (powershell.exe) is not on PATH: the WinRT toast needs it, and pwsh "
+                           "(PowerShell 7) cannot load the WinRT types; enable the Windows PowerShell feature or put "
+                           r"%SystemRoot%\System32\WindowsPowerShell\v1.0 on PATH")
     r = subprocess.run(toast_argv(cards, exe), capture_output=True, text=True, timeout=int(ch.get("timeout", 30)),
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if r.returncode != 0:

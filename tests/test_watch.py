@@ -1974,6 +1974,19 @@ def test_toast_smoke_runs_the_real_script_through_powershell():
     assert r.returncode == 0 and not r.stderr.strip(), f"rc {r.returncode}: {r.stderr or r.stdout}"
 
 
+def test_toast_without_windows_powershell_raises(monkeypatch):
+    """T-0179: pwsh cannot load the WinRT types, so a box with only pwsh gets a clear error and no process."""
+    monkeypatch.setattr(notify, "_under_pytest", lambda: False)
+    monkeypatch.setattr(notify.shutil, "which", lambda name: None if name == "powershell" else rf"C:\fake\{name}.exe")
+
+    def no_run(*a, **k):
+        pytest.fail(f"subprocess.run called: {a}")
+    monkeypatch.setattr(notify.subprocess, "run", no_run)
+    with pytest.raises(RuntimeError, match=r"Windows PowerShell \(powershell\.exe\)") as e:
+        notify.toast([CARD_A], {}, {})
+    assert "pwsh" in str(e.value)
+
+
 def test_email_password_comes_from_the_named_env_var_only(monkeypatch):
     """The message is built from the yaml; the channel refuses to run without the env var the yaml names."""
     ch = {"enabled": True, "host": "smtp.example", "from": "a@example", "to": ["b@example"], "user": "a", "password_env": "SCR_TEST_SMTP_PW"}
