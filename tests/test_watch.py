@@ -2002,3 +2002,160 @@ def test_land_failed_card_goes_when_the_task_leaves_accepted_and_never_doubles(w
     scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "land_failed", "--task", "T-0001", "--note", "FAILED (tests): x")
     cards = _land_cards(root, "T-0001")
     assert len(cards) == 1 and cards[0]["text"].startswith("FAILED (tests): x") and "×" not in cards[0]["title"], cards
+
+
+# ---- T-0173: every watcher NEEDS-YOU line is a needs-you card, live ----------------------------------------------
+from scr.watch import NEEDS_FILE  # noqa: E402
+
+
+def _watch_cards(root: Path, tid: str | None = None) -> list[dict]:
+    return [c for c in ui_mod.needs_cards(root) if c["type"] == "watch" and (tid is None or c["id"] == tid)]
+
+
+def _needs_file(root: Path) -> dict:
+    return json.loads((root / NEEDS_FILE).read_text(encoding="utf-8"))
+
+
+def _refuse_escalation(monkeypatch) -> None:
+    real = Watcher.scr
+
+    def scr_(self, actor, *args):
+        if args[:2] == ("task", "set") and "escalated" in args:
+            return None
+        return real(self, actor, *args)
+
+    monkeypatch.setattr(Watcher, "scr", scr_)
+
+
+def test_watch_need_is_one_live_card_with_a_stable_key(world, monkeypatch):
+    """DoD: a tick whose stuck task cannot be escalated (the `task set escalated` refused) leaves exactly one card
+    naming the task and the line; a second tick with the condition keeps the SAME key (no spam); the next tick
+    without the condition leaves none."""
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)
+    _refuse_escalation(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted"
+    line = next(n for n in res["needs"] if n.startswith("T-0001 is stuck"))
+    cards = _watch_cards(root)
+    assert len(cards) == 1, cards
+    c = cards[0]
+    assert c["id"] == "T-0001" and c["text"] == line and "could not be escalated" in c["text"] and c["name"] == "escalate_failed"
+    assert c["key"].startswith("need:escalate_failed:T-0001:") and "escalate" in c["title"]
+    assert [n["key"] for n in _needs_file(root)["needs"]] == ["escalate_failed:T-0001"]
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert [x["key"] for x in _watch_cards(root)] == [c["key"]]                              # same key across ticks
+    monkeypatch.undo()                                                                        # the escalation goes through now
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert _watch_cards(root) == [] and _needs_file(root)["needs"] == []
+
+
+def test_watch_need_card_is_acked_like_any_card(world, monkeypatch):
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)
+    _refuse_escalation(monkeypatch)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    [c] = _watch_cards(root)
+    sscr(root, "--quiet", "--actor", "omri", "ack", c["key"])
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert _watch_cards(root) == []
+
+
+def test_watch_help_need_is_the_help_card_only(world):
+    """DoD: a HELP line the tick raises as a need appears once in needs_cards: the help:<id>:<line> card."""
+    root, _, _ = world
+    _running(root)
+    log = Store(root).get("T-0001").dir / "log.md"
+    log.write_text(log.read_text(encoding="utf-8") + "- HELP: which lemma closes the goal?\n", encoding="utf-8")
+    res = Watcher(root, quiet=True).tick()
+    assert any("HELP" in n and n.startswith("T-0001") for n in res["needs"]), res["needs"]
+    assert any(n["key"].startswith("help:T-0001:") for n in _needs_file(root)["needs"])
+    cards = [c for c in ui_mod.needs_cards(root) if c["id"] == "T-0001"]
+    assert [c["type"] for c in cards] == ["help"] and "which lemma" in cards[0]["text"], cards
+
+
+def test_watch_land_failed_need_is_the_land_failed_card_only(world):
+    """DoD: the watcher's own land_failed path (need line + event) -> one card, the land_failed system card."""
+    root, _, _ = world
+    _accepted(root)
+    w = Watcher(root, quiet=True)
+    w.land_failed(Store(root).get("T-0001"), {"ok": False, "reason": "conflict", "out": ["FAILED (conflict): A.lean"], "tip": "abc123"}, set(), "0000")
+    w.publish_needs(datetime.now(timezone.utc))
+    assert [n["key"] for n in _needs_file(root)["needs"]] == ["land_failed:T-0001"]
+    cards = [c for c in ui_mod.needs_cards(root) if c["id"] == "T-0001"]
+    assert [(c["type"], c.get("name")) for c in cards] == [("system", "land_failed")], cards
+
+
+def test_watch_needs_file_is_written_empty_and_when_paused(world):
+    """DoD: a tick that finds nothing still writes the file (empty list), so a cleared condition clears its card;
+    the paused early return publishes too (its line is the page's paused banner, not a card)."""
+    root, _, _ = world
+    assert not (root / NEEDS_FILE).exists()
+    res = Watcher(root, quiet=True).tick()
+    doc = _needs_file(root)
+    assert res["needs"] == [] and doc["needs"] == [] and doc["ts"] and doc["interval_min"] > 0
+    (root / ".scr" / "paused").write_text("", encoding="utf-8")
+    res = Watcher(root, quiet=True).tick()
+    assert res["paused"] and res["needs"] == ["watcher paused"]
+    assert [n["key"] for n in _needs_file(root)["needs"]] == ["paused"] and _watch_cards(root) == []
+
+
+def test_watch_needs_older_than_two_ticks_show_nothing(world):
+    """A watcher that stopped ticking leaves no cards up: a list older than WATCH_STALE_TICKS intervals is ignored."""
+    root, _, _ = world
+    w = Watcher(root, quiet=True)
+    w.interval_min = 30
+    w.need("checkpoint_failed:T-0001", "T-0001 checkpoint commit failed: boom", "T-0001")
+    now = datetime.now(timezone.utc)
+    w.publish_needs(now - timedelta(minutes=61))
+    assert _watch_cards(root) == []
+    w.publish_needs(now - timedelta(minutes=59))                     # same key: `since` is carried over
+    assert _needs_file(root)["needs"][0]["since"] < _needs_file(root)["ts"]
+    assert len(_watch_cards(root)) == 1
+
+
+def test_watch_retire_refused_stands_while_the_worktree_does(world):
+    """A refused retire happens once (the task is merged after it); the line stays raised while the worktree exists."""
+    root, _, _ = world
+    w = Watcher(root, quiet=True)
+    t = Store(root).get("T-0001")
+    wt = task_worktree(workload_for(root, w.store, t), t)
+    w.retire_refused("T-0001", "dirty")
+    w.retire_refused_needs(w.store.load_all())
+    assert w.needs == [] and not any(k.startswith("retire_refused:") for k in w.flags)       # no worktree: nothing to say
+    wt.mkdir(parents=True)
+    w.retire_refused("T-0001", "dirty")
+    for _ in range(2):
+        w.needs, w.need_items = [], []
+        w.retire_refused_needs(w.store.load_all())
+        assert [n["key"] for n in w.need_items] == ["retire_refused:T-0001"] and "(dirty)" in w.needs[0]
+
+
+def test_ui_state_carries_watch_cards_and_nothing_else_changes(world):
+    """DoD: ui.state() returns the watcher-need cards in `needs`; the rest of its JSON is unchanged field for field."""
+    root, _, _ = world
+    (root / ".gitignore").write_text(".scr/\n", encoding="utf-8")      # as in the live root: the file is never a journal change
+    sgit(root, "add", ".gitignore"); sgit(root, "commit", "-q", "-m", "ignore .scr")
+    before = ui_mod.state(root)
+    w = Watcher(root, quiet=True)
+    w.need("decision_unapplied:T-0001", "T-0001 decision accepted from review.md could not be applied — see log", "T-0001")
+    w.publish_needs(datetime.now(timezone.utc))
+    after = ui_mod.state(root)
+    assert set(after) == set(before)
+    for k in before:
+        if k not in {"generated", "needs"}:
+            assert after[k] == before[k], k
+    added = [c for c in after["needs"] if c not in before["needs"]]
+    assert [(c["type"], c["id"], c["name"]) for c in added] == [("watch", "T-0001", "decision_unapplied")]
+    assert [c for c in after["needs"] if c["type"] != "watch"] == before["needs"]
+
+
+def test_every_watch_need_goes_through_the_keyed_helper():
+    """Every NEEDS-YOU line has a stable key: `self.needs.append` appears only inside Watcher.need."""
+    src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
+    assert src.count("self.needs.append(") == 1 and src.count("self.need(") >= 15

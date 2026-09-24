@@ -153,11 +153,57 @@ def invalidate_chores() -> None:
     _CHORE_CACHE["ts"] = 0.0
 
 
-CARD_ORDER = {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}
+CARD_ORDER = {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4, "watch": 5}
+
+# The watcher's NEEDS-YOU list (scr/watch.py publish_needs, T-0173): one `watch` card per line while the watcher still
+# raises it. A line whose condition already has its own card is not shown twice; the kind is its key's first part.
+WATCH_NEEDS_FILE = ".scr/watch.needs.json"
+WATCH_OWN_CARD = {"help": "the help:<id>:<line> card", "land_failed": "the land_failed system card (T-0146)",
+                  "wall": "the budget_wall system card", "dead": "the session_dead system card",
+                  "stale": "the stale system card", "paused": "the page's paused banner"}
+WATCH_TITLES = {"checkpoint_failed": "checkpoint commit failed — work only in the worktree",
+                "auto_land_failed": "auto-land failed — code accepted but not merged",
+                "retire_refused": "merged, but its worktree could not be retired",
+                "dispatch_timeout_unset": "dispatch timed out and could not be set ready",
+                "escalate_failed": "stuck, and the watcher could not escalate it",
+                "decision_unreadable": "review.md Decision unreadable — apply it by hand",
+                "decision_stale": "submitted again with the old review — a fresh review is needed",
+                "decision_unapplied": "review.md Decision could not be applied"}
+WATCH_STALE_TICKS = 2          # the list is dropped once it is older than this many tick intervals (a stopped watcher)
 
 
 def acked_keys(root: Path) -> set[str]:
     return set(_read(root / "reports" / "ui.acks.txt").split())
+
+
+def watch_cards(root: Path, tasks: dict, acked: set[str], now: datetime | None = None) -> list[dict]:
+    """One `watch` card per line of the watcher's last published needs list. Live: a line the next tick does not raise
+    is gone from the file and so from the page. The key `need:<line key>:<since>` holds across the ticks that raise
+    the line, so `scr ack` and the push dedup (`notified:<key>`) work as for other cards; a later episode of the same
+    condition is a new card. A list older than WATCH_STALE_TICKS tick intervals is ignored: the watcher stopped."""
+    try:
+        doc = json.loads(_read(root / WATCH_NEEDS_FILE) or "{}")
+        ts = datetime.fromisoformat(doc["ts"].replace("Z", "+00:00"))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return []
+    now = now or datetime.now(timezone.utc)
+    if (now - ts).total_seconds() > WATCH_STALE_TICKS * 60 * float(doc.get("interval_min") or 30):
+        return []
+    cards = []
+    for n in doc.get("needs") or []:
+        key = str(n.get("key") or "")
+        kind = key.split(":", 1)[0]
+        if not key or kind in WATCH_OWN_CARD:
+            continue
+        since = str(n.get("since") or doc["ts"])
+        ck = f"need:{key}:{re.sub(r'[^0-9TZ]', '', since)}"
+        if ck in acked:
+            continue
+        tid = n.get("task") or "-"
+        cards.append({"key": ck, "h": ck, "id": tid, "kind": "watch", "name": kind, "type": "watch",
+                      "title": WATCH_TITLES.get(kind, f"watcher: {kind}"), "status": tasks[tid].status if tid in tasks else None,
+                      "text": n.get("text") or "", "options": [], "ts": since})
+    return cards
 
 
 def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
@@ -224,6 +270,7 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
             grp["title"] = f"{grp['title']} ×{grp['count']}"
         grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"
         needs.append(grp)
+    needs += watch_cards(root, tasks, acked)
     needs += chore_cards(root, acked)
     from . import hotfix as _hx
     hx = _hx.status(root)

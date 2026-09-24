@@ -34,6 +34,9 @@ Per tick:
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
+  needs list    -> written to .scr/watch.needs.json at the end of every tick, empty or not, paused or not (T-0173):
+                   one entry per NEEDS-YOU line with a stable key (`<kind>:<task>`, the flags' scheme), the task, the
+                   text and the tick it was first raised; scr/ui.py needs_cards shows each as a card while it stands
   needs-you     -> every card the page shows (scr/ui.py needs_cards) that no earlier tick pushed goes out on
                    the channels of config/notify.yaml (toast, email; T-0090), once per card key (`notified:<key>`
                    in the flags file); an acked key is never sent; a failure is a `notify FAILED:` log line
@@ -58,6 +61,7 @@ from .store import Store
 
 STATE_FILE = ".scr/watch.state.txt"
 LOG_FILE = "reports/steward_watch.log"
+NEEDS_FILE = ".scr/watch.needs.json"      # the tick's NEEDS-YOU list, read by scr/ui.py needs_cards (T-0173)
 # claude -p writes this to stderr when it kills the session at its background-task ceiling (T-0067 owns the ceiling)
 DEAD_LINE = "Background tasks still running after"
 # Only a task whose session should be running is ever declared dead. `dispatched` has no session yet and
@@ -206,6 +210,8 @@ class Watcher:
         tpl = root / "templates" / "report.md"
         self.report_tpl = tpl.read_text(encoding="utf-8").strip() if tpl.exists() else ""
         self.needs: list[str] = []
+        self.need_items: list[dict] = []           # the same lines with their stable keys, published each tick (T-0173)
+        self.interval_min: int | None = None       # set by loop(); published so the page can tell a stopped watcher
         self.rows: list[dict] = []
         self.escalated: list[dict] = []            # the stuck tasks this tick moved to `escalated` (T-0092)
         self.timed_out: list[dict] = []            # the dispatches this tick moved back to `ready` (T-0122)
@@ -230,6 +236,32 @@ class Watcher:
 
     def unflag(self, key: str) -> None:
         self.flags.discard(key)
+
+    def need(self, key: str, text: str, task: str | None = None) -> None:
+        """One NEEDS-YOU line. `key` is `<kind>:<task>[:<detail>]` (the flags' scheme: stale:<id>, help:<id>:<line>):
+        stable across ticks for as long as the condition stands, so the card, `scr ack` and `notified:<key>` hold."""
+        self.needs.append(text)
+        if not any(n["key"] == key for n in self.need_items):
+            self.need_items.append({"key": key, "task": task, "text": text})
+
+    def publish_needs(self, now: datetime) -> None:
+        """Write this tick's needs list to NEEDS_FILE, always (an empty list clears the cards). `since` is carried
+        over from the previous file for a key that is still raised, so a card keeps its key across ticks."""
+        p = self.root / NEEDS_FILE
+        try:
+            prev = {n["key"]: n.get("since") for n in (json.loads(p.read_text(encoding="utf-8")).get("needs") or [])} if p.exists() else {}
+        except (OSError, ValueError, AttributeError, KeyError, TypeError):
+            prev = {}
+        ts = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = {"ts": ts, "interval_min": self.interval_min or int(self.limits.get("checkpoint_every_minutes", 30)),
+                "needs": [{**n, "since": prev.get(n["key"]) or ts} for n in self.need_items]}
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(body, indent=1) + "\n", encoding="utf-8")
+            tmp.replace(p)
+        except OSError as e:
+            self.log(f"needs file FAILED: {e}")
 
     def save_flags(self) -> None:
         p = self.root / STATE_FILE
@@ -329,10 +361,12 @@ class Watcher:
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
-        self.needs, self.rows, self.escalated, self.timed_out, self.events = [], [], [], [], None
+        self.needs, self.need_items, self.rows, self.escalated, self.timed_out, self.events = [], [], [], [], [], None
         if (self.root / ".scr" / "paused").exists():
             self.log("paused (resume from the UI)")
-            return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
+            self.need("paused", "watcher paused")
+            self.publish_needs(now)
+            return {"ok": True, "rows": [], "review": [], "needs": self.needs, "paused": True}
         self.touch_log()
         try:
             from .hotfix import poll_requests
@@ -375,7 +409,7 @@ class Watcher:
                             self.flag(f"drift:{t.id}:{p}")
                     except Exception as e:  # noqa: BLE001 — a checkpoint failure must not stop the tick
                         self.log(f"{t.id} checkpoint commit failed: {e}")
-                        self.needs.append(f"{t.id} checkpoint commit failed: {str(e)[-200:]}")
+                        self.need(f"checkpoint_failed:{t.id}", f"{t.id} checkpoint commit failed: {str(e)[-200:]}", t.id)
                 g = Git(wt)
                 changed = [p for p in g.dirty() if not p.startswith(LOG_PATHS)]
                 # After a checkpoint commit the tree is clean, so drift is the branch's OWN commits: its diff to
@@ -416,7 +450,7 @@ class Watcher:
                             if re.match(r"^\s*(-\s*)?HELP:", nxt):
                                 break
                         if not answered:
-                            self.needs.append(f"{t.id} HELP (log.md:{i + 1}): {line.strip()}")
+                            self.need(f"help:{t.id}:{i + 1}", f"{t.id} HELP (log.md:{i + 1}): {line.strip()}", t.id)
                             if self.flag(f"help:{t.id}:{i + 1}"):
                                 self.scr(f"steward:{t.id}", "event", "system", "--name", "help", "--task", t.id, "--note", line.strip()[:300], "--quiet")
 
@@ -428,7 +462,7 @@ class Watcher:
                 if self.flag(f"wall:{t.id}"):
                     self.log(f"{t.id} wall budget exhausted: {wall} h > {hours} h")
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "budget_wall", "--task", t.id, "--note", f"{wall} h", "--quiet")
-                self.needs.append(f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend")
+                self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
 
             rep = t.dir / "report.md"
             submitted = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl and self.report_tpl
@@ -452,7 +486,7 @@ class Watcher:
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "session_dead", "--task", t.id, "--note", f"pid {sess['pid']}: {dead}"[:300], "--quiet")
                     if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
                         self.unflag(key)                                  # retried next tick
-                self.needs.append(f"{t.id} session died ({dead}) — returned; no relaunch from here")
+                self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — returned; no relaunch from here", t.id)
             elif ok and t.status in {"in_progress", "checkpoint"}:
                 if t.status == "in_progress":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "checkpoint", "--quiet")
@@ -460,7 +494,7 @@ class Watcher:
             if idle >= self.stale and not dead:
                 flags.append(f"STALE {idle}m")
                 alive = f"pid {sess['pid']} is alive" if sess else "no recorded pid to check"
-                self.needs.append(f"{t.id} silent for {idle} min ({alive}) — is its session hung?")
+                self.need(f"stale:{t.id}", f"{t.id} silent for {idle} min ({alive}) — is its session hung?", t.id)
                 if self.flag(f"stale:{t.id}"):                             # once per idle episode (see below)
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "stale", "--task", t.id, "--note",
                              f"silent for {idle} min (threshold {self.stale}); {alive}", "--quiet")
@@ -513,7 +547,7 @@ class Watcher:
                 for line in res["out"]:
                     self.log(f"  land: {line}")
                 if not res["ok"]:
-                    self.needs.append(f"{t.id} auto-land failed — see reports/steward_watch.log")
+                    self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed — see reports/steward_watch.log", t.id)
                     self.unflag(f"land:{t.id}")
                     continue
                 merged_now += 1
@@ -521,7 +555,8 @@ class Watcher:
                 for line in r["out"]:
                     self.log(f"  retire: {line}")
                 if not r["ok"]:
-                    self.needs.append(f"{t.id} merged; worktree retire refused ({r['code']}) — see log")
+                    self.retire_refused(t.id, r["code"])
+        self.retire_refused_needs(tasks)
 
         if self.auto_intake and ok:
             nightly = datetime.now().hour == 22 and self.flag(f"intake:{datetime.now():%Y-%m-%d}")
@@ -544,6 +579,7 @@ class Watcher:
                     for line in launch(self.root, mode="headless", permission_mode=self.permission_mode):
                         self.log(f"  launcher: {line}")
 
+        self.publish_needs(datetime.now(timezone.utc))      # before the push, so it carries the watcher's own lines too
         self.notify_cards()
         self.save_flags()
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
@@ -588,7 +624,7 @@ class Watcher:
             note = (f"waited {row['age_min']} min in dispatched (dispatch_timeout_minutes {minutes:g}); "
                     "no launch event; redispatch is automatic")
             if self.scr(f"steward:{t.id}", "task", "set", t.id, "ready", "--note", f"dispatch timed out: {note}", "--quiet") is None:
-                self.needs.append(f"{t.id} dispatch timed out ({note}) but could not be set ready — see reports/steward_watch.log")
+                self.need(f"dispatch_timeout_unset:{t.id}", f"{t.id} dispatch timed out ({note}) but could not be set ready — see reports/steward_watch.log", t.id)
                 continue
             self.scr(f"steward:{t.id}", "event", "system", "--name", "dispatch_timeout", "--task", t.id, "--note", note, "--quiet")
             self.log(f"{t.id} dispatch timed out -> ready ({note})")
@@ -677,7 +713,7 @@ class Watcher:
         note = (f"stuck: {reason}; escalated by the watcher — a task that cannot progress is escalated, never held "
                 f"(agents/_common.md); {where}; transcript(s): {tr}")
         if self.scr(f"steward:{t.id}", "task", "set", t.id, "escalated", "--note", note[:900], "--quiet") is None:
-            self.needs.append(f"{t.id} is stuck ({reason}) but could not be escalated — see reports/steward_watch.log")
+            self.need(f"escalate_failed:{t.id}", f"{t.id} is stuck ({reason}) but could not be escalated — see reports/steward_watch.log", t.id)
             return False
         self.flags.add(key)
         self.unflag(f"review:{t.id}")          # it left `submitted`: a later re-submission gets a fresh review
@@ -729,8 +765,8 @@ class Watcher:
         verdict, problem = read_decision(text)
         if problem:
             self.log(f"{t.id} decision NOT applied: {problem}")
-            self.needs.append(f"{t.id} review.md has a Decision the watcher cannot read ({problem}) — apply it by hand: "
-                              f"scr --actor omri task set {t.id} accepted|returned|escalated")
+            self.need(f"decision_unreadable:{t.id}", f"{t.id} review.md has a Decision the watcher cannot read ({problem}) — apply it by hand: "
+                      f"scr --actor omri task set {t.id} accepted|returned|escalated", t.id)
             return False
         if not verdict:
             return False
@@ -739,11 +775,11 @@ class Watcher:
         prior = next((e for e in self.read_events() if e.get("kind") == "state" and e.get("task") == t.id
                       and f"[review.md {digest}]" in (e.get("note") or "")), None)
         if prior:
-            self.needs.append(f"{t.id} is submitted again but review.md is the review already applied "
-                              f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed")
+            self.need(f"decision_stale:{t.id}", f"{t.id} is submitted again but review.md is the review already applied "
+                      f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed", t.id)
             return False
         if self.scr(f"steward:{t.id}", "task", "set", t.id, verdict, "--note", note, "--quiet") is None:
-            self.needs.append(f"{t.id} decision {verdict} from review.md could not be applied — see reports/steward_watch.log")
+            self.need(f"decision_unapplied:{t.id}", f"{t.id} decision {verdict} from review.md could not be applied — see reports/steward_watch.log", t.id)
             return False
         self.log(f"{t.id} decision applied: {verdict}")
         decided.append({"task": t.id, "decision": verdict})
@@ -785,7 +821,7 @@ class Watcher:
         g, mg = Git(wt), Git(self.root)
         tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
-            self.needs.append(f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand")
+            self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
             self.unflag(f"land:{t.id}")
             return False
         self.log(f"{t.id} auto-land (scriptorium worktree): commit, merge {wl.main} in, tests, merge into {wl.main}")
@@ -806,15 +842,31 @@ class Watcher:
         for line in r["out"]:
             self.log(f"  retire: {line}")
         if not r["ok"]:
-            self.needs.append(f"{t.id} merged; worktree retire refused ({r['code']}) — see log")
+            self.retire_refused(t.id, r["code"])
         return True
+
+    def retire_refused(self, tid: str, code: str) -> None:
+        """A merged task whose worktree retire was refused: its landing never runs again, so the line would stand for
+        one tick only; the flag `retire_refused:<id>:<code>` keeps it raised while the worktree exists (T-0173)."""
+        for k in [k for k in self.flags if k.startswith(f"retire_refused:{tid}:")]:
+            self.unflag(k)
+        self.flags.add(f"retire_refused:{tid}:{code}")
+
+    def retire_refused_needs(self, tasks: dict) -> None:
+        for k in sorted(k for k in self.flags if k.startswith("retire_refused:")):
+            _, tid, code = k.split(":", 2)
+            t = tasks.get(tid)
+            if t is None or not task_worktree(workload_for(self.root, self.store, t), t).exists():
+                self.unflag(k)
+                continue
+            self.need(f"retire_refused:{tid}", f"{tid} merged; worktree retire refused ({code}) — see log", tid)
 
     def land_failed(self, t, res: dict, failed: set, scope_sig: str) -> bool:
         """A refused landing (land_scriptorium or the no-worktree land_any): the task stays accepted, a NEEDS-YOU
         line every tick, ONE land_failed event per branch tip (+ scope). Returns False."""
         why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
         nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
-        self.needs.append(f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log")
+        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
         for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
             self.unflag(k)
@@ -899,6 +951,7 @@ class Watcher:
     def loop(self, interval_min: int, once: bool = False) -> None:
         from .ui import _code_signature
         sig = _code_signature()
+        self.interval_min = interval_min
         while True:
             try:
                 res = self.tick()
