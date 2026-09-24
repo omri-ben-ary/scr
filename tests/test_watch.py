@@ -393,6 +393,29 @@ def test_merge_conflict_is_not_merged_and_raises_land_failed(tmp_path: Path, mon
     assert not any(k.startswith("land_failed:T-0007:") for k in (root / ".scr" / "watch.state.txt").read_text(encoding="utf-8").split())
 
 
+def test_landing_test_timeout_comes_from_limits_yaml(tmp_path: Path, monkeypatch):
+    """T-0186: land_scriptorium runs the tests within limits.yaml land_test_timeout_seconds (it was a
+    hardcoded 1800 s in ops._run_tests). With the key at 5 and a test command that sleeps 10 s, the landing
+    fails as `tests`, and the land_failed event names the 5 s and the key to raise."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    lim = yaml.safe_load((root / "config" / "limits.yaml").read_text(encoding="utf-8")) or {}
+    lim["land_test_timeout_seconds"] = 5
+    (root / "config" / "limits.yaml").write_text(yaml.safe_dump(lim), encoding="utf-8")
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["scriptorium"]["tests"] = f'{sys.executable} -c "import time; time.sleep(10)"'
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] 5 s landing timeout, 10 s tests")
+    (wt / "tool.txt").write_text("ok
+", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "tests" in ev[0]["note"], ev
+    assert "timed out after 5s" in ev[0]["note"] and "land_test_timeout_seconds" in ev[0]["note"], ev
+    assert Store(root).get("T-0007").status == "accepted" and sgit(root, "rev-parse", "main") == main_before
+
+
 def test_failing_tests_are_not_merged_and_raise_land_failed(tmp_path: Path, monkeypatch):
     """DoD 3b: the merge is clean but the workload's tests fail on the result: not merged, land_failed says
     `tests`, the trunk untouched. The tests ran in the worktree, on task/<id> with the trunk merged in, so

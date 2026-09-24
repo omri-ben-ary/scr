@@ -477,10 +477,25 @@ def _record_merged(root: Path, store: Store, tid: str, note: str, report: str = 
     return [f"  unblocked {d} -> ready" for d in lifecycle.cascade(store, log, tid, "merged", actor=f"steward:{tid}")]
 
 
-def _run_tests(wl: Workload, cwd: Path, timeout: int = 1800) -> tuple[int, str]:
+LAND_TEST_TIMEOUT_KEY = "land_test_timeout_seconds"   # config/limits.yaml (T-0186)
+LAND_TEST_TIMEOUT_S = 3600      # its default: T-0170's landing hit the old hardcoded 1800 s on 2026-09-24
+
+
+def land_test_timeout(store: Store) -> int:
+    """The landing test timeout in seconds: limits.yaml land_test_timeout_seconds, LAND_TEST_TIMEOUT_S when
+    the key is absent or not a positive number."""
+    try:
+        v = int(store.config("limits").get(LAND_TEST_TIMEOUT_KEY) or 0)
+    except (TypeError, ValueError, AttributeError):
+        v = 0
+    return v if v > 0 else LAND_TEST_TIMEOUT_S
+
+
+def _run_tests(wl: Workload, cwd: Path, timeout: int = LAND_TEST_TIMEOUT_S) -> tuple[int, str]:
     """Run the workload's `tests:` command IN `cwd` (a worktree). Same resolution as scr.hotfix.run_tests,
     which is bound to the checkout: a relative interpreter path is taken relative to cwd (a spawned
-    scriptorium worktree links `.venv` to the checkout's), a missing python.exe falls back to this one."""
+    scriptorium worktree links `.venv` to the checkout's), a missing python.exe falls back to this one.
+    land_scriptorium passes `timeout` from limits.yaml land_test_timeout_seconds (land_test_timeout)."""
     cmd = wl.cfg.get("tests")
     if not cmd:
         cmd = ".venv/Scripts/python.exe -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q"
@@ -498,7 +513,7 @@ def _run_tests(wl: Workload, cwd: Path, timeout: int = 1800) -> tuple[int, str]:
         r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, encoding="utf-8", errors="replace")
         return r.returncode, (r.stdout + r.stderr)[-6000:]
     except subprocess.TimeoutExpired:
-        return 124, f"tests timed out after {timeout}s"
+        return 124, f"tests timed out after {timeout}s (raise {LAND_TEST_TIMEOUT_KEY} in config/limits.yaml)"
     except FileNotFoundError as e:
         return 127, f"test command not found: {e}"
 
@@ -605,7 +620,8 @@ def land_scriptorium(root: Path, tid: str) -> dict:
       3b. whatever still differs from the trunk under RECORD_ROOTS (added, modified, deleted) is reverted to
          the trunk's side in one commit and listed — except the task's own report.md / log.md, which fail
          the landing (`records`) by name: a scriber's words are moved to the live root, never dropped;
-      4. run the workload's `tests:` command in the worktree — on exactly the tree the trunk will get;
+      4. run the workload's `tests:` command in the worktree — on exactly the tree the trunk will get —
+         within limits.yaml land_test_timeout_seconds (default 3600; a timeout fails the landing: `tests`);
       5. journal the checkout, then under the journal lock merge task/<id> into the trunk: a fast-forward
          after step 3 unless the trunk moved meanwhile (journal commits: records, never the tooling under
          test), a merge commit then; a failure here is aborted and reported like the others;
@@ -720,7 +736,7 @@ def _land_scriptorium(root: Path, tid: str) -> dict:
         followed += [p for p in rec if p not in followed]
         out.append(f"  records follow the trunk: {len(rec)} path(s) reverted on {br}: " + ", ".join(rec))
     # 4. the tests, on the tree the trunk will get
-    rc, txt = _run_tests(wl, wt)
+    rc, txt = _run_tests(wl, wt, land_test_timeout(store))
     if rc != 0:
         tail = " | ".join(l.strip() for l in txt.splitlines() if l.strip())[-400:]
         return fail("tests", f"`{wl.cfg.get('tests') or 'pytest tests -q'}` exited {rc} in {wt}: {tail}")
