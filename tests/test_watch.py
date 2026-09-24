@@ -1380,10 +1380,14 @@ def _dispatched(root: Path, tid: str = "T-0001") -> None:
     scr(root, "--quiet", "--actor", "prioritizer", "task", "set", tid, "dispatched")
 
 
-def _launched(root: Path, tid: str = "T-0001", pid: int = 4242) -> None:
-    """The launcher's `launch` event, pid recorded in `data` as scr/launch.py writes it."""
+def _launched(root: Path, tid: str = "T-0001", pid: int = 4242, created: int | None = None) -> None:
+    """The launcher's `launch` event, pid recorded in `data` as scr/launch.py writes it (`created` only when
+    given: without it the event has the pre-T-0147 shape)."""
+    data = {"pid": pid, "transcript": "session-20260923-000000.txt"}
+    if created is not None:
+        data["created"] = created
     scr(root, "--quiet", "--actor", f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid,
-        "--note", f"headless pid {pid}", "--data", json.dumps({"pid": pid, "transcript": "session-20260923-000000.txt"}))
+        "--note", f"headless pid {pid}", "--data", json.dumps(data))
 
 
 def _backdate(root: Path, tid: str, to: str, minutes: float) -> None:
@@ -1525,12 +1529,12 @@ from scr.gitops import Git  # noqa: E402
 from scr.ops import task_worktree, workload_for  # noqa: E402
 
 
-def _stuck_running(root: Path, tid: str = "T-0001", pid: int = 4242) -> Path:
+def _stuck_running(root: Path, tid: str = "T-0001", pid: int = 4242, created: int | None = None) -> Path:
     """An in_progress task with a worktree, a launch event (pid recorded) and a blocking HELP line 4 h old."""
     _dispatched(root, tid)
     spawn(root, [tid], lake=False)
     scr(root, "--quiet", "--actor", f"steward:{tid}", "task", "set", tid, "in_progress")
-    _launched(root, tid, pid)
+    _launched(root, tid, pid, created)
     t = Store(root).get(tid)
     log = t.dir / "log.md"
     log.write_text(log.read_text(encoding="utf-8") + "- HELP[blocks: Phase C]: which lemma closes the goal?\n", encoding="utf-8")
@@ -1650,6 +1654,145 @@ def test_run_kill_reports_a_refused_taskkill(monkeypatch):
     for rc, want in ((0, True), (128, False)):
         monkeypatch.setattr(run_mod, "subprocess", _Shim(subprocess, run=lambda *a, rc=rc, **k: R(rc)))
         assert run_mod.kill(99999) is want
+
+
+# ---- T-0147: a reused pid is never stopped -------------------------------------------------------------------
+# pid_alive counts a pid Windows reused for another process as alive, so a silently dead scriber's pid could be
+# `taskkill /T /F`-ed by the escalation above. The launcher now records the process creation time (`created`), and
+# session_dead / stop_session compare it with the live process's (run.process_created, replaced in scr.watch).
+def _mock_created(monkeypatch, value) -> list[int]:
+    """Replace process_created in scr.watch with a constant; return the pids it was asked about."""
+    import scr.watch as watch_mod
+    asked: list[int] = []
+    monkeypatch.setattr(watch_mod, "process_created", lambda pid: (asked.append(pid), value)[1])
+    return asked
+
+
+def test_stop_session_skips_a_reused_pid(world, monkeypatch):
+    """Launch recorded created X, the pid is alive but its process was created at Y != X, a stale blocking HELP ->
+    escalated, kill never called (nor a checkpoint for a session that is gone), the note says the pid was reused.
+    (On a whole tick the dead check returns such a task first, so the escalation pass is driven directly.)"""
+    root, _, _ = world
+    _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True)
+    asked = _mock_created(monkeypatch, 132000000000000002)
+    w = Watcher(root, quiet=True, auto_decide=True)
+    assert w.escalation_checks(datetime.now(timezone.utc), Store(root).load_all()) == 1
+    assert Store(root).get("T-0001").status == "escalated"
+    assert not [c for c in calls if c[0] in {"kill", "checkpoint"}], calls
+    assert asked == [4242]
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "session pid 4242 was already gone (pid reused by another process)" in ev[0]["note"], ev
+    assert "stopped after" not in ev[0]["note"]
+
+
+def test_stop_session_kills_when_creation_time_matches(world, monkeypatch):
+    """The same with Y == X: it is the launched session, so T-0124's behaviour: one kill, of that pid."""
+    root, _, _ = world
+    wt = _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    _mock_created(monkeypatch, 132000000000000001)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)], calls
+    assert "session pid 4242 stopped after checkpoint " in _events(root, "slot_freed", "T-0001")[0]["note"]
+
+
+@pytest.mark.parametrize("live", [132000000000000002, None])
+def test_stop_session_kills_on_an_old_launch_event(world, monkeypatch, live):
+    """A launch event without `created` (recorded before T-0147): the pid is trusted exactly as today, whatever
+    the live creation time is; the helper is not even asked."""
+    root, _, _ = world
+    wt = _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    asked = _mock_created(monkeypatch, live)
+    assert Watcher(root, quiet=True).session_of(Store(root).get("T-0001")).get("created") is None
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)], calls
+    assert asked == []
+
+
+def test_stop_session_kills_when_the_live_creation_time_is_unreadable(world, monkeypatch):
+    """created recorded, but the live process's cannot be read (access denied): today's behaviour, one kill."""
+    root, _, _ = world
+    wt = _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    _mock_created(monkeypatch, None)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)], calls
+
+
+def test_session_dead_on_reused_pid(world, monkeypatch):
+    """session_dead names the reuse when the creation times differ, and only then; on a tick the dead-session
+    card fires (task returned) instead of the stale one, and nothing is killed."""
+    import scr.watch as watch_mod
+    root, _, _ = world
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: True)
+    t = Store(root).get("T-0001")
+    sess = {"pid": 4242, "transcript": None, "created": 132000000000000001}
+    _mock_created(monkeypatch, 132000000000000002)
+    assert Watcher.session_dead(t, sess) == "pid 4242 was reused by another process"
+    _mock_created(monkeypatch, 132000000000000001)
+    assert Watcher.session_dead(t, sess) is None
+    _mock_created(monkeypatch, None)
+    assert Watcher.session_dead(t, sess) is None
+    assert Watcher.session_dead(t, {"pid": 4242, "transcript": None}) is None
+
+    _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True)
+    _mock_created(monkeypatch, 132000000000000002)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
+    dead = _events(root, "session_dead", "T-0001")
+    assert len(dead) == 1 and "pid 4242 was reused by another process" in dead[0]["note"], dead
+    assert not _events(root, "stale", "T-0001") and not [c for c in calls if c[0] == "kill"], calls
+
+
+def test_launch_records_the_process_creation_time(world, monkeypatch):
+    """The headless launcher reads the creation time of the pid start_claude returned and puts it in the
+    `launch` event's data next to pid and transcript; session_of hands it on."""
+    import scr.launch as launch_mod
+    from scr.launch import launch
+    root, _, _ = world
+    _record_launches(monkeypatch)
+    monkeypatch.setattr(launch_mod, "claude_bin", lambda: FAKE_CLAUDE)
+    asked: list[int] = []
+    monkeypatch.setattr(launch_mod, "process_created", lambda pid: (asked.append(pid), 132000000000000007)[1])
+    _dispatched(root)
+    launch(root, ["T-0001"], mode="headless")
+    assert asked == [4242]
+    ev = _events(root, "launch", "T-0001")[-1]
+    assert ev["data"]["pid"] == 4242 and ev["data"]["created"] == 132000000000000007, ev
+    assert ev["data"]["transcript"].startswith("session-"), ev
+    sess = Watcher(root, quiet=True).session_of(Store(root).get("T-0001"))
+    assert sess["pid"] == 4242 and sess["created"] == 132000000000000007, sess
+
+
+def test_process_created_identifies_a_real_child_process():
+    """run.process_created on a real process: the same value on every read while it lives, None (or another
+    value) once it has exited and been reaped, None for a pid that cannot exist."""
+    import gc
+
+    from scr.run import process_created
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        first = process_created(p.pid)
+        assert first is not None and process_created(p.pid) == first
+        assert process_created(os.getpid()) not in (None, first)
+    finally:
+        p.kill()
+        p.wait()
+    pid = p.pid
+    del p
+    gc.collect()                                   # the Popen's process handle closes: the pid is released
+    for _ in range(40):                            # (the venv launcher's own handle goes a moment later)
+        if process_created(pid) != first:
+            break
+        time.sleep(0.25)
+    assert process_created(pid) != first
+    assert process_created(0) is None and process_created(None) is None
 
 
 # ---- T-0153: the watcher routes by ops.is_scriptorium_task (repo identity), not the `workload:` string --------

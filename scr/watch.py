@@ -55,7 +55,7 @@ from .events import EventLog
 from .gitops import Git
 from .journal import journal
 from .ops import LOG_PATHS, checkpoint, is_scriptorium_task, land, land_any, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
-from .run import kill, pid_alive, scr_cmd, start_claude
+from .run import kill, pid_alive, process_created, scr_cmd, start_claude
 from .state import State
 from .store import Store
 
@@ -296,7 +296,9 @@ class Watcher:
         the last `launch` event since the last dispatched -> in_progress transition (the launcher sets
         in_progress first, then launches). None for an interactive tab (no pid) or a run launched before
         the pid was recorded; the pid comes from the event's data or its `headless pid N` note, the
-        transcript from the data or the launcher's line in log.md."""
+        transcript from the data or the launcher's line in log.md. `created` (the process creation time the
+        launcher read right after starting it, T-0147) is added when the event recorded one; `sess.get("created")`
+        is None for older events and for a process that died before it could be read."""
         launch = None
         for e in self.read_events():
             if e.get("task") != t.id:
@@ -322,13 +324,28 @@ class Watcher:
                 if m:
                     transcript = Path(m.group(1).strip()).name
                     break
-        return {"pid": int(pid), "transcript": transcript, "ts": launch.get("ts")}
+        sess = {"pid": int(pid), "transcript": transcript, "ts": launch.get("ts")}
+        if data.get("created") is not None:
+            sess["created"] = data["created"]
+        return sess
+
+    @staticmethod
+    def pid_reused(sess: dict) -> bool:
+        """The session's pid now belongs to another process: the launch recorded a creation time and the live
+        process with that pid has a different one (T-0147). False whenever either side is unknown (an old
+        launch event, a process whose times cannot be read): then the pid is trusted exactly as before."""
+        recorded = sess.get("created")
+        if recorded is None:
+            return False
+        live = process_created(sess["pid"])
+        return live is not None and live != recorded
 
     @staticmethod
     def session_dead(t, sess: dict) -> str | None:
-        """Why the session is dead, or None: the transcript's .err carries claude's termination line, or the
-        launched pid no longer exists. A pid Windows has reused still counts as alive (the .err covers the
-        common case); an alive-but-silent session is STALE, never dead."""
+        """Why the session is dead, or None: the transcript's .err carries claude's termination line, the
+        launched pid no longer exists, or it was reused by another process (its creation time differs from the
+        one the launch recorded, T-0147; without a recorded one a reused pid still counts as alive). An
+        alive-but-silent session is STALE, never dead."""
         if sess.get("transcript"):
             err = t.dir / (sess["transcript"] + ".err")
             try:
@@ -340,6 +357,8 @@ class Watcher:
                     return f"claude terminated it: {line.strip()[:160]}"
         if not pid_alive(sess["pid"]):
             return f"pid {sess['pid']} no longer exists"
+        if Watcher.pid_reused(sess):
+            return f"pid {sess['pid']} was reused by another process"
         return None
 
     @staticmethod
@@ -698,7 +717,7 @@ class Watcher:
         by the tick's earlier pass, so nothing written since is lost), then that pid is stopped with run.kill:
         otherwise auto-dispatch fills the freed slot and cap + 1 sessions run, and the old session's
         `task set submitted` is refused unexplained (T-0124, T-0092 review item 3). Only the pid session_of
-        returns is ever stopped; a `submitted` task has no scriber session (its review is T-0075's). The
+        returns is ever stopped, and never once another process has reused it (T-0147); a `submitted` task has no scriber session (its review is T-0075's). The
         escalation never depends on the stop: a failed checkpoint or kill is said in the note, not fatal."""
         key = f"slot_freed:{t.id}:{since.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
         if key in self.flags:
@@ -708,7 +727,7 @@ class Watcher:
         branch = t.rec.get("branch") or "task/" + t.id
         where = f"work: {wt} on {branch}" + ("" if wt.exists() else " (worktree missing)")
         if t.status in DEAD_CHECK_STATUSES and (sess := self.session_of(t)):
-            where = f"{self.stop_session(t, sess['pid'], wt, branch)}; {where}"
+            where = f"{self.stop_session(t, sess['pid'], wt, branch, created=sess.get('created'))}; {where}"
         tr = ", ".join(f"tasks/{t.dir.name}/{x}" for x in transcripts) if transcripts else "no transcript recorded"
         note = (f"stuck: {reason}; escalated by the watcher — a task that cannot progress is escalated, never held "
                 f"(agents/_common.md); {where}; transcript(s): {tr}")
@@ -727,11 +746,15 @@ class Watcher:
                 r["flags"] = (r["flags"] + " ESCALATED").strip()
         return True
 
-    def stop_session(self, t, pid: int, wt: Path, branch: str) -> str:
+    def stop_session(self, t, pid: int, wt: Path, branch: str, created: int | None = None) -> str:
         """Checkpoint-commit the worktree, then stop the launched session `pid` (T-0124). Returns the clause for
-        the escalation note; never raises."""
+        the escalation note; never raises. `created` is the creation time the launch recorded: a live process
+        with that pid but another creation time is not the session, and is never killed (T-0147)."""
         if not pid_alive(pid):
             return f"session pid {pid} was already gone"
+        if self.pid_reused({"pid": pid, "created": created}):
+            self.log(f"{t.id} session pid {pid} was reused by another process: not stopped")
+            return f"session pid {pid} was already gone (pid reused by another process)"
         sha = None
         try:
             c = checkpoint(self.root, t.id, push=self.push) if wt.exists() else None
