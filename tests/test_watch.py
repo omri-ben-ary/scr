@@ -2315,3 +2315,129 @@ def test_every_watch_need_goes_through_the_keyed_helper():
     """Every NEEDS-YOU line has a stable key: `self.needs.append` appears only inside Watcher.need."""
     src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
     assert src.count("self.needs.append(") == 1 and src.count("self.need(") >= 15
+
+
+# ---- T-0180: a half-written report.md is not a submission --------------------------------------------------
+# T-0172 was submitted with a literal FULL_SUITE_PLACEHOLDER where the full-suite result belonged. The text
+# below is T-0172's final report.md (the placeholder line already replaced by the real result).
+from scr.watch import report_unfinished  # noqa: E402
+
+T0172_REPORT = """# Report
+
+## Result
+The suite now runs the real WinRT toast script through powershell once, in **dry** mode: nothing is put on screen.
+
+- `scr/notify.py` `toast_argv(cards, exe="powershell", dry=False)`: new keyword `dry`. The script now binds
+  `$t = ...CreateToastNotifier(<app id>)` and `$n = [ToastNotification]::new($x)` and, only when not dry, ends with
+  `; $t.Show($n)`. So dry exercises everything the real toast does (both WinRT type loads, `New-Object XmlDocument`,
+  `LoadXml` of the escaped XML, `CreateToastNotifier` with `TOAST_APP_ID`, building the `ToastNotification`) except `.Show`.
+  The script also now starts with `$ErrorActionPreference = 'Stop'`, so any failing statement ends the script with rc 1
+  (before, a failed type load in the middle could be followed by statements that still "succeed"; the last statement's
+  status decided rc). This applies to the real toast too: `toast()` now reliably raises `powershell rc 1: ...` on such a break.
+- `tests/test_watch.py` `test_toast_smoke_runs_the_real_script_through_powershell`: `@pytest.mark.skipif(os.name != "nt" or not
+  shutil.which("powershell"))`; card titled `scr test suite: toast smoke (ignore)`; runs
+  `subprocess.run(notify.toast_argv([card], shutil.which("powershell"), dry=True), capture_output=True, text=True, timeout=60)`
+  (plus `CREATE_NO_WINDOW`) and asserts rc 0 and empty stderr; also asserts `.Show(` is absent from the dry script.
+  Deselect with `-k "not toast_smoke"`.
+
+done_when:
+- `pytest tests/test_watch.py -k toast_smoke -q` -> `1 passed, 102 deselected` (not skipped). PASS.
+- skipif on `os.name != "nt"` and `shutil.which("powershell")`. PASS.
+- `test_toast_argv_names_the_card_title_and_task_id` unchanged and passes (`-k toast` -> 2 passed); `toast()` and
+  `_under_pytest` untouched, `test_scr_notify_test_reports_every_channel` still sees `skipped (pytest)`. PASS.
+- full suite: see below.
+- Judgment, broken script: with `XmlDocument` misspelled as `XmlDocumnet` in the type-load line (and `::new` as `::nwe`),
+  the smoke test FAILED: `AssertionError: rc 1: Unable to find type [Windows.Data.Xml.Dom.XmlDocumnet,Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime].`
+  After reverting it passed again (`1 passed`).
+- Judgment, toasts on screen: dry, so running the suite puts **zero** toasts on screen.
+
+Full suite: `.venv/Scripts/python.exe -m pytest tests -q` in the worktree with the live-root `.venv` python ->
+`231 passed in 2611.58s (0:43:31)`, exit 0. PASS. Note that the suite has become slow (43.5 min on this box, up from about
+20 min in T-0090). A land gate with a shorter timeout will time out on it, as T-0170's land did with `exited 124`. The new
+smoke test adds about 2 s of that.
+
+## What I am unsure about
+- Dry mode does not prove `.Show` itself succeeds (for example Focus Assist, or the app id being unregistered at show
+  time). Everything before it is covered; `.Show` on a built `ToastNotification` with a valid notifier is the one
+  untested call.
+- `$ErrorActionPreference = 'Stop'` is a small behaviour change to the live toast: failures that were silently
+  swallowed now raise in `toast()` (and so become `notify FAILED: toast: ...` lines). I think that is the wanted
+  direction, but the Steward may want it noted.
+
+## Statement changes
+None. (`toast_argv` gained an optional keyword argument `dry=False`; existing callers are unchanged. This is Python, no
+Lean statements touched.)
+
+## Tokens and attempts
+Attempt 1 of 2; roughly 60k tokens.
+
+## unlocks
+```yaml
+on_success: []     # {title, kind, queue, scope, reason} — proposals, not tasks; Intake decides
+on_failure: []
+informs:
+  - {task: T-0171, weight: 0.2, reason: "toast_argv gained dry= and $ErrorActionPreference='Stop'; a failing toast now raises reliably, which feeds the T-0171 retry path"}
+```
+"""
+REPORT_TPL = (REPO / "templates" / "report.md").read_text(encoding="utf-8").strip()
+
+
+def test_report_unfinished_names_a_placeholder_an_empty_result_and_the_template_prompt():
+    assert report_unfinished(T0172_REPORT, REPORT_TPL) is None
+    submitted = T0172_REPORT.replace("Full suite: `.venv", "FULL_SUITE_PLACEHOLDER\n\nFull suite: `.venv")
+    assert submitted != T0172_REPORT and "FULL_SUITE_PLACEHOLDER" in report_unfinished(submitted, REPORT_TPL)
+    assert "FULL_SUITE_PLACEHOLDER" in report_unfinished("# Report\n\n## Result\nProved a.\n- full suite: FULL_SUITE_PLACEHOLDER\n", REPORT_TPL)
+    empty = REPORT_TPL.replace("What was proved / produced. Which done_when lines pass, in the Scriber's own assessment.", "")
+    assert empty != REPORT_TPL and "## Result is empty" in report_unfinished(empty + "\nfilled in elsewhere\n", REPORT_TPL)
+    assert "## Result is empty" in report_unfinished("# Report\n\n## Result\n\n## What I am unsure about\nnothing\n", REPORT_TPL)
+    prompt = REPORT_TPL + "\n\nfilled in elsewhere\n"                          # differs from the template, Result untouched
+    assert "template prompt" in report_unfinished(prompt, REPORT_TPL)
+    # lower-case or unanchored words are not placeholders; a report with no Result heading is not judged
+    for ok in ("# Report\n\n## Result\nThe _PLACEHOLDER rule in scr/review.py is untouched; a placeholder_x name too.\n",
+               "# report\n\n## Result\n\ndone\n\n## Statement changes\n\nnone\n", "done\n"):
+        assert report_unfinished(ok, REPORT_TPL) is None, ok
+
+
+def test_tick_keeps_placeholder_report_in_progress(world, monkeypatch):
+    """DoD: an in_progress task whose report.md holds a placeholder stays in_progress, a needs line with key
+    report:<id> appears (logged once), and no `task set ... submitted` call is made; once the report is
+    finished the next tick submits it as before."""
+    root, _, _ = world
+    _running(root)
+    t = Store(root).get("T-0001")
+    (t.dir / "report.md").write_text("# report\n\n## Result\n\nProved a.\n\nFull suite: FULL_SUITE_PLACEHOLDER\n\n## Statement changes\n\nnone\n", encoding="utf-8")
+    calls = _spy_scr(monkeypatch)
+    for _ in range(2):
+        w = Watcher(root, quiet=True)
+        res = w.tick()
+        assert res["ok"], res
+        assert Store(root).get("T-0001").status == "in_progress"
+        items = [n for n in w.need_items if n["key"] == "report:T-0001"]
+        assert len(items) == 1 and items[0]["task"] == "T-0001" and "FULL_SUITE_PLACEHOLDER" in items[0]["text"], w.need_items
+        assert items[0]["text"].startswith("T-0001 report.md unfinished: ")
+        assert "REPORT-UNFINISHED" in res["rows"][0]["flags"]
+    assert not any("submitted" in args for _, args in calls), calls
+    log = (root / "reports" / "steward_watch.log").read_text(encoding="utf-8")
+    assert log.count("T-0001 report.md unfinished") == 1                                # logged once
+    assert "report_unfinished:T-0001" in _flags(root)
+    # finished: submitted exactly as today, and the flag is gone
+    (t.dir / "report.md").write_text("# report\n\n## Result\n\nProved a.\n\nFull suite: 3 passed\n\n## Statement changes\n\nnone\n", encoding="utf-8")
+    w = Watcher(root, quiet=True)
+    w.tick()
+    assert Store(root).get("T-0001").status == "submitted" and not any(n["key"] == "report:T-0001" for n in w.need_items)
+    assert "report_unfinished:T-0001" not in _flags(root)
+
+
+def test_tick_returns_a_dead_session_that_left_an_unfinished_report(world):
+    """A session that died with a placeholder still in report.md is not submitted: the existing dead-session
+    path returns it (one session_dead event), as it would a session that wrote no report."""
+    import subprocess as sp
+    from test_journal_ops import _named, _running_with_session
+    p = sp.Popen([sys.executable, "-c", "pass"]); p.wait()                  # a pid that existed and is gone
+    root, _, t = _running_with_session(world, p.pid)
+    (t.dir / "report.md").write_text("# report\n\n## Result\n\nFULL_SUITE_PLACEHOLDER\n", encoding="utf-8")
+    w = Watcher(root, quiet=True)
+    res = w.tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
+    assert len(_named(root, "session_dead")) == 1
+    assert any(n["key"] == "report:T-0001" for n in w.need_items) and any(n["key"] == "dead:T-0001" for n in w.need_items)
