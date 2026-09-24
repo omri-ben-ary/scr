@@ -61,7 +61,8 @@ def read_decision(review_md: str) -> tuple[str | None, str | None]:
     """(verdict, problem) from a review.md text. The verdict comes from the FIRST `Decision:` line at column
     zero outside a code fence (the explicit form the review brief asks for) or, failing that, from the
     first non-blank line under a `## Decision` heading whose first word is a verdict (the template form
-    T-0062's review used). The untouched placeholder is no decision. When both forms are present they
+    T-0062's review used; a `Decision:` line there is read by the explicit rule, T-0193). The untouched
+    placeholder is no decision. When both forms are present they
     must agree. `problem` is set — with the offending line — when a Decision is written but cannot be
     read (`Decision: maybe`, a section that opens with prose, the two forms disagreeing): that is for
     Omri, never a transition."""
@@ -77,6 +78,13 @@ def read_decision(review_md: str) -> tuple[str | None, str | None]:
                     section = nxt
                     break
             break
+    # `Decision: accepted` as the section's first line is the explicit form written under the heading (T-0193):
+    # read it with the explicit rule, or the section pass would call its own `Decision:` prefix unreadable
+    section_rx = _SECTION_VERDICT
+    if section is not None and _DECISION_LINE.match(section):
+        section_rx = _DECISION_VERDICT
+        if _PLACEHOLDER.match(section[len("Decision:"):]):
+            section = None
     if section is not None and _PLACEHOLDER.match(section):
         section = None
     if explicit is not None and _PLACEHOLDER.match(explicit[len("Decision:"):]):   # the brief's own wording, copied
@@ -87,7 +95,7 @@ def read_decision(review_md: str) -> tuple[str | None, str | None]:
     if explicit is not None:
         found[explicit] = _verdict(explicit, _DECISION_VERDICT)
     if section is not None:
-        found[section] = _verdict(section, _SECTION_VERDICT)
+        found[section] = _verdict(section, section_rx)
     bad = [l for l, v in found.items() if v is None]
     if bad:
         return None, f"unreadable Decision line {bad[0].strip()[:120]!r}"

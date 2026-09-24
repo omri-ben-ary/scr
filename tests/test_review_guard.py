@@ -387,6 +387,23 @@ def test_one_read_decision_definition_and_watch_reexports_it():
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
 
 
+# ---- T-0193: `Decision: <verdict>` as the first line under `## Decision` ----------------------------------
+def test_explicit_line_under_the_decision_heading_is_read():
+    from scr.review import read_decision
+    assert read_decision(_review("Decision: accepted")) == ("accepted", None)
+    assert read_decision(_review("Decision: returned (the tests are red)")) == ("returned", None)
+    assert read_decision(_review("Decision: **escalated** (Gate 1, statement changed)")) == ("escalated", None)
+    # the brief's placeholder copied under the heading with the prefix is still no decision
+    assert read_decision(_review("Decision: " + PLACEHOLDER)) == (None, None)
+    # still unreadable / still disagreeing where it was before
+    v, problem = read_decision(_review("Decision: maybe"))
+    assert v is None and "unreadable" in problem
+    v, problem = read_decision(_review("accepted", tail="Decision: returned (fix the lemma)"))
+    assert v is None and "disagree" in problem, problem
+    assert read_decision(_review("Decision: accepted", tail="Decision: returned")) == ("accepted", None)   # first explicit line wins, as before
+    assert read_decision(_review("Decision: accepted", tail="Decision: accepted")) == ("accepted", None)
+
+
 # ---- T-0130: the Discuss brief shows the Decision the same parser reads -------------------------------------
 HEADING = "review.md — Decision"
 
