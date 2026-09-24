@@ -459,6 +459,52 @@ def test_indented_label_in_a_feedback_list_item_is_not_the_explicit_line():
     assert read_decision(no_heading + "- note\n  Decision: accepted\n") == (None, None)
 
 
+# ---- T-0210: one normaliser for every candidate Decision line ------------------------------------------------
+_NO_HEADING = TEMPLATE.replace("## Decision\n" + PLACEHOLDER + "\n", "")
+
+
+@pytest.mark.parametrize("line, verdict, column_zero", [
+    ("**Decision**: accepted", "accepted", True),
+    ("_Decision_: returned (fix it)", "returned", True),
+    ("**decision:** accepted", "accepted", True),
+    ("DECISION: escalated (Gate 2)", "escalated", True),
+    ("> Decision: accepted", "accepted", True),
+    (">**Decision**: returned (fix it)", "returned", True),
+    ("  > Decision: accepted", "accepted", False),   # indented: only the section pass may read it
+])
+def test_normalised_label_reads_under_the_heading_and_at_column_zero(line, verdict, column_zero):
+    from scr.review import read_decision
+    assert read_decision(_review(line)) == (verdict, None)
+    assert "## Decision" not in _NO_HEADING
+    assert read_decision(_NO_HEADING + line + "\n") == ((verdict, None) if column_zero else (None, None))
+
+
+def test_normalised_label_stays_fail_safe():
+    from scr.review import read_decision
+    # two verdicts are still unreadable, whatever the spelling of the label
+    for text in (_NO_HEADING + "**Decision**: accepted | returned\n", _review("**Decision**: accepted | returned"),
+                 _NO_HEADING + "> decision: accepted | escalated\n"):
+        v, problem = read_decision(text)
+        assert v is None and "unreadable" in problem, problem
+    # the verdict word stays case-sensitive: only the label is casefolded
+    for text in (_NO_HEADING + "Decision: Accepted\n", _review("**decision**: ACCEPTED")):
+        v, problem = read_decision(text)
+        assert v is None and "unreadable" in problem, problem
+    # the placeholder copied under a normalised label is still no decision
+    assert read_decision(_review("> **Decision**: " + PLACEHOLDER)) == (None, None)
+    assert read_decision(_NO_HEADING + "_decision_: " + PLACEHOLDER + "\n") == (None, None)
+    # a fence still hides every spelling
+    assert read_decision(_NO_HEADING + "```\n**Decision**: accepted\n```\n") == (None, None)
+    assert read_decision(_NO_HEADING + "~~~\n> Decision: accepted\n~~~\n") == (None, None)
+    # a bullet is a list item, not an emphasised label (as before T-0210)
+    assert read_decision(_NO_HEADING + "* Decision: accepted\n") == (None, None)
+    assert read_decision(_NO_HEADING + "- **Decision**: accepted\n") == (None, None)
+    # the explicit line and the heading's line must still agree across spellings
+    assert read_decision(_review("**Decision**: accepted", tail="> decision: accepted")) == ("accepted", None)
+    v, problem = read_decision(_review("accepted", tail="> Decision: returned"))
+    assert v is None and "disagree" in problem, problem
+
+
 # ---- T-0130: the Discuss brief shows the Decision the same parser reads -------------------------------------
 HEADING = "review.md — Decision"
 
