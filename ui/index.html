@@ -171,6 +171,7 @@ async function refresh() {
   $('#jDot').parentElement.title = j.last_failure ? 'last journal failure: ' + j.last_failure : 'the scriptorium repo journals itself; pending files are committed by the next command or watcher tick';
   $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency; $('#runN').textContent = STATE.running.length; $('#readyN').textContent = STATE.ready.length;
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
+  document.title = STATE.needs.length ? `(${STATE.needs.length}) Scriptorium` : 'Scriptorium';   // a pinned tab shows the count (T-0090)
   $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
   $('#pauseBtn').textContent = STATE.paused ? 'Resume' : 'Pause';
   renderNeeds(); renderLists(); renderTabs();

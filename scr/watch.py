@@ -34,6 +34,9 @@ Per tick:
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
+  needs-you     -> every card the page shows (scr/ui.py needs_cards) that no earlier tick pushed goes out on
+                   the channels of config/notify.yaml (toast, email; T-0090), once per card key (`notified:<key>`
+                   in the flags file); an acked key is never sent; a failure is a `notify FAILED:` log line
 Never deletes anything; never edits Lean; never answers a HELP: line itself.
 """
 from __future__ import annotations
@@ -541,10 +544,22 @@ class Watcher:
                     for line in launch(self.root, mode="headless", permission_mode=self.permission_mode):
                         self.log(f"  launcher: {line}")
 
+        self.notify_cards()
         self.save_flags()
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
                 "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- out-of-band push of NEW needs-you cards (T-0090) -------------------------------------------
+    def notify_cards(self) -> list[dict]:
+        """Push the cards the page shows (scr/ui.py needs_cards) that no earlier tick pushed; the dedup state is
+        `notified:<key>` in the flags file. Any failure is a `notify FAILED:` log line, never a tick crash."""
+        try:
+            from . import notify, ui
+            return notify.push(self.root, ui.needs_cards(self.root), self.flags, ui.acked_keys(self.root), self.log)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"notify FAILED: {type(e).__name__}: {e}")
+            return []
 
     # ---- a failed dispatch leaves the slot (T-0122) ---------------------------------------------------
     def dispatch_checks(self, now: datetime, tasks: dict) -> int:

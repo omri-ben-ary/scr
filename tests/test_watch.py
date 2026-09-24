@@ -1711,3 +1711,128 @@ def test_watch_review_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path
     _rename_workload(root, "T-0010")
     res = Watcher(root, quiet=True).tick()
     assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
+
+
+# ---- T-0090: out-of-band push of needs-you cards -------------------------------------------------------------
+import scr.notify as notify  # noqa: E402
+import scr.ui as ui_mod  # noqa: E402
+
+
+def _card(key: str, tid: str, title: str) -> dict:
+    return {"key": key, "id": tid, "type": "system", "kind": "system", "title": title, "options": [], "text": "note"}
+
+
+CARD_A = _card("events:T-0001:session_dead:2026-09-24T01:00:00Z", "T-0001", "scriber session died")
+CARD_B = _card("decision:T-0002", "T-0002", "Pick a direction")
+CARD_C = _card("chore:push-main", "push-main", "Push main to origin")
+
+
+def _notify_cfg(root: Path, cfg: dict | None) -> None:
+    """Write (or, with None, delete) config/notify.yaml and commit it, like _set_limit (config/ is a tooling path)."""
+    p = root / "config" / "notify.yaml"
+    if cfg is None:
+        if p.exists():
+            p.unlink()
+    else:
+        p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    sgit(root, "add", "-A", "config"); sgit(root, "commit", "-q", "--allow-empty", "-m", "[test] notify config")
+
+
+def _fake_channel(monkeypatch, name: str = "toast", fail: bool = False) -> list[list[dict]]:
+    calls: list[list[dict]] = []
+
+    def fake(cards, ch, cfg):
+        calls.append(list(cards))
+        if fail:
+            raise RuntimeError("smtp down")
+        return "ok"
+    monkeypatch.setitem(notify.CHANNELS, name, fake)
+    return calls
+
+
+def _cards(monkeypatch, cards: list[dict]) -> None:
+    monkeypatch.setattr(ui_mod, "needs_cards", lambda root, tasks=None: list(cards))
+
+
+def test_notify_pushes_each_new_card_once_and_never_an_acked_one(world, monkeypatch):
+    """DoD: two new cards on tick 1 -> the channel is called once with both; the same cards on tick 2 -> not
+    called; one card acked, one new -> called with the new one only. Every tick is a fresh Watcher, so the
+    dedup state is the flags file, which survives a watcher restart."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
+    calls = _fake_channel(monkeypatch)
+    email_calls = _fake_channel(monkeypatch, "email")
+    _cards(monkeypatch, [CARD_A, CARD_B])
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert calls == [[CARD_A, CARD_B]] and not email_calls
+    assert {"notified:" + CARD_A["key"], "notified:" + CARD_B["key"]} <= _flags(root)
+    Watcher(root, quiet=True).tick()
+    assert len(calls) == 1
+    scr(root, "--quiet", "--actor", "omri", "ack", CARD_B["key"])   # a decision card stays listed after an ack
+    _cards(monkeypatch, [CARD_A, CARD_B, CARD_C])
+    Watcher(root, quiet=True).tick()
+    assert calls[1:] == [[CARD_C]]
+    Watcher(root, quiet=True).tick()
+    assert len(calls) == 2
+    # a card that no longer stands leaves the flags file (it stays as long as the card list)
+    _cards(monkeypatch, [CARD_C])
+    Watcher(root, quiet=True).tick()
+    assert "notified:" + CARD_A["key"] not in _flags(root) and "notified:" + CARD_C["key"] in _flags(root) and len(calls) == 2
+
+
+def test_notify_channel_failure_is_a_log_line_not_a_crash(world, monkeypatch):
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": True}})
+    toast_calls = _fake_channel(monkeypatch, "toast")
+    _fake_channel(monkeypatch, "email", fail=True)
+    _cards(monkeypatch, [CARD_A])
+    res = Watcher(root, quiet=True).tick()
+    assert res["ok"] and toast_calls == [[CARD_A]]
+    log = (root / LOG).read_text(encoding="utf-8")
+    assert "notify FAILED: email: RuntimeError: smtp down" in log and "notify toast: ok" in log
+    # the card list itself failing is the same kind of line
+    monkeypatch.setattr(ui_mod, "needs_cards", lambda root, tasks=None: 1 / 0)
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert "notify FAILED: ZeroDivisionError" in (root / LOG).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("cfg", [None, {"toast": {"enabled": False}, "email": {"enabled": False}}, {}])
+def test_notify_config_absent_or_all_off_calls_nothing(world, monkeypatch, cfg):
+    root, _, _ = world
+    _notify_cfg(root, cfg)
+    calls = _fake_channel(monkeypatch) + _fake_channel(monkeypatch, "email")
+    _cards(monkeypatch, [CARD_A, CARD_B])
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert not calls and not any(k.startswith("notified:") for k in _flags(root))
+    assert "notify" not in (root / LOG).read_text(encoding="utf-8")
+
+
+def test_toast_argv_names_the_card_title_and_task_id():
+    card = _card("gate:T-0042", "T-0042", "Omri's gate: accept the <new> lemma & go")
+    argv = notify.toast_argv([card, CARD_A])
+    assert argv[0] == "powershell" and "-Command" in argv
+    cmd = argv[-1]
+    assert "T-0042" in cmd and "T-0001" in cmd and "scriber session died" in cmd
+    # the title is XML-escaped and its quote doubled for the PowerShell single-quoted string
+    assert "Omri''s gate: accept the &lt;new&gt; lemma &amp; go" in cmd
+    assert "ToastNotificationManager" in cmd and notify.TOAST_APP_ID in cmd
+
+
+def test_email_password_comes_from_the_named_env_var_only(monkeypatch):
+    """The message is built from the yaml; the channel refuses to run without the env var the yaml names."""
+    ch = {"enabled": True, "host": "smtp.example", "from": "a@example", "to": ["b@example"], "user": "a", "password_env": "SCR_TEST_SMTP_PW"}
+    msg = notify.email_message([CARD_A], ch, {})
+    assert msg["To"] == "b@example" and CARD_A["key"] in msg.get_content() and "T-0001" in msg.get_content()
+    monkeypatch.setattr(notify, "_under_pytest", lambda: False)
+    monkeypatch.delenv("SCR_TEST_SMTP_PW", raising=False)
+    with pytest.raises(RuntimeError, match="SCR_TEST_SMTP_PW"):
+        notify.email([CARD_A], ch, {})
+    live = yaml.safe_load((REPO / "config" / "notify.yaml").read_text(encoding="utf-8"))
+    assert set(live["email"]) >= {"host", "port", "from", "to", "password_env"} and "password" not in live["email"]
+
+
+def test_scr_notify_test_reports_every_channel(world, monkeypatch):
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
+    out = scr(root, "notify", "--test").stdout
+    assert "notify toast: skipped (pytest)" in out and "notify email: off" in out

@@ -103,6 +103,15 @@ agents' `main_branch` (`--auto-land`), Inbox lines and report `unlocks` become t
 and the queue is refilled up to `concurrency` (`--auto-dispatch`). What still reaches you, in the UI:
 the five gates — new/changed statements, direction decisions, stuck tasks, config changes, seeding.
 
+You do not have to keep the page open to learn that something needs you. Every card the page shows is
+also pushed out of band by the watcher tick that first sees it — a Windows toast (PowerShell + WinRT, no
+module) and, if you turn it on, an SMTP email — once per card key; Dismiss (`scr ack <key>`) silences it for
+good. Channels, host, port, addresses and the NAME of the environment variable that holds the SMTP password
+live in `config/notify.yaml` (never the password itself). `scr notify --test` sends one test message per
+enabled channel and prints the result; `scr notify` lists the standing cards and which were pushed. A failed
+push is a `notify FAILED:` line in `reports/steward_watch.log`. The page title reads `(N) Scriptorium` while
+N cards stand, so a pinned tab shows the count (T-0090).
+
 Permission mode: every Claude session the operation starts — the headless ones (`claude -p`: scribers,
 Steward reviews and tooling reviews, the nightly Intake, the Concierge) and the interactive ones you open
 with Discuss — runs in Claude Code **auto mode** (`--permission-mode auto`), and a session started in a

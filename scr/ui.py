@@ -138,13 +138,20 @@ def invalidate_chores() -> None:
     _CHORE_CACHE["ts"] = 0.0
 
 
-def state(root: Path) -> dict:
-    store = Store(root)
-    tasks = store.load_all()
+CARD_ORDER = {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}
+
+
+def acked_keys(root: Path) -> set[str]:
+    return set(_read(root / "reports" / "ui.acks.txt").split())
+
+
+def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
+    """The needs-you cards, in page order: what the page shows and what the watcher pushes out of band
+    (scr/notify.py, T-0090) — one source for both. Each card has a `key` (what `scr ack` takes)."""
+    if tasks is None:
+        tasks = Store(root).load_all()
     g = Graph.build(tasks)
-    wl_name, wl = _workload(root, store)
-    limits = store.config("limits") or {}
-    acked = set(_read(root / "reports" / "ui.acks.txt").split())
+    acked = acked_keys(root)
     needs: list[dict] = []
     for t in tasks.values():
         rec, d = t.rec, t.dir
@@ -204,6 +211,15 @@ def state(root: Path) -> dict:
                          "text": "A tooling fix is in progress in the live checkout. Files so far: " + (", ".join(hx["files"]) or "(none yet)") +
                                  ". When the fix is done, close it: the tests run, a report is written and the Steward reviews it.",
                          "options": []})
+    return sorted(needs, key=lambda x: CARD_ORDER[x["type"]])
+
+
+def state(root: Path) -> dict:
+    store = Store(root)
+    tasks = store.load_all()
+    wl_name, wl = _workload(root, store)
+    limits = store.config("limits") or {}
+    needs = needs_cards(root, tasks)
     running = [{"id": t.id, "status": t.status, "title": t.rec.get("title", ""), "kind": t.rec.get("kind"),
                 "attempts": t.rec.get("attempts", 0), "tokens": t.rec.get("tokens_used", 0), "started": _started(root, t.id)}
                for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted", "accepted"}]
@@ -234,7 +250,7 @@ def state(root: Path) -> dict:
         "journal": {"head": head, "dirty": len(gj.dirty()) if head else 0, "last_failure": last_failure(root)},
         "last_watch_tick": last_tick, "pid": os.getpid(), "paused": paused(root),
         "watcher_running": bool(__import__("scr.run", fromlist=["pids_matching"]).pids_matching(__import__("scr.admin", fromlist=["WATCH_PATTERN"]).WATCH_PATTERN)),
-        "needs": sorted(needs, key=lambda x: {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}[x["type"]]),
+        "needs": needs,
         "running": running, "ready": ready, "recent": recent,
         "jobs": JOBS.list(),
         "counts": {s: sum(1 for t in tasks.values() if t.status == s) for s in
