@@ -8,7 +8,9 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -61,6 +63,9 @@ def cmd_task_new(args):
     root, store, log = _ctx(args)
     tasks = store.load_all()
     tid = args.id or store.next_id()
+    # `--max-attempts` unset -> limits.yaml default_max_attempts (3 when the key is absent); T-0125
+    if args.max_attempts is None:
+        args.max_attempts = int(store.config("limits").get("default_max_attempts", 3))
     rec = {
         "id": tid, "title": args.title, "queue": args.queue, "kind": args.kind, "status": "proposed",
         "workload": args.workload, "created": now_iso(),
@@ -94,6 +99,23 @@ def cmd_task_set(args):
     old = t.status
     if not lifecycle.allowed(t.rec, args.status) and not args.force:
         raise RepoError(f"{args.id}: {old} -> {args.status} is not an allowed transition (use --force to override; it is logged)")
+    if args.status == "accepted" and old != "omri_queue":
+        # T-0081: no acceptance without a written review. The same reading as ops.land and the watcher's
+        # auto-decide (scr/review.py). Only Omri may go past it, explicitly, and that leaves an event.
+        # T-0128: on every route into accepted, whatever the previous status and even under --force
+        # (--force overrides the lifecycle table above, never the review); omri_queue -> accepted is
+        # the gate click, where Omri's decision is the review.
+        from .review import acceptance_problem
+        problem = acceptance_problem(t.dir)
+        if problem:
+            if getattr(args, "force_accept", False) and args.actor == "omri":
+                log.append("system", name="accept_override", task=args.id, actor=args.actor,
+                           note=f"{problem}; accepted anyway by Omri (--force-accept)" + (f": {args.note}" if args.note else ""))
+            elif getattr(args, "force_accept", False):
+                raise RepoError(f"{args.id}: {old} -> accepted refused — {problem}; --force-accept is Omri's alone (--actor omri)")
+            else:
+                raise RepoError(f"{args.id}: {old} -> accepted refused — {problem}; write the review in "
+                                f"tasks/{t.dir.name}/review.md first (Omri may override with --actor omri --force-accept --note <why>; it is logged)")
     lifecycle.apply(t.rec, args.status)
     if args.tokens:
         t.rec["tokens_used"] = int(t.rec.get("tokens_used", 0)) + args.tokens
@@ -214,15 +236,33 @@ def cmd_score(args):
         _out([{"task": r["task"], "score": r["score"], **{k: round(v, 3) for k, v in r["terms"].items()}} for r in rows], args.json)
 
 
+def statement_window_open(window, now: datetime | None = None) -> bool:
+    """True when `now` (Asia/Jerusalem; local time when tzdata is missing) falls in limits.yaml
+    statement_window, a "HH:MM-HH:MM" string; an absent or empty window is always open (T-0125)."""
+    if not window:
+        return True
+    lo, hi = (s.strip() for s in str(window).split("-", 1))
+    try:
+        now = now or datetime.now(ZoneInfo("Asia/Jerusalem"))
+    except ZoneInfoNotFoundError:
+        now = datetime.now()
+    t = now.strftime("%H:%M")
+    return lo <= t <= hi if lo <= hi else t >= lo or t <= hi     # "22:00-06:00" wraps midnight
+
+
 def cmd_dispatch(args):
     root, store, log = _ctx(args)
     limits = store.config("limits")
     g = Graph.build(store.load_all())
+    # the slot-holders: the same set as scr.watch.SLOT_STATUSES; `escalated` and `returned` never count (T-0092)
     running = [t.id for t in g.tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"}]
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")
     ranked = [r["task"] for r in rows]
-    if not args.allow_statements:
+    # may_touch_statements tasks need --allow-statements and the limits.yaml statement_window to be open (T-0125)
+    if not args.allow_statements or not statement_window_open(limits.get("statement_window")):
+        if args.allow_statements:
+            print(f"statement_window {limits.get('statement_window')} is closed now: may_touch_statements tasks held back")
         ranked = [t for t in ranked if not (g.tasks[t].rec.get("scope") or {}).get("may_touch_statements")]
     # never co-dispatch with something already running that conflicts
     ranked = [t for t in ranked if all(tuple(sorted((t, r))) not in g.conflicts for r in running)]
@@ -317,9 +357,13 @@ def _print(lines):
 
 
 def cmd_land(args):
-    root, _, _ = _ctx(args)
-    from .ops import land
-    r = land(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
+    """One command for both landings (T-0119): ops.land_any routes a scriptorium task to land_scriptorium
+    (the watcher's land step), every other workload to the QI push/PR land()."""
+    root, store, _ = _ctx(args)
+    from .ops import is_scriptorium_task, land_any
+    if is_scriptorium_task(root, store, store.get(args.id)) and (args.no_pr or args.draft or args.merge):
+        print("scriptorium task: --merge is implied, --no-pr/--draft do not apply")
+    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
     _print(r["out"])
     if not r["ok"]:
         sys.exit(1)
@@ -439,9 +483,11 @@ def cmd_ensure_main(args):
 
 def cmd_up(args):
     root, _, _ = _ctx(args)
-    from .admin import up, stop
+    from .admin import up, stop, stop_failed
     if args.stop:
-        _print(stop(root, "ui") + stop(root, "watch")); return
+        lines = stop(root, "ui") + stop(root, "watch")
+        _print(lines)
+        sys.exit(1 if stop_failed(lines) else 0)      # T-0156: a surviving process must not read as a made stop
     lines = up(root, ui_only=args.ui_only, restart=args.restart, register_logon=args.register, port=args.port, open_browser=not args.no_browser)
     _print(lines)
     (root / "reports").mkdir(exist_ok=True)      # `up` also runs windowless from the Desktop shortcut: keep a trace
@@ -522,6 +568,27 @@ def cmd_ack(args):
     print(f"acknowledged {args.key}")
 
 
+def cmd_notify(args):
+    """--test: one test message on every enabled channel of config/notify.yaml. Without it: the cards that stand
+    and whether the watcher has pushed each (T-0090)."""
+    root, _, _ = _ctx(args)
+    from . import notify
+    if args.test:
+        lines = notify.send_test(root)
+        print("\n".join(lines))
+        if any("FAILED" in ln for ln in lines):
+            sys.exit(1)
+        return
+    from .ui import acked_keys, needs_cards
+    sf = root / ".scr" / "watch.state.txt"
+    flags = set(sf.read_text(encoding="utf-8").split()) if sf.exists() else set()
+    cards = needs_cards(root)
+    new = {c["key"] for c in notify.pending(cards, flags, acked_keys(root))}
+    print(f"channels on: {', '.join(notify.enabled(notify.load(root))) or 'none'}; {len(cards)} card(s) stand, {len(new)} not yet pushed")
+    for c in cards:
+        print(f"  {'new   ' if c['key'] in new else 'pushed'}  {c['key']}  {c.get('title', '')[:80]}")
+
+
 def cmd_journal(args):
     root, _, _ = _ctx(args)
     sha = journal(root, args.actor, args.note, push=args.push)
@@ -566,11 +633,12 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--files", nargs="*"); n.add_argument("--decls", nargs="*"); n.add_argument("--may-touch-statements", action="store_true")
     n.add_argument("--blocked-by", nargs="*"); n.add_argument("--reason", help="justification for blocks edges without shared scope")
     n.add_argument("--origin"); n.add_argument("--omri-weight", type=float, default=0.0); n.add_argument("--verifiability", type=float, default=1.0)
-    n.add_argument("--risk", type=float, default=0.2); n.add_argument("--max-attempts", type=int, default=3)
+    n.add_argument("--risk", type=float, default=0.2); n.add_argument("--max-attempts", type=int, default=None, help="default: limits.yaml default_max_attempts")
     n.add_argument("--max-tokens", type=int, default=2_000_000); n.add_argument("--max-wall-hours", type=float, default=6); n.add_argument("--note")
     n.set_defaults(fn=cmd_task_new)
     st = t.add_parser("set", parents=[common], help="status transition")
     st.add_argument("id"); st.add_argument("status"); st.add_argument("--note"); st.add_argument("--tokens", type=int); st.add_argument("--force", action="store_true")
+    st.add_argument("--force-accept", action="store_true", help="(--actor omri only) accept a submitted task whose review.md does not decide `accepted`; logs an accept_override event with --note")
     st.set_defaults(fn=cmd_task_set)
     br = t.add_parser("brief", parents=[common], help="print the standard scriber launch prompt for a task")
     br.add_argument("id"); br.set_defaults(fn=cmd_task_brief)
@@ -604,7 +672,10 @@ def build_parser() -> argparse.ArgumentParser:
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)
     j = sub.add_parser("journal", parents=[common], help="commit the scriptorium tree if dirty (journal mode; every mutating command does this itself)")
     j.add_argument("--note", default="journal"); j.add_argument("--push", action="store_true"); j.set_defaults(fn=cmd_journal)
-    ld = sub.add_parser("land", parents=[common], help="commit + push a task's worktree, open its PR (--merge: merge and mark merged)")
+    land_help = ("land a task: a scriptorium task via land_scriptorium (commit, merge the trunk in, tests, merge into the trunk, merged; "
+                 "--dry-run prints the plan, --no-pr/--draft/--merge do not apply); any other workload via the PR path "
+                 "(commit + push, open its PR; --merge: merge and mark merged)")
+    ld = sub.add_parser("land", parents=[common], help=land_help, description=land_help)
     ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true"); ld.set_defaults(fn=cmd_land)
     sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
     sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true"); sw.set_defaults(fn=cmd_sweep)
@@ -635,6 +706,8 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
     ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
+    nt = sub.add_parser("notify", parents=[common], help="push channel for needs-you cards (config/notify.yaml): --test sends one test message per enabled channel")
+    nt.add_argument("--test", action="store_true"); nt.set_defaults(fn=cmd_notify)
     hx = sub.add_parser("hotfix", parents=[common], help="fix the tooling in place, as a recorded task: open <symptom> | close [id] --summary | test | status")
     hx.add_argument("op", choices=["open", "close", "test", "status"]); hx.add_argument("id", nargs="?"); hx.add_argument("text", nargs="?")
     hx.add_argument("--summary"); hx.add_argument("--unlock", action="append", help='"<title> | <why>" (repeatable)'); hx.add_argument("--discuss", action="store_true", help="open the Toolsmith session too")

@@ -136,6 +136,16 @@ class State:
         errors += ie
         warnings += iw
 
+        # T-0157: ops.workload() resolves a missing or unregistered `workload:` to the first entry on
+        # purpose (a record may name a workload before it is registered); make that fallback visible.
+        wls = list(self.store.config("workloads") or {})
+        if wls:
+            for tid, t in sorted(g.tasks.items()):
+                key = t.rec.get("workload")
+                if t.is_open and (not key or key not in wls):
+                    warnings.append(f"{tid}: workload '{key or ''}' is not registered in config/workloads.yaml "
+                                    f"(resolves to the first entry, '{wls[0]}')")
+
         if self.graph_path.exists():
             try:
                 gj = json.loads(self.graph_path.read_text(encoding="utf-8"))

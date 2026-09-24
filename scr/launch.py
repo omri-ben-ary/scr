@@ -12,7 +12,7 @@ from pathlib import Path
 from .brief import brief_for
 from .events import EventLog
 from .ops import spawn, task_worktree, workload_for
-from .run import claude_bin, permission_mode_for, scr_cmd, session_argv, start_claude
+from .run import claude_bin, permission_mode_for, process_created, scr_cmd, session_argv, start_claude
 from .store import Store
 
 
@@ -52,12 +52,14 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"\n- {stamp} [launcher] headless scriber session started (permission-mode {permission_mode})\n")
             pid = start_claude(wt, bf, tr, permission_mode=permission_mode, model=model, root=root)
+            created = process_created(pid) if pid else None      # the pid's identity: None if it already died (T-0147)
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"- {stamp} [launcher] pid {pid}, transcript {tr}\n")
             # the watcher re-checks this pid and this transcript's .err every tick (T-0063): both go in `data`,
-            # the note stays human-readable (and is the fallback for events recorded before `data` existed)
+            # the note stays human-readable (and is the fallback for events recorded before `data` existed);
+            # `created` lets it tell this session from a later process that reused the pid (T-0147)
             scr_cmd(root, f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid, "--note", f"headless pid {pid}",
-                    "--data", json.dumps({"pid": pid, "transcript": tr.name}), "--quiet")
+                    "--data", json.dumps({"pid": pid, "transcript": tr.name, "created": created}), "--quiet")
             out.append(f"  headless pid {pid}; transcript {tr}")
         else:
             ps1 = t.dir / "launch.ps1"     # a script, not an inline command: wt splits command lines on ';'

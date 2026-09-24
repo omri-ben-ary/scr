@@ -27,6 +27,7 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
     d = t.dir
     ts = now_iso()
     msgs: list[str] = []
+    ok = True
     if kind == "help":
         with open(d / "log.md", "a", encoding="utf-8") as f:
             f.write(f"\n- {ts} [steward] ({actor}, via UI) {answer}\n")
@@ -44,20 +45,36 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
     elif kind == "gate":
         target = GATE_TARGETS.get(answer.split()[0].lower()) if answer.strip() else None
         if target:
+            # T-0129: `ok` means the record moved. Every `task set` is checked; the first non-zero stops
+            # the chain, its refusal goes to `log`, and the Concierge is not started.
+            steps: list[tuple[str, ...]] = []
             if t.status == "escalated":
-                scr_cmd(root, actor, "task", "set", tid, "omri_queue", "--quiet")
-            msgs.append(scr_cmd(root, actor, "task", "set", tid, target, "--note", f"Gate decision via UI: {answer[:200]}", "--quiet")[1])
+                steps.append(("omri_queue",))
+            override: tuple[str, ...] = ()
+            if target == "accepted" and t.status == "submitted" and actor == "omri":
+                # T-0081's guard refuses submitted -> accepted without an accepting review.md. Omri's
+                # gate click is the explicit override T-0081 designed: --force-accept, the answer as the
+                # note, and an accept_override event. Any other actor gets the refusal.
+                override = ("--force-accept",)
+            steps.append((target, "--note", f"Gate decision via UI: {answer[:200]}", *override))
             if target == "triaged":
-                scr_cmd(root, actor, "task", "set", tid, "ready", "--note", f"returned by Omri: {answer[:200]}", "--quiet")
+                steps.append(("ready", "--note", f"returned by Omri: {answer[:200]}"))
+            for step in steps:
+                rc, text = scr_cmd(root, actor, "task", "set", tid, *step, "--quiet")
+                if text:
+                    msgs.append(text)
+                if rc != 0:
+                    ok = False
+                    break
         else:
             with open(d / "log.md", "a", encoding="utf-8") as f:
                 f.write(f"\n- {ts} [{actor}] gate note: {answer}\n")
             msgs.append(scr_cmd(root, actor, "event", "system", "--name", "gate_note", "--task", tid, "--note", answer[:500], "--quiet")[1])
     else:
         raise RepoError(f"unknown answer kind {kind}")
-    if concierge and kind != "help":
+    if ok and concierge and kind != "help":
         start_concierge(root, tid, answer)
-    return {"ok": True, "log": [m for m in msgs if m]}
+    return {"ok": ok, "log": [m for m in msgs if m]}
 
 
 def start_concierge(root: Path, tid: str, answer: str) -> int | None:

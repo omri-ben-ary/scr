@@ -14,12 +14,13 @@ You follow one task from `dispatched` to `merged`, `returned`, or `escalated`. Y
 
 ## On submission (`report.md` written)
 - `scr task set <id> submitted`.
-- Run the workload's `done_when_checker` on the scope decls and `statement_diff` against main. Fill review.md.
+- Run the workload's `done_when_checker` on the scope decls and `statement_diff`, both with `--fetch` and their default base (the merge-base of `origin/<main_branch>` and `HEAD`) — never `--base <main_branch>`: the local ref is stale and names every file merged since the branch point as out of scope (T-0111). Fill review.md — the mechanical table (one row per check you ran, with its result) and the `## Decision` section (`accepted`, `returned (feedback below)` or `escalated (Gate N, reason)`, replacing the placeholder line) — BEFORE any `accepted` or `land`. The review is the record of why the task may merge; it is written first, not after. `scr task set <id> accepted` and `scr land <id>` refuse a `submitted` task whose review.md has no Decision, decides something other than `accepted`, or has an empty mechanical table (T-0081: T-0021 was merged on the blank template). Only Omri can go past that, with `--actor omri task set <id> accepted --force-accept --note <why>`, which leaves an `accept_override` event.
 - Route:
   - all mechanical pass, statement diff empty, judgment lines pass → `scr task set <id> accepted`; rebase on main, rebuild, `scr task set <id> merged --tokens <n>`; merge the branch; retire the worktree (see "Retiring the worktree").
   - checks fail and attempts remain → `scr task set <id> returned --note "<feedback>"` (then `ready` so it can be redispatched).
   - statement diff non-empty, or attempts exhausted, or report has `omri:decide` → `scr task set <id> escalated` then `omri_queue`; write a one-screen brief at the top of review.md: what changed, `scr graph impact <id> --decls <changed>` output (the blast radius), your recommendation.
 - Copy the report's `informs` proposals in as edges: `scr edge add informs <from> <id> --weight w --reason "..."`.
+- A task that cannot progress is escalated, never held. A `submitted` task whose review has written no Decision after `limits.yaml: review_stale_hours`, or a running task whose blocking `HELP` line nobody answered after `help_stale_hours`, is `escalated` by the watcher as `steward:<id>` with one `slot_freed` event (the card names the one action for Omri and the transcript). An escalation is a queue item for Omri, and its slot goes to the next ready task on the same tick — `escalated` and `returned` never count against the cap. Never leave a task `submitted` waiting for a review that will not come: decide, or escalate with the brief above. The worktree and branch stay; say in the note where the work is.
 - The scriptorium tree journals itself after every `scr` call (journal mode); never run git in that folder.
 
 ## Retiring the worktree

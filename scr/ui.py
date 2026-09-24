@@ -113,10 +113,26 @@ _CHORE_CACHE: dict = {"ts": 0.0, "items": []}
 
 # System events that become a "needs you" card, one per (task, name). `stale` is a live condition: its card
 # shows only while the watcher's `stale:<task>` flag is set (idle >= stale_minutes, session alive) and
-# clears by itself when the scriber writes again; `session_dead` stays until dismissed (T-0063).
-ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale"}
-ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent"}
+# clears by itself when the scriber writes again; `session_dead` stays until dismissed (T-0063). `land_failed`
+# is live too (T-0146): its card shows only while the task is still `accepted`, and counts only the events since
+# the task last became accepted, so a task returned for a rebase (or merged) drops the card without an ack.
+ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale", "slot_freed",
+                "land_failed"}
+ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent",
+                "slot_freed": "escalated: a stuck task left its slot — one action for you",
+                "land_failed": "landing failed — code accepted but not on main"}
 RUNNING = {"dispatched", "in_progress", "checkpoint"}
+
+
+def land_failed_next(tid: str, note: str) -> str:
+    """The one action for a land_failed card, by the reason in the event note (the watcher's NEEDS-YOU line says
+    the same): a conflict is fixed on the branch, out-of-scope paths by a wider scope or a revert."""
+    ret = f"or return it for a rebase: scr --actor omri task set {tid} returned"
+    if "(scope)" in note:
+        return f"Next: widen {tid}'s scope.files or revert the out-of-scope commit on task/{tid} (either retries the landing); {ret}"
+    if "(conflict)" in note:
+        return f"Next: merge main into task/{tid}, resolve the conflict and commit (a new commit retries the landing); {ret}"
+    return f"Next: fix task/{tid} (a new commit retries the landing) or merge it into main by hand; {ret}"
 
 
 def _watch_flags(root: Path) -> set[str]:
@@ -137,13 +153,66 @@ def invalidate_chores() -> None:
     _CHORE_CACHE["ts"] = 0.0
 
 
-def state(root: Path) -> dict:
-    store = Store(root)
-    tasks = store.load_all()
+CARD_ORDER = {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4, "watch": 5}
+
+# The watcher's NEEDS-YOU list (scr/watch.py publish_needs, T-0173): one `watch` card per line while the watcher still
+# raises it. A line whose condition already has its own card is not shown twice; the kind is its key's first part.
+WATCH_NEEDS_FILE = ".scr/watch.needs.json"
+WATCH_OWN_CARD = {"help": "the help:<id>:<line> card", "land_failed": "the land_failed system card (T-0146)",
+                  "wall": "the budget_wall system card", "dead": "the session_dead system card",
+                  "stale": "the stale system card", "paused": "the page's paused banner"}
+WATCH_TITLES = {"checkpoint_failed": "checkpoint commit failed — work only in the worktree",
+                "auto_land_failed": "auto-land failed — code accepted but not merged",
+                "retire_refused": "merged, but its worktree could not be retired",
+                "dispatch_timeout_unset": "dispatch timed out and could not be set ready",
+                "escalate_failed": "stuck, and the watcher could not escalate it",
+                "decision_unreadable": "review.md Decision unreadable — apply it by hand",
+                "decision_stale": "submitted again with the old review — a fresh review is needed",
+                "decision_unapplied": "review.md Decision could not be applied"}
+WATCH_STALE_TICKS = 2          # the list is dropped once it is older than this many tick intervals (a stopped watcher)
+
+
+def acked_keys(root: Path) -> set[str]:
+    return set(_read(root / "reports" / "ui.acks.txt").split())
+
+
+def watch_cards(root: Path, tasks: dict, acked: set[str], now: datetime | None = None) -> list[dict]:
+    """One `watch` card per line of the watcher's last published needs list. Live: a line the next tick does not raise
+    is gone from the file and so from the page. The key `need:<line key>:<since>` holds across the ticks that raise
+    the line, so `scr ack` and the push dedup (`notified:<key>`) work as for other cards; a later episode of the same
+    condition is a new card. A list older than WATCH_STALE_TICKS tick intervals is ignored: the watcher stopped."""
+    try:
+        doc = json.loads(_read(root / WATCH_NEEDS_FILE) or "{}")
+        ts = datetime.fromisoformat(doc["ts"].replace("Z", "+00:00"))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return []
+    now = now or datetime.now(timezone.utc)
+    if (now - ts).total_seconds() > WATCH_STALE_TICKS * 60 * float(doc.get("interval_min") or 30):
+        return []
+    cards = []
+    for n in doc.get("needs") or []:
+        key = str(n.get("key") or "")
+        kind = key.split(":", 1)[0]
+        if not key or kind in WATCH_OWN_CARD:
+            continue
+        since = str(n.get("since") or doc["ts"])
+        ck = f"need:{key}:{re.sub(r'[^0-9TZ]', '', since)}"
+        if ck in acked:
+            continue
+        tid = n.get("task") or "-"
+        cards.append({"key": ck, "h": ck, "id": tid, "kind": "watch", "name": kind, "type": "watch",
+                      "title": WATCH_TITLES.get(kind, f"watcher: {kind}"), "status": tasks[tid].status if tid in tasks else None,
+                      "text": n.get("text") or "", "options": [], "ts": since})
+    return cards
+
+
+def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
+    """The needs-you cards, in page order: what the page shows and what the watcher pushes out of band
+    (scr/notify.py, T-0090) — one source for both. Each card has a `key` (what `scr ack` takes)."""
+    if tasks is None:
+        tasks = Store(root).load_all()
     g = Graph.build(tasks)
-    wl_name, wl = _workload(root, store)
-    limits = store.config("limits") or {}
-    acked = set(_read(root / "reports" / "ui.acks.txt").split())
+    acked = acked_keys(root)
     needs: list[dict] = []
     for t in tasks.values():
         rec, d = t.rec, t.dir
@@ -171,7 +240,9 @@ def state(root: Path) -> dict:
                 group_acked[(parts[1], parts[2])] = max(group_acked.get((parts[1], parts[2]), ""), parts[3])
     groups: dict[tuple[str, str], dict] = {}
     flags = _watch_flags(root)
-    for e in _events(root, None, 2000):
+    recent = _events(root, None, 2000)
+    accepted_seq = {e.get("task") or "-": e.get("seq") or 0 for e in recent if e.get("kind") == "state" and e.get("to") == "accepted"}
+    for e in recent:
         age = _age_h(e.get("ts"))
         if age is not None and age > 24 * 7:
             continue
@@ -182,6 +253,8 @@ def state(root: Path) -> dict:
             continue
         if name == "stale" and not (f"stale:{task}" in flags and task in tasks and tasks[task].status in RUNNING):
             continue
+        if name == "land_failed" and not (task in tasks and tasks[task].status == "accepted" and (e.get("seq") or 0) > accepted_seq.get(task, -1)):
+            continue
         grp = groups.setdefault((task, name), {"id": task, "kind": "system", "name": name, "title": ALARM_TITLES.get(name, name), "type": "system",
                                                "options": [], "ts": ts, "count": 0, "notes": []})
         grp["count"] += 1
@@ -191,10 +264,13 @@ def state(root: Path) -> dict:
         notes = grp.pop("notes")
         shown = notes[-8:]
         grp["text"] = "\n".join(shown) + (f"\n… and {len(notes) - len(shown)} earlier" if len(notes) > len(shown) else "")
+        if name == "land_failed":
+            grp["text"] += "\n" + land_failed_next(task, notes[-1])
         if grp["count"] > 1:
             grp["title"] = f"{grp['title']} ×{grp['count']}"
         grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"
         needs.append(grp)
+    needs += watch_cards(root, tasks, acked)
     needs += chore_cards(root, acked)
     from . import hotfix as _hx
     hx = _hx.status(root)
@@ -203,6 +279,15 @@ def state(root: Path) -> dict:
                          "text": "A tooling fix is in progress in the live checkout. Files so far: " + (", ".join(hx["files"]) or "(none yet)") +
                                  ". When the fix is done, close it: the tests run, a report is written and the Steward reviews it.",
                          "options": []})
+    return sorted(needs, key=lambda x: CARD_ORDER[x["type"]])
+
+
+def state(root: Path) -> dict:
+    store = Store(root)
+    tasks = store.load_all()
+    wl_name, wl = _workload(root, store)
+    limits = store.config("limits") or {}
+    needs = needs_cards(root, tasks)
     running = [{"id": t.id, "status": t.status, "title": t.rec.get("title", ""), "kind": t.rec.get("kind"),
                 "attempts": t.rec.get("attempts", 0), "tokens": t.rec.get("tokens_used", 0), "started": _started(root, t.id)}
                for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted", "accepted"}]
@@ -233,7 +318,7 @@ def state(root: Path) -> dict:
         "journal": {"head": head, "dirty": len(gj.dirty()) if head else 0, "last_failure": last_failure(root)},
         "last_watch_tick": last_tick, "pid": os.getpid(), "paused": paused(root),
         "watcher_running": bool(__import__("scr.run", fromlist=["pids_matching"]).pids_matching(__import__("scr.admin", fromlist=["WATCH_PATTERN"]).WATCH_PATTERN)),
-        "needs": sorted(needs, key=lambda x: {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4}[x["type"]]),
+        "needs": needs,
         "running": running, "ready": ready, "recent": recent,
         "jobs": JOBS.list(),
         "counts": {s: sum(1 for t in tasks.values() if t.status == s) for s in
@@ -344,8 +429,12 @@ def _set_paused(root: Path, on: bool) -> dict:
 
 
 def _quit(root: Path) -> dict:
-    from .admin import stop
+    from .admin import stop, stop_failed
     lines = stop(root, "watch")
+    if stop_failed(lines):                                       # T-0150: a surviving watcher must not cost Omri the UI
+        return {"ok": False, "output": "\n".join(lines + [
+            "UI stays up: the watcher pid above is still alive. Retry Quit, run `scr admin stop watch`, "
+            "or end the pid in Task Manager"])}
     threading.Timer(1.0, lambda: os._exit(0)).start()      # the child exits 0 -> the supervisor stops too
     return {"ok": True, "output": "\n".join(lines + ["UI shutting down; start it again from the Scriptorium shortcut"])}
 

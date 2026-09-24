@@ -103,10 +103,58 @@ def test_verify_clean_after_seed(repo: Path):
     assert "0 errors" in r.stdout
 
 
+def _set_workload(root: Path, tid: str, key: str | None):
+    """Edit a record's `workload:` (None deletes the key) and re-snapshot so only the new check fires."""
+    t = Store(root).get(tid)
+    if key is None:
+        t.rec.pop("workload", None)
+    else:
+        t.rec["workload"] = key
+    t.save()
+    scr(root, "--quiet", "snapshot")
+
+
+def test_verify_warns_on_unregistered_workload(repo: Path):
+    seed(repo)
+    before = State(repo).verify()
+    first = next(iter(Store(repo).config("workloads")))
+    _set_workload(repo, "T-0002", "nosuch")
+    v = State(repo).verify()
+    hits = [w for w in v["warnings"] if w.startswith("T-0002:") and "nosuch" in w]
+    assert hits and f"'{first}'" in hits[0]
+    assert v["errors"] == before["errors"]
+
+
+def test_verify_warns_on_missing_workload(repo: Path):
+    seed(repo)
+    before = State(repo).verify()
+    _set_workload(repo, "T-0003", None)
+    v = State(repo).verify()
+    assert any(w.startswith("T-0003:") and "workload" in w and "not registered" in w for w in v["warnings"])
+    assert v["errors"] == before["errors"]
+    # a merged record is closed: its workload no longer resolves anything, so no warning
+    for s in ("dispatched", "in_progress", "submitted"):
+        scr(repo, "--quiet", "task", "set", "T-0002", s)
+    review = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    review = review.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted").replace("|---|---|\n", "|---|---|\n| build | ok |\n")
+    (Store(repo).get("T-0002").dir / "review.md").write_text(review, encoding="utf-8")
+    scr(repo, "--quiet", "task", "set", "T-0002", "accepted")
+    scr(repo, "--quiet", "task", "set", "T-0002", "merged")
+    _set_workload(repo, "T-0002", "nosuch")
+    v = State(repo).verify()
+    assert not any(w.startswith("T-0002:") and "workload" in w for w in v["warnings"])
+    assert not v["errors"]
+
+
 def test_merge_cascades_to_ready(repo: Path):
     seed(repo)
-    for s in ("dispatched", "in_progress", "submitted", "accepted"):
+    for s in ("dispatched", "in_progress", "submitted"):
         scr(repo, "--quiet", "task", "set", "T-0002", s)
+    # T-0081: submitted -> accepted needs review.md to decide `accepted` with a mechanical row
+    review = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    review = review.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted").replace("|---|---|\n", "|---|---|\n| build | ok |\n")
+    (Store(repo).get("T-0002").dir / "review.md").write_text(review, encoding="utf-8")
+    scr(repo, "--quiet", "task", "set", "T-0002", "accepted")
     scr(repo, "--quiet", "task", "set", "T-0002", "merged", "--tokens", "1000")
     t3 = Store(repo).get("T-0003")
     assert t3.status == "ready"
@@ -149,6 +197,95 @@ def test_tamper_docs_detected(repo: Path):
     assert r.returncode == 1 and "task docs changed" in r.stdout
     scr(repo, "refresh", "--quiet")           # a refresh re-blesses the docs (they are prose, not state)
     assert "0 errors" in scr(repo, "verify").stdout
+
+
+# ---- line endings (T-0100) ------------------------------------------------------
+def _write_eol(p: Path, text: str, eol: str) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(text.replace("\n", eol).encode("utf-8"))
+
+
+def test_docs_and_config_hash_ignore_crlf(tmp_path: Path):
+    from scr.store import DOC_FILES, Task
+    docs = {f: f"# {f}\n\nline one\nline two\n" for f in DOC_FILES}
+    cfg = {"a.yaml": "x: 1\ny: [1, 2]\n", "b.yaml": "z: two\n"}
+    roots = {}
+    for eol in ("\n", "\r\n"):
+        root = tmp_path / ("crlf" if eol == "\r\n" else "lf")
+        for f, text in docs.items():
+            _write_eol(root / "tasks" / "T-0001-x" / f, text, eol)
+        for f, text in cfg.items():
+            _write_eol(root / "config" / f, text, eol)
+        roots[eol] = root
+    lf, crlf = roots["\n"], roots["\r\n"]
+    assert b"\r\n" in (crlf / "config" / "a.yaml").read_bytes()
+    t_lf, t_crlf = Task(lf / "tasks" / "T-0001-x", {"id": "T-0001"}), Task(crlf / "tasks" / "T-0001-x", {"id": "T-0001"})
+    assert t_lf.docs_hash() == t_crlf.docs_hash()
+    assert Store(lf).config_hash() == Store(crlf).config_hash()
+    # a real content change still changes both
+    before_docs, before_cfg = t_crlf.docs_hash(), Store(crlf).config_hash()
+    _write_eol(crlf / "tasks" / "T-0001-x" / "spec.md", "# spec.md\n\nline one\nline 2\n", "\r\n")
+    _write_eol(crlf / "config" / "b.yaml", "z: three\n", "\r\n")
+    assert t_crlf.docs_hash() != before_docs
+    assert Store(crlf).config_hash() != before_cfg
+
+
+def test_verify_clean_after_crlf_rewrite(repo: Path):
+    seed(repo)
+    texts = [p for sub in ("tasks", "config") for p in (repo / sub).rglob("*") if p.is_file() and p.suffix in (".md", ".yaml")]
+    assert len(texts) > 10
+    # write_text emits CRLF on Windows, so make the snapshotted tree LF first; the CRLF rewrite must change bytes
+    for p in texts:
+        p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
+    scr(repo, "refresh", "--quiet")
+    assert "0 errors" in scr(repo, "verify").stdout
+    for p in texts:
+        b = p.read_bytes()
+        p.write_bytes(b.replace(b"\n", b"\r\n"))
+        assert p.read_bytes() != b or b"\n" not in b
+    r = State(repo).verify()
+    assert r["errors"] == [], r["errors"]
+
+
+def autocrlf_clone(tmp_path: Path, gitattributes: bytes) -> Path:
+    """T-0151 in miniature: a one-task scriptorium tree, written LF, carrying `gitattributes` as its
+    .gitattributes, committed and then cloned with core.autocrlf=true. Returns the clone."""
+    src = tmp_path / "src"
+    src.mkdir()
+    for d in ("config", "templates", "agents"):
+        shutil.copytree(REPO / d, src / d)
+    scr(src, "init", "--quiet")
+    scr(src, "--quiet", "task", "new", "A", "--id", "T-0001", "--origin", "omri")
+    for p in (p for sub in ("tasks", "config") for p in (src / sub).rglob("*") if p.is_file()):
+        p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
+    scr(src, "refresh", "--quiet")
+    (src / ".gitattributes").write_bytes(gitattributes)
+    (src / ".gitignore").write_text(".scr/\n__pycache__/\n", encoding="utf-8")
+    git(src, "init", "-q", "-b", "main")
+    git(src, "-c", "core.autocrlf=false", "add", "-A")
+    git(src, "commit", "-q", "-m", "seed")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", "-c", "core.autocrlf=true", str(src), str(clone))
+    return clone
+
+
+def test_autocrlf_clone_checks_out_lf_and_verifies(tmp_path: Path):
+    """T-0177: the root .gitattributes (`* text=auto eol=lf`, T-0100) keeps a core.autocrlf=true checkout
+    of tasks/ and config/ LF, and a read-only verify of that checkout is clean and leaves it clean."""
+    if shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+    clone = autocrlf_clone(tmp_path, (REPO / ".gitattributes").read_bytes())
+    assert git(clone, "config", "core.autocrlf") == "true"
+    eol = [line.split() for line in git(clone, "ls-files", "--eol", "--", "tasks", "config").splitlines()]
+    assert any(f[-1].startswith("tasks/") and f[-1].endswith("/task.yaml") for f in eol)
+    assert any(f[-1].startswith("tasks/") and f[-1].endswith("/spec.md") for f in eol)
+    assert any(f[-1].startswith("config/") and f[-1].endswith(".yaml") for f in eol)
+    crlf = [f[-1] for f in eol if f[1] == "w/crlf"]
+    assert crlf == [], f"core.autocrlf=true checkout has CRLF files: {crlf[:5]}"
+    env = {**os.environ, "SCRIPTORIUM_ROOT": str(clone), "PYTHONPATH": str(REPO), "SCR_NO_JOURNAL": "1"}
+    r = subprocess.run([sys.executable, "-m", "scr", "verify"], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r.returncode == 0 and " 0 errors" in r.stdout, r.stdout + r.stderr
+    assert git(clone, "status", "--porcelain") == ""
 
 
 def test_tamper_events_detected(repo: Path):
@@ -343,3 +480,26 @@ def test_watcher_journal_push_comes_from_config(tmp_path: Path):
     wl["scriptorium"]["push"] = False
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
     assert not Watcher(root, quiet=True).push_journal and Watcher(root, quiet=True, push=True).push_journal
+
+
+def test_ui_page_has_no_inbox_form_or_done_list():
+    """T-0086: the left panel no longer carries the 'Add an idea to the Inbox' form or the 'Done' list.
+    Reads the file scr.ui serves (UI_DIR/index.html) so a moved UI_DIR would still be checked."""
+    from scr.ui import UI_DIR
+    page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    for needle in ("inboxForm", "inboxText", 'id="done"', "doneN", "renderDone", "Add an idea to the Inbox", "details.done"):
+        assert needle not in page, needle
+    assert 'id="needs"' in page  # the rest of the panel is untouched
+    assert "planTasks" in page  # the add-task button stays
+
+
+def test_ui_quit_button_waits_for_the_quit_job():
+    """T-0155: Quit shows a failed quit job's output and keeps the page; the shut-down screen is not on a blind timer."""
+    import re
+    from scr.ui import UI_DIR
+    page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    start = page.index("$('#quitBtn').onclick")
+    handler = page[start:page.index("\n};", start) + 3]
+    assert "failed" in handler and "output" in handler
+    assert page.count("Scriptorium is shut down") == 1
+    assert not re.search(r"await start\(\{ kind: 'quit' \}[^;]*\);\s*setTimeout\(", handler)

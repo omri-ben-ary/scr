@@ -182,12 +182,22 @@ def _pattern(p: str) -> str:
     return p
 
 
+STOP_FAILED = "FAILED"      # the prefix of a `stop` line whose kill was refused; read it only through stop_failed
+
+
 def stop(root: Path, what: str) -> list[str]:
     pat = {"ui": UI_PATTERN, "watch": WATCH_PATTERN}[what]
     out = []
     for pid in pids_matching(_pattern(pat)):
-        kill(pid); out.append(f"stopped {what} pid {pid}")
+        # T-0148: kill's return is truthful (T-0124); a refused stop must not read as made
+        out.append(f"stopped {what} pid {pid}" if kill(pid) else
+                   f"{STOP_FAILED} to stop {what} pid {pid} (it may still be running; stop it by hand)")
     return out or [f"no {what} running"]
+
+
+def stop_failed(lines: list[str]) -> bool:
+    """True when a `stop` line reports a process that survived (T-0156: shared by ui._quit and `scr up --stop`)."""
+    return any(l.startswith(STOP_FAILED) for l in lines)
 
 
 def start(root: Path, what: str, port: int = 8765) -> list[str]:

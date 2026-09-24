@@ -105,18 +105,35 @@ class Git:
         return self.out("rev-parse", "--abbrev-ref", "HEAD")
 
     def dirty(self, ignore_noise: bool = True) -> list[str]:
-        """Changed/untracked paths (porcelain), noise filtered."""
-        r = self.run("status", "--porcelain", "--untracked-files=all")
-        if not r.ok:
+        """Changed/untracked paths (porcelain), noise filtered, exact: read NUL-separated (`-z`) straight from
+        the process, not through `run`, which strips the output — a modified tracked file on the FIRST line
+        (` M QuantumInsertion/A.lean`) lost its status column and came back as `uantumInsertion/A.lean`
+        (T-0082's report, item 4). A staged rename/copy lists both its new and its old path."""
+        try:
+            r = subprocess.run(self._base() + ["status", "--porcelain", "-z", "--untracked-files=all"], cwd=self.cwd,
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+        except (OSError, subprocess.SubprocessError):
             return []
-        rows = []
-        for line in r.out.splitlines():
-            if len(line) < 4:
+        if r.returncode != 0:
+            return []
+        rows: list[str] = []
+        fields = r.stdout.split("\0")
+        i = 0
+        while i < len(fields):
+            entry = fields[i]
+            i += 1
+            if len(entry) < 4:
                 continue
-            path = line[3:].strip().strip('"').replace("\\", "/")
-            if ignore_noise and any(n in "/" + path for n in NOISE_RE):
-                continue
-            rows.append(path)
+            paths = [entry[3:]]
+            if entry[0] in "RC" and i < len(fields):    # `R  new\0old`: the original path is the next field
+                paths.append(fields[i])
+                i += 1
+            for path in paths:
+                path = path.replace("\\", "/")
+                if not path or (ignore_noise and any(n in "/" + path for n in NOISE_RE)):
+                    continue
+                if path not in rows:
+                    rows.append(path)
         return rows
 
     def is_ancestor(self, a: str, b: str) -> bool:
@@ -147,6 +164,36 @@ class Git:
         if exclude:
             noise = [e.replace(":(exclude)", ":(glob)") for e in exclude]
             self.run("reset", "-q", "--", *noise, *[n.replace(":(glob)", ":(glob)**/") for n in noise if not n.startswith(":(glob)**/")])
+        return self._commit_staged(message)
+
+    def commit_paths(self, message: str, paths: list[str]) -> str | None:
+        """Stage exactly `paths` — their additions, modifications and deletions, nothing else — and commit
+        if anything is staged. Returns the sha or None. The index is reset to HEAD first, so a stray `git add`
+        of some other path never rides along; the working tree is untouched. The pathspec goes through a
+        NUL-separated file inside .git (`--pathspec-from-file`, every entry `:(literal)`): no command-line
+        length limit, and no glob magic in a scriber's file names. T-0079: `checkpoint_commit` and `land`
+        stage the in-scope and the out-of-scope parts of a worktree as two commits with this."""
+        paths = [p.replace("\\", "/") for p in dict.fromkeys(paths) if p and p.strip()]
+        if not paths:
+            return None
+        reset = self.run("reset", "-q")
+        if not reset.ok and "unknown revision" not in reset.out:   # an unborn HEAD has nothing to reset to
+            raise GitError(f"git reset: {reset.out}")
+        spec_file = Path(self.git_dir()) / "SCR_PATHSPEC"          # inside .git: never part of the tree
+        spec_file.write_text("\0".join(":(literal)" + p for p in paths) + "\0", encoding="utf-8")
+        try:
+            add = self.run("add", "-A", "--pathspec-from-file=" + str(spec_file), "--pathspec-file-nul")
+        finally:
+            try:
+                spec_file.unlink()
+            except OSError:
+                pass
+        if not add.ok:
+            raise GitError(f"git add: {add.out}")
+        return self._commit_staged(message)
+
+    def _commit_staged(self, message: str) -> str | None:
+        """Commit the index if it differs from HEAD (the message via a file inside .git). Sha or None."""
         if not self.run("diff", "--cached", "--quiet").ok:      # rc 1 = something staged
             msg_file = Path(self.git_dir()) / "SCR_COMMIT_MSG"   # inside .git: never part of the tree
             msg_file.write_text(message, encoding="utf-8")
