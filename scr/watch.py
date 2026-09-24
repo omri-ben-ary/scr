@@ -48,7 +48,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import LOG_PATHS, checkpoint, is_scriptorium_task, land, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
+from .ops import LOG_PATHS, checkpoint, is_scriptorium_task, land, land_any, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
 from .run import kill, pid_alive, scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -735,8 +735,9 @@ class Watcher:
         return True
 
     def land_scriptorium_task(self, t) -> bool:
-        """accepted scriptorium task -> merged (T-0078). No worktree: a hotfix made in the checkout, whose
-        commits the journal already put on the trunk — merged without a merge, as before. A spawned
+        """accepted scriptorium task -> merged (T-0078). No worktree: ops.land_any decides, as for `scr land`
+        (T-0158) — a hotfix made in the checkout, whose commits the journal already put on the trunk, is merged
+        without a merge; a task/<id> with commits not on the trunk is a lost worktree, a landing failure. A spawned
         worktree: ops.land_scriptorium (commit, merge the trunk in, tests, merge into the trunk), then
         retire, like any other workload. A failure (conflict, failing tests, checkout off the trunk) leaves
         the task accepted, logs the reason, raises ONE land_failed event per task-branch tip and a NEEDS-YOU
@@ -744,17 +745,30 @@ class Watcher:
         tip would fail the same way — or when the branch reached the trunk by hand, which is then recorded."""
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        if not wt.exists():
-            self.scr(f"steward:{t.id}", "task", "set", t.id, "merged", "--note", "tooling task: change already on main (journal)", "--quiet")
-            self.log(f"{t.id} tooling task (no worktree) -> merged")
-            return True
-        g, mg = Git(wt), Git(self.root)
         # The retry key is the branch tip PLUS the record's scope (T-0079): a landing refused for out-of-scope
         # paths is retried when the Steward widens scope.files / scope.mission, not only on a new commit.
         sc = t.rec.get("scope") or {}
         scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
-        tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
+        if not wt.exists():
+            # T-0158: ops.land_any owns the no-worktree landing (note, actor, cascade, events): a checkout hotfix
+            # is recorded merged, a task/<id> with commits not on the trunk is refused (lost_worktree).
+            try:
+                res = land_any(self.root, t.id)
+            except Exception as e:  # noqa: BLE001
+                res = {"ok": False, "reason": "error", "out": [f"FAILED (error): {e}"], "sha": None, "tip": None}
+            for line in res["out"]:
+                self.log(f"  land: {line}")
+            if not res["ok"]:
+                return self.land_failed(t, res, failed, scope_sig)
+            for k in failed:
+                self.unflag(k)
+            from .cli import refresh            # local import: cli imports this module
+            refresh(self.root, quiet=True)      # the queues/STATE.json refresh the old `scr task set` subprocess did
+            self.log(f"{t.id} tooling task (no worktree) -> merged")
+            return True
+        g, mg = Git(wt), Git(self.root)
+        tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
             self.needs.append(f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand")
             self.unflag(f"land:{t.id}")
@@ -767,15 +781,7 @@ class Watcher:
         for line in res["out"]:
             self.log(f"  land: {line}")
         if not res["ok"]:
-            why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
-            self.needs.append(f"{t.id} landing failed ({res['reason']}) — {why[:200]}; see reports/steward_watch.log")
-            key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
-            for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
-                self.unflag(k)
-            if self.flag(key):
-                self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
-            self.unflag(f"land:{t.id}")
-            return False
+            return self.land_failed(t, res, failed, scope_sig)
         for k in failed:
             self.unflag(k)
         try:
@@ -787,6 +793,20 @@ class Watcher:
         if not r["ok"]:
             self.needs.append(f"{t.id} merged; worktree retire refused ({r['code']}) — see log")
         return True
+
+    def land_failed(self, t, res: dict, failed: set, scope_sig: str) -> bool:
+        """A refused landing (land_scriptorium or the no-worktree land_any): the task stays accepted, a NEEDS-YOU
+        line every tick, ONE land_failed event per branch tip (+ scope). Returns False."""
+        why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
+        nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
+        self.needs.append(f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log")
+        key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
+        for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
+            self.unflag(k)
+        if self.flag(key):
+            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
+        self.unflag(f"land:{t.id}")
+        return False
 
     def start_review(self, t) -> None:
         wl = workload_for(self.root, self.store, t)

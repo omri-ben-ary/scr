@@ -718,7 +718,7 @@ def test_scr_land_hotfix_no_worktree_is_merged_like_the_watcher(tmp_path: Path, 
     st = _merged_states(root, "T-0008")
     assert len(st) == 1 and "already on main (journal)" in st[0]["note"], st
     assert st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0008" and st[0]["from"] == "accepted", st
-    assert f'"{ops.HOTFIX_MERGED_NOTE}"' in (REPO / "scr" / "watch.py").read_text(encoding="utf-8")   # same wording as the watcher
+    assert "change already on main (journal)" not in (REPO / "scr" / "watch.py").read_text(encoding="utf-8")   # T-0158: one owner, ops
     assert Store(root).get("T-0007").status == "accepted"                                       # the spawned task is not touched
 
 
@@ -742,6 +742,92 @@ def test_scr_land_hotfix_no_worktree_submitted_still_refuses(tmp_path: Path, mon
         r = sscr(root, "--actor", "omri", "land", "T-0008", *extra, check=False)
         assert r.returncode == 2 and "T-0008 is submitted, not accepted — write the Decision first (T-0081)" in r.stderr, r.stdout + r.stderr
     assert Store(root).get("T-0008").status == "submitted" and not _merged_states(root, "T-0008")
+
+
+# ---- T-0158: one owner for the no-worktree landing; a lost worktree is refused, not merged ----------------
+# land_any and the watcher both recorded "no worktree" as a merged hotfix. A spawned task whose worktree was
+# removed while task/<id> still carries commits not on the trunk lost its work that way; now ops.land_no_worktree
+# decides for both callers: merged only with no task/<id> or task/<id> already on the trunk, else lost_worktree.
+def _lost_worktree(tmp_path: Path, monkeypatch, ahead: bool = True) -> tuple[Path, str]:
+    """_land_world's T-0007 with (ahead) one commit on task/T-0007 that is not on main, then its worktree
+    removed. Returns (root, main sha)."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    if ahead:
+        (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+        sgit(wt, "commit", "-q", "-am", "the scriber's work")
+    sgit(root, "worktree", "remove", "--force", str(wt))
+    assert not wt.exists() and sgit(root, "rev-parse", "--verify", "task/T-0007")
+    on_main = subprocess.run(["git", "merge-base", "--is-ancestor", "task/T-0007", "main"], cwd=root).returncode == 0
+    assert on_main is not ahead
+    return root, sgit(root, "rev-parse", "main")
+
+
+def _no_merge(root: Path, main_before: str) -> None:
+    assert Store(root).get("T-0007").status == "accepted" and not _merged_states(root, "T-0007")
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
+
+
+def test_scr_land_lost_worktree_branch_not_on_main_is_refused(tmp_path: Path, monkeypatch):
+    """`scr land T-0007` with the worktree gone and task/T-0007 ahead of main: rc 1, the reason and the one
+    next action, the task still accepted, no merged event, the trunk unmoved. `--dry-run` says the same."""
+    root, main_before = _lost_worktree(tmp_path, monkeypatch)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--dry-run", check=False)
+    assert r.returncode == 1 and "would refuse" in r.stdout and "not on main" in r.stdout and "dry run" in r.stdout, r.stdout + r.stderr
+    _no_merge(root, main_before)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", check=False)
+    assert r.returncode == 1 and "not on main" in r.stdout, r.stdout + r.stderr
+    assert "FAILED (lost_worktree): worktree missing, branch task/T-0007 not on main" in r.stdout, r.stdout
+    nxt = [l for l in r.stdout.splitlines() if "NOT landed (lost_worktree)" in l]
+    assert len(nxt) == 1 and "git worktree add" in nxt[0] and "task/T-0007" in nxt[0] and "`scr land T-0007` again" in nxt[0], r.stdout
+    _no_merge(root, main_before)
+
+
+def test_watcher_lost_worktree_branch_not_on_main_stays_accepted_one_land_failed(tmp_path: Path, monkeypatch):
+    """Same world, the watcher: accepted after the tick, ONE land_failed event, a NEEDS-YOU line naming the
+    reason; the second tick adds a NEEDS-YOU line but no event and still does not record merged."""
+    root, main_before = _lost_worktree(tmp_path, monkeypatch)
+    for n in (1, 2):
+        res = _tick(root)
+        _no_merge(root, main_before)
+        ev = _events(root, "land_failed", "T-0007")
+        assert len(ev) == 1 and "lost_worktree" in ev[0]["note"] and "not on main" in ev[0]["note"], (n, ev)
+        need = [l for l in res["needs"] if l.startswith("T-0007 landing failed (lost_worktree)")]
+        assert len(need) == 1 and "git worktree add" in need[0], (n, res["needs"])
+
+
+def test_scr_land_no_worktree_branch_already_on_main_is_merged(tmp_path: Path, monkeypatch):
+    """task/T-0007 exists but is contained in main (nothing to lose): `scr land` records it merged exactly as
+    a hotfix — HOTFIX_MERGED_NOTE, actor steward:T-0007, no merge, no landed event."""
+    import scr.ops as ops
+    root, main_before = _lost_worktree(tmp_path, monkeypatch, ahead=False)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--dry-run")
+    assert "record merged only" in r.stdout and "would refuse" not in r.stdout, r.stdout
+    r = sscr(root, "--actor", "omri", "land", "T-0007")
+    assert r.returncode == 0 and "T-0007 marked merged" in r.stdout, r.stdout + r.stderr
+    st = _merged_states(root, "T-0007")
+    assert len(st) == 1 and st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0007", st
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
+
+
+def test_watcher_no_worktree_branch_already_on_main_is_merged_like_scr_land(tmp_path: Path, monkeypatch):
+    """The watcher on the same world: merged with the same record `scr land` writes — note, actor, and the
+    cascade actor of the dependent it unblocks (the old `scr task set` subprocess cascaded as `scr`) — and
+    queues/STATE.json follow the merge (the refresh the subprocess did)."""
+    import scr.ops as ops
+    root, main_before = _lost_worktree(tmp_path, monkeypatch, ahead=False)
+    sscr(root, "--quiet", "task", "new", "After", "--id", "T-0009", "--workload", "scriptorium", "--files", "other.txt", "--origin", "omri", "--blocked-by", "T-0007")
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0009", "triaged")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0007").status == "merged", res
+    st = _merged_states(root, "T-0007")
+    assert len(st) == 1 and st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0007", st
+    from scr.events import EventLog
+    up = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == "T-0009" and e.get("to") == "ready"]
+    assert len(up) == 1 and up[0]["actor"] == "steward:T-0007" and up[0]["note"] == "unblocked by T-0007", up
+    from scr.state import State
+    snap = State(root).read_snapshot()
+    assert snap["state_root"] == State(root).compute()["state_root"], "STATE.json does not follow the merge"
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007") and not _events(root, "land_failed", "T-0007")
 
 
 # ---- T-0091: the watcher applies a Decision written in review.md ----------------------------------------

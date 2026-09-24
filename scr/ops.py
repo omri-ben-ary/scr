@@ -809,8 +809,8 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
     The QI flags do not apply to the scriptorium path; dry_run there reports the plan and changes nothing.
     land_scriptorium is the post-acceptance step, so a scriptorium task must be `accepted` (land() accepts a
     reviewed `submitted` task because the PR merge implies the review; here the Decision comes first).
-    An accepted scriptorium task with no worktree is a checkout hotfix, already on the trunk through the
-    journal: it is recorded merged with HOTFIX_MERGED_NOTE and nothing else, as the watcher does (T-0154).
+    An accepted scriptorium task with no worktree goes through land_no_worktree (T-0158): merged with
+    HOTFIX_MERGED_NOTE when it is a checkout hotfix, refused (lost_worktree) when task/<id> is not on the trunk.
     A failure returns ok False with one closing line naming the reason and what to do next."""
     store = Store(root)
     t = store.get(tid)
@@ -823,13 +823,10 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
     wl = workload_for(root, store, t)
     wt, br, trunk = task_worktree(wl, t), f"task/{tid}", wl.main
     if not wt.exists():
-        # T-0154: a checkout hotfix — the watcher's outcome: merged with its note, no merge, no landed event
-        head = f"=== {tid} [{t.status}] no worktree ({wt}) -> {trunk} (scriptorium"
-        if dry_run:
-            return {"ok": True, "reason": None, "sha": None, "tip": None, "url": None,
-                    "out": [head + ", dry run: nothing changed)", f"  no worktree: record merged only (change already on {trunk} via the journal)"]}
-        out = [head + ")"] + _record_merged(root, store, tid, HOTFIX_MERGED_NOTE) + [f"  {tid} marked merged ({HOTFIX_MERGED_NOTE})"]
-        return {"ok": True, "reason": None, "out": out, "sha": None, "tip": None, "url": None}
+        r = land_no_worktree(root, store, t, wl, dry_run=dry_run)
+        if not r["ok"]:
+            r["out"].append(f"{tid}: NOT landed ({r['reason']}) — next: " + _LAND_NEXT[r["reason"]].format(trunk=trunk, br=br, wt=wt, tid=tid))
+        return r
     if dry_run:
         g, mg = Git(wt), Git(root)
         dirty = g.dirty()
