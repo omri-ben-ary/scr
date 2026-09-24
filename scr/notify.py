@@ -70,18 +70,23 @@ def toast_text(cards: list[dict]) -> tuple[str, str]:
     return head, body[:600]
 
 
-def toast_argv(cards: list[dict], exe: str = "powershell") -> list[str]:
-    """The command that shows one toast for `cards`: head line + one `<id> <title>` entry per card."""
+def toast_argv(cards: list[dict], exe: str = "powershell", dry: bool = False) -> list[str]:
+    """The command that shows one toast for `cards`: head line + one `<id> <title>` entry per card.
+
+    `dry` (T-0172, the suite's smoke test) runs the same script up to the notifier and the built toast but
+    never calls `.Show`: the WinRT types, LoadXml and the app id are exercised, nothing reaches the screen."""
     head, body = toast_text(cards)
     xml = ("<toast><visual><binding template='ToastGeneric'>"
            f"<text>{escape(head)}</text><text>{escape(body)}</text>"
            "</binding></visual></toast>")
-    script = ("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+    script = ("$ErrorActionPreference = 'Stop'; "
+              "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
               "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; "
               "$x = New-Object Windows.Data.Xml.Dom.XmlDocument; "
               f"$x.LoadXml({_ps_quote(xml)}); "
-              f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier({_ps_quote(TOAST_APP_ID)})"
-              ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
+              f"$t = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier({_ps_quote(TOAST_APP_ID)}); "
+              "$n = [Windows.UI.Notifications.ToastNotification]::new($x)"
+              + ("" if dry else "; $t.Show($n)"))
     return [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
 
 

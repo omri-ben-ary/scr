@@ -1961,6 +1961,19 @@ def test_toast_argv_names_the_card_title_and_task_id():
     assert "ToastNotificationManager" in cmd and notify.TOAST_APP_ID in cmd
 
 
+@pytest.mark.skipif(os.name != "nt" or not shutil.which("powershell"), reason="needs Windows and powershell on PATH")
+def test_toast_smoke_runs_the_real_script_through_powershell():
+    """T-0172: toast() is skipped under pytest, so this is the one test that runs the WinRT script itself
+    (dry: types, LoadXml, notifier and toast are built, `.Show` is not called: nothing reaches the screen).
+    Deselect with -k "not toast_smoke"."""
+    card = _card("chore:toast-smoke", "toast-smoke", "scr test suite: toast smoke (ignore)")
+    argv = notify.toast_argv([card], shutil.which("powershell"), dry=True)
+    assert ".Show(" not in argv[-1]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    assert r.returncode == 0 and not r.stderr.strip(), f"rc {r.returncode}: {r.stderr or r.stdout}"
+
+
 def test_email_password_comes_from_the_named_env_var_only(monkeypatch):
     """The message is built from the yaml; the channel refuses to run without the env var the yaml names."""
     ch = {"enabled": True, "host": "smtp.example", "from": "a@example", "to": ["b@example"], "user": "a", "password_env": "SCR_TEST_SMTP_PW"}
