@@ -450,3 +450,15 @@ def test_ui_page_has_no_inbox_form_or_done_list():
         assert needle not in page, needle
     assert 'id="needs"' in page  # the rest of the panel is untouched
     assert "planTasks" in page  # the add-task button stays
+
+
+def test_ui_quit_button_waits_for_the_quit_job():
+    """T-0155: Quit shows a failed quit job's output and keeps the page; the shut-down screen is not on a blind timer."""
+    import re
+    from scr.ui import UI_DIR
+    page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    start = page.index("$('#quitBtn').onclick")
+    handler = page[start:page.index("\n};", start) + 3]
+    assert "failed" in handler and "output" in handler
+    assert page.count("Scriptorium is shut down") == 1
+    assert not re.search(r"await start\(\{ kind: 'quit' \}[^;]*\);\s*setTimeout\(", handler)

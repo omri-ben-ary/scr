@@ -298,7 +298,35 @@ $('#discussGeneral').onclick = () => start({ kind: 'discuss', item: 'general' },
 $('#planTasks').onclick = () => start({ kind: 'discuss', item: 'plan' }, 'discuss:plan');
 $('#fixBug').onclick = () => { const sm = prompt('What is broken? (one line; the Toolsmith session opens with it)'); if (sm !== null && sm.trim()) start({ kind: 'hotfix_open', symptom: sm.trim() }, 'hotfix:new'); };
 $('#pauseBtn').onclick = () => start({ kind: STATE && STATE.paused ? 'resume' : 'pause' }, 'system:pause');
-$('#quitBtn').onclick = async () => { await start({ kind: 'quit' }, 'system:quit'); setTimeout(() => { document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; }, 1500); };
+// T-0155: poll /api/jobs for the job start() stored under key; the job once it is no longer running,
+// null if it still runs after ~15 s; throws when the server stops answering (a successful quit exits the UI).
+async function waitJob(key) {
+  const id = LOCAL.jobs[key];
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 750));
+    const job = (await api('/api/jobs')).find(x => x.id === id);
+    if (job && job.state !== 'running') return job;
+  }
+  return null;
+}
+$('#quitBtn').onclick = async () => {
+  const btn = $('#quitBtn'), shutDown = () => { if (POLL) { clearInterval(POLL); POLL = null; } document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; };
+  document.querySelectorAll('.quitFail').forEach(e => e.remove());
+  delete LOCAL.jobs['system:quit'];               // a retry must not read the previous attempt's job
+  await start({ kind: 'quit' }, 'system:quit');
+  if (!LOCAL.jobs['system:quit']) return;         // start() already toasted the error
+  btn.disabled = true;
+  let job;
+  try { job = await waitJob('system:quit'); } catch (e) { shutDown(); return; }   // server gone: the quit went through
+  btn.disabled = false;
+  if (job && job.state === 'failed') {            // the watcher survived: the UI stays up, show why and let Quit be retried
+    const o = document.createElement('div'); o.className = 'out err quitFail';
+    o.textContent = '✖ Quit failed — the page stays up; press Quit to retry.\n' + (job.output || '(no output)');
+    o.title = 'click to dismiss'; o.onclick = () => o.remove();
+    $('#needs').before(o);
+  } else if (job) shutDown();                     // done: the server exits a second later
+  else toast('Quit is still running; press Quit again or check the watcher');
+};
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (e.key === 'r') refresh();
