@@ -2398,6 +2398,26 @@ def test_report_unfinished_names_a_placeholder_an_empty_result_and_the_template_
         assert report_unfinished(ok, REPORT_TPL) is None, ok
 
 
+def test_report_unfinished_ignores_tokens_in_a_fence_or_backticks():
+    """T-0181: a token quoted in a code fence or inline backticks is a mention (a report about T-0180 names
+    FULL_SUITE_PLACEHOLDER); a bare prose token is still caught, also next to a fenced one. An unclosed fence
+    hides the rest of the text, as `_unfenced` does for review.md Decision lines."""
+    fenced = "# Report\n\n## Result\nProved a.\n\n```\nFull suite: FULL_SUITE_PLACEHOLDER\n```\n\nFull suite: 3 passed\n"
+    assert report_unfinished(fenced, REPORT_TPL) is None
+    assert report_unfinished(fenced.replace("```", "~~~"), REPORT_TPL) is None
+    ticked = "# Report\n\n## Result\nT-0172 held a literal `FULL_SUITE_PLACEHOLDER`; now caught. Full suite: 3 passed\n"
+    assert report_unfinished(ticked, REPORT_TPL) is None
+    bare = "# Report\n\n## Result\nProved a.\n\nFull suite: FULL_SUITE_PLACEHOLDER\n"
+    assert "FULL_SUITE_PLACEHOLDER" in report_unfinished(bare, REPORT_TPL)
+    both = fenced + "\nAxioms: AXIOMS_PLACEHOLDER\n"
+    assert "AXIOMS_PLACEHOLDER" in report_unfinished(both, REPORT_TPL)
+    assert "FULL_SUITE_PLACEHOLDER" in report_unfinished("# Report\n\n## Result\n`x` FULL_SUITE_PLACEHOLDER `y`\n", REPORT_TPL)
+    unclosed = "# Report\n\n## Result\nProved a.\n\n```\nFull suite: FULL_SUITE_PLACEHOLDER\n"
+    assert report_unfinished(unclosed, REPORT_TPL) is None
+    # the Result checks still read the original text: a Result that is only a fenced block is not empty
+    assert report_unfinished("# Report\n\n## Result\n```\nlake build: ok\n```\n", REPORT_TPL) is None
+
+
 def test_tick_keeps_placeholder_report_in_progress(world, monkeypatch):
     """DoD: an in_progress task whose report.md holds a placeholder stays in_progress, a needs line with key
     report:<id> appears (logged once), and no `task set ... submitted` call is made; once the report is

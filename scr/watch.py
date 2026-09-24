@@ -92,6 +92,7 @@ from .review import (DECISION_NOTE, VERDICTS, _ANY_HEADING, _DECISION_HEADING, _
 _REPORT_PLACEHOLDER = re.compile(r"\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b")
 _REPORT_HEADING = re.compile(r"^##\s")
 _RESULT_HEADING = re.compile(r"^##\s+Result\s*$")
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
 
 
 def _result_body(text: str) -> list[str] | None:
@@ -112,8 +113,9 @@ def _result_body(text: str) -> list[str] | None:
 def report_unfinished(text: str, tpl: str) -> str | None:
     """A short reason when report.md is not finished yet, else None: it still holds an ALL-CAPS `*_PLACEHOLDER`
     token, or its `## Result` section is empty or only the template's prompt line. A report with no
-    `## Result` heading at all is not judged here (None)."""
-    m = _REPORT_PLACEHOLDER.search(text)
+    `## Result` heading at all is not judged here (None). A token quoted inside a code fence or inline backticks
+    is a mention, not a placeholder (T-0181); the Result checks still read the whole text."""
+    m = _REPORT_PLACEHOLDER.search(_INLINE_CODE.sub("", "\n".join(_unfenced(text))))
     if m:
         return f"placeholder {m.group(0)} is still in it; replace it with the real text"
     body = _result_body(text)
