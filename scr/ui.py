@@ -124,6 +124,17 @@ ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale
 RUNNING = {"dispatched", "in_progress", "checkpoint"}
 
 
+def land_failed_next(tid: str, note: str) -> str:
+    """The one action for a land_failed card, by the reason in the event note (the watcher's NEEDS-YOU line says
+    the same): a conflict is fixed on the branch, out-of-scope paths by a wider scope or a revert."""
+    ret = f"or return it for a rebase: scr --actor omri task set {tid} returned"
+    if "(scope)" in note:
+        return f"Next: widen {tid}'s scope.files or revert the out-of-scope commit on task/{tid} (either retries the landing); {ret}"
+    if "(conflict)" in note:
+        return f"Next: merge main into task/{tid}, resolve the conflict and commit (a new commit retries the landing); {ret}"
+    return f"Next: fix task/{tid} (a new commit retries the landing) or merge it into main by hand; {ret}"
+
+
 def _watch_flags(root: Path) -> set[str]:
     return set(_read(root / ".scr" / "watch.state.txt").split())
 
@@ -183,7 +194,9 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
                 group_acked[(parts[1], parts[2])] = max(group_acked.get((parts[1], parts[2]), ""), parts[3])
     groups: dict[tuple[str, str], dict] = {}
     flags = _watch_flags(root)
-    for e in _events(root, None, 2000):
+    recent = _events(root, None, 2000)
+    accepted_seq = {e.get("task") or "-": e.get("seq") or 0 for e in recent if e.get("kind") == "state" and e.get("to") == "accepted"}
+    for e in recent:
         age = _age_h(e.get("ts"))
         if age is not None and age > 24 * 7:
             continue
@@ -194,6 +207,8 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
             continue
         if name == "stale" and not (f"stale:{task}" in flags and task in tasks and tasks[task].status in RUNNING):
             continue
+        if name == "land_failed" and not (task in tasks and tasks[task].status == "accepted" and (e.get("seq") or 0) > accepted_seq.get(task, -1)):
+            continue
         grp = groups.setdefault((task, name), {"id": task, "kind": "system", "name": name, "title": ALARM_TITLES.get(name, name), "type": "system",
                                                "options": [], "ts": ts, "count": 0, "notes": []})
         grp["count"] += 1
@@ -203,6 +218,8 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
         notes = grp.pop("notes")
         shown = notes[-8:]
         grp["text"] = "\n".join(shown) + (f"\n… and {len(notes) - len(shown)} earlier" if len(notes) > len(shown) else "")
+        if name == "land_failed":
+            grp["text"] += "\n" + land_failed_next(task, notes[-1])
         if grp["count"] > 1:
             grp["title"] = f"{grp['title']} ×{grp['count']}"
         grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"

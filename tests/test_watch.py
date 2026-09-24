@@ -1945,3 +1945,60 @@ def test_notify_retry_flag_survives_a_watcher_restart(world, monkeypatch):
     assert len(calls) == 1 and any(f.startswith("notified-retry:" + CARD_A["key"] + ":") for f in _flags(root))
     assert Watcher(root, quiet=True).tick()["ok"]
     assert len(calls) == 1
+
+
+# ---- T-0146: a failed landing is a needs-you card while the task stays accepted ------------------------------
+def _land_cards(root: Path, tid: str) -> list[dict]:
+    return [c for c in ui_mod.needs_cards(root) if c["type"] == "system" and c.get("name") == "land_failed" and c["id"] == tid]
+
+
+def _accepted(root: Path, tid: str = "T-0001") -> None:
+    """The world's ready T-0001 through to accepted (review.md first, T-0081)."""
+    for st in ("dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    (Store(root).get(tid).dir / "review.md").write_text(accepted_review(), encoding="utf-8")
+    scr(root, "--quiet", "--actor", "s", "task", "set", tid, "accepted")
+
+
+def test_land_failed_conflict_is_one_card_with_the_note_until_acked(tmp_path: Path, monkeypatch):
+    """DoD: an accepted task whose landing failed (the real watcher path, a conflict on tool.txt) -> exactly one
+    land_failed needs card for it, carrying the event note and the next step; more ticks add no card; /api/state
+    returns the same card; `scr ack <key>` dismisses it."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk moved on tool.txt")
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    _tick(root)
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and Store(root).get("T-0007").status == "accepted"
+    cards = _land_cards(root, "T-0007")
+    assert len(cards) == 1, cards
+    c = cards[0]
+    assert ev[0]["note"] in c["text"] and "landing failed" in c["title"] and "not on main" in c["title"]
+    assert "merge main into task/T-0007" in c["text"] and "task set T-0007 returned" in c["text"]
+    _tick(root); _tick(root)                                                     # ticks: no second event, no second card
+    assert [x["key"] for x in _land_cards(root, "T-0007")] == [c["key"]]
+    assert [x["key"] for x in ui_mod.state(root)["needs"] if x.get("name") == "land_failed"] == [c["key"]]
+    sscr(root, "--quiet", "--actor", "omri", "ack", c["key"])
+    assert _land_cards(root, "T-0007") == []
+
+
+def test_land_failed_card_goes_when_the_task_leaves_accepted_and_never_doubles(world):
+    """DoD: two land_failed events on one accepted task -> ONE card (x2, both notes, the scope next step); the task
+    returned -> no card, no ack; accepted again -> the old failures do not come back; a fresh failure does, alone."""
+    root, _, _ = world
+    _accepted(root)
+    for note in ("FAILED (conflict): main does not merge into task/T-0001: QuantumInsertion/A.lean",
+                 "FAILED (scope): task/T-0001 carries 1 path(s) outside T-0001's scope: state/STATE.json"):
+        scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "land_failed", "--task", "T-0001", "--note", note)
+    cards = _land_cards(root, "T-0001")
+    assert len(cards) == 1 and "×2" in cards[0]["title"], cards
+    assert "(conflict)" in cards[0]["text"] and "(scope)" in cards[0]["text"] and "widen T-0001's scope.files" in cards[0]["text"]
+    scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0001", "returned", "--note", "rebase")
+    assert _land_cards(root, "T-0001") == []
+    for st in ("ready", "dispatched", "in_progress", "submitted", "accepted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    assert _land_cards(root, "T-0001") == []
+    scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "land_failed", "--task", "T-0001", "--note", "FAILED (tests): x")
+    cards = _land_cards(root, "T-0001")
+    assert len(cards) == 1 and cards[0]["text"].startswith("FAILED (tests): x") and "×" not in cards[0]["title"], cards
