@@ -404,9 +404,9 @@ def test_landing_test_timeout_comes_from_limits_yaml(tmp_path: Path, monkeypatch
     wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
     wl["scriptorium"]["tests"] = f'{sys.executable} -c "import time; time.sleep(10)"'
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    sscr(root, "--quiet", "snapshot")                                   # the config hash moved: keep verify green
     sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] 5 s landing timeout, 10 s tests")
-    (wt / "tool.txt").write_text("ok
-", encoding="utf-8")
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
     main_before = sgit(root, "rev-parse", "main")
     res = _tick(root)
     assert res["ok"], res
