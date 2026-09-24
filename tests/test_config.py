@@ -251,3 +251,24 @@ def test_dispatch_drops_statement_tasks_outside_the_window(world):
     assert "would dispatch: T-0001" in r.stdout, r.stdout
     r = scr(root, "dispatch", "--dry-run", journal_on=False)               # the flag rule is unchanged inside the window
     assert "T-0001" not in r.stdout, r.stdout
+
+
+# ---- T-0186: land_test_timeout_seconds -------------------------------------------------------------------
+def test_land_test_timeout_reads_limits_and_defaults_to_3600(tmp_path: Path):
+    """ops.land_test_timeout: the limits.yaml value when it is a positive number, 3600 when the key (or the
+    file) is absent; the real limits.yaml carries the key with a comment naming scr/ops.py."""
+    from scr.ops import LAND_TEST_TIMEOUT_S, land_test_timeout
+    from scr.store import Store
+    assert LAND_TEST_TIMEOUT_S == 3600
+    assert land_test_timeout(Store(tmp_path)) == 3600                     # no config/limits.yaml at all
+    (tmp_path / "config").mkdir()
+    lim = tmp_path / "config" / "limits.yaml"
+    lim.write_text("concurrency: 2\n", encoding="utf-8")
+    assert land_test_timeout(Store(tmp_path)) == 3600                     # the key absent
+    lim.write_text("land_test_timeout_seconds: 5\n", encoding="utf-8")
+    assert land_test_timeout(Store(tmp_path)) == 5
+    for bad in ("0", "-3", "soon", "null"):
+        lim.write_text(f"land_test_timeout_seconds: {bad}\n", encoding="utf-8")
+        assert land_test_timeout(Store(tmp_path)) == 3600, bad
+    line = [l for l in (REPO / "config" / "limits.yaml").read_text(encoding="utf-8").splitlines() if "land_test_timeout_seconds" in l]
+    assert len(line) == 1 and line[0].startswith("land_test_timeout_seconds:") and "scr/ops.py" in line[0], line
