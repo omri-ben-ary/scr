@@ -921,10 +921,17 @@ def retire(root: Path, name: str, execute: bool = False, wl_name: str | None = N
         raise RepoError(f"refusing: {name} resolves outside {wl.wt_root}")
     g, mg = Git(wt), Git(wl.repo)
     br = g.branch()
-    out = [f"=== retire {name} (branch {br}, main {wl.main}) [{'execute' if execute else 'dry-run'}]"]
-    if not mg.is_ancestor(br, wl.main):
-        ahead = mg.run("rev-list", "--count", f"{wl.main}..{br}").out
-        return {"ok": False, "code": 2, "out": out + [f"REFUSING: {br} is {ahead} commit(s) ahead of {wl.main} — land it first"]}
+    # T-0188: merged means merged into origin/<main> (fetched first) for a workload with its own checkout — its
+    # local main can sit far behind (quantum-insertion's master, 53 commits on 2026-09-24, refused merged T-0115
+    # as 52 ahead); the scriptorium's own workload keeps its checkout trunk (branch_base). A failed fetch
+    # (offline) measures against the last fetched origin ref.
+    if wl.repo != root.resolve():
+        mg.fetch()
+    base = branch_base(root, wl, mg)
+    out = [f"=== retire {name} (branch {br}, main {base}) [{'execute' if execute else 'dry-run'}]"]
+    if not mg.is_ancestor(br, base):
+        ahead = mg.run("rev-list", "--count", f"{base}..{br}").out
+        return {"ok": False, "code": 2, "out": out + [f"REFUSING: {br} is {ahead} commit(s) ahead of {base} — land it first"]}
     if g.run("diff", "--stat", "HEAD").out.strip():
         return {"ok": False, "code": 3, "out": out + ["REFUSING: uncommitted changes to tracked files (checkpoint commit first)"]}
     stamp = time.strftime("%Y%m%d-%H%M%S")

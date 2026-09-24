@@ -2497,3 +2497,54 @@ def test_tick_returns_a_dead_session_that_left_an_unfinished_report(world):
     assert res["ok"] and Store(root).get("T-0001").status == "returned", res
     assert len(_named(root, "session_dead")) == 1
     assert any(n["key"] == "report:T-0001" for n in w.need_items) and any(n["key"] == "dead:T-0001" for n in w.need_items)
+
+
+# ---- T-0188: retire measures a workload branch against origin/<main>, not the local main ------------------------
+# quantum-insertion's local master sat 53 commits behind origin/master on 2026-09-24, so retire refused T-0115
+# (merged by PR #64) as `52 commit(s) ahead of master`.
+from test_journal_ops import git as jgit  # noqa: E402
+from scr.ops import checkpoint_commit, retire  # noqa: E402
+
+
+def _retire_world(world, merged: bool):
+    """T-0001 spawned with two commits; origin/master moves on by three commits of its own (plus the branch when
+    `merged`), pushed from another clone, so the workload's local master and its origin/master ref stay behind."""
+    root, repo, origin = world
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched")
+    spawn(root, ["T-0001"], lake=False)
+    wt = repo / ".worktrees" / "T-0001"
+    for i in (1, 2):
+        (wt / f"n{i}.txt").write_text(f"{i}\n"); checkpoint_commit(root, "T-0001")
+    jgit(wt, "push", "-q", "origin", "task/T-0001")
+    other = repo.parent / "other-clone"
+    jgit(repo.parent, "clone", "-q", str(origin), str(other))
+    jgit(other, "config", "user.email", "t@t"); jgit(other, "config", "user.name", "t")
+    for i in (1, 2, 3):
+        (other / f"o{i}.txt").write_text(f"{i}\n"); jgit(other, "add", "-A"); jgit(other, "commit", "-q", "-m", f"o{i}")
+    if merged:
+        jgit(other, "fetch", "-q", "origin", "task/T-0001")
+        jgit(other, "merge", "-q", "--no-edit", "FETCH_HEAD")
+    jgit(other, "push", "-q", "origin", "master")
+    return root, repo, wt
+
+
+def test_retire_takes_a_branch_merged_into_origin_main_only(world):
+    """DoD: local main behind origin/main, the branch merged into origin/main only -> retire proceeds (dry run shows
+    the move), no REFUSING line; the local master is left where it was."""
+    root, repo, wt = _retire_world(world, merged=True)
+    local = jgit(repo, "rev-parse", "master")
+    assert int(jgit(repo, "rev-list", "--count", "master..task/T-0001")) == 2          # the old measure: 2 ahead
+    res = retire(root, "T-0001")
+    assert res["ok"] and res["code"] == 0, res["out"]
+    assert not any("REFUSING" in l for l in res["out"])
+    assert "origin/master" in res["out"][0] and any("quarantine ->" in l for l in res["out"]) and res["out"][-1] == "DRY RUN — nothing moved"
+    assert wt.exists() and jgit(repo, "rev-parse", "master") == local                  # nothing moved, local master untouched
+    assert retire(root, "T-0001", execute=True)["ok"] and not wt.exists()
+
+
+def test_retire_still_refuses_a_branch_not_in_origin_main(world):
+    """DoD: a branch not merged into origin/main is refused, its ahead count measured against origin/main."""
+    root, repo, wt = _retire_world(world, merged=False)
+    res = retire(root, "T-0001", execute=True)
+    assert not res["ok"] and res["code"] == 2 and wt.exists(), res["out"]
+    assert res["out"][-1].startswith("REFUSING: task/T-0001 is 2 commit(s) ahead of origin/master")
