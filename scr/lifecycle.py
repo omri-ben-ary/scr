@@ -59,6 +59,28 @@ def cascade(store, log, tid: str, status: str, actor: str = "scr") -> list[str]:
     return made
 
 
+def requeue(store, log, tid: str, note: str, actor: str, refund: bool = False) -> bool:
+    """A running task whose session is gone goes back to `ready` through the sanctioned path
+    (in_progress / checkpoint -> returned -> ready; a task already `returned` takes the second step only), one
+    state event per step (T-0187). `refund` gives back the attempt its dispatch counted (attempts = dispatches),
+    with a `field` event: a session that died of an exhausted usage-credit balance never ran, so it is not an
+    attempt. False when the task is in no status this applies to. Callers refresh STATE.json afterwards."""
+    t = store.get(tid)
+    steps = {"in_progress": ["returned", "ready"], "checkpoint": ["returned", "ready"], "returned": ["ready"]}.get(t.status)
+    if not steps:
+        return False
+    for new in steps:
+        old = t.status
+        apply(t.rec, new)
+        t.save()
+        log.append("state", task=tid, **{"from": old}, to=new, actor=actor, note=note)
+    if refund and int(t.rec.get("attempts", 0)) > 0:
+        t.rec["attempts"] = int(t.rec["attempts"]) - 1
+        t.save()
+        log.append("field", task=tid, field="attempts", value=t.rec["attempts"], actor=actor, note=f"refunded: {note}"[:300])
+    return True
+
+
 def apply(rec: dict, new: str) -> None:
     """Mutate the record for a transition (beyond status)."""
     old = rec.get("status")
