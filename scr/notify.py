@@ -6,6 +6,11 @@ A card is pushed once: its key (the one `scr ack` takes: `events:<task>:<kind>:<
 survives a restart; an acked key (reports/ui.acks.txt) is never sent. A `notified:` line whose card no longer
 stands is dropped, so the flags file stays as long as the card list.
 
+A push that failed on EVERY enabled channel is retried once (T-0171): the card becomes a
+`notified-retry:<key>:<epoch>` line instead, and the first tick at least `retry_minutes` (config, default 10)
+later sends it again. Whatever that retry does, the card then becomes `notified:<key>`; if it failed everywhere
+again, one `notify GAVE UP: <key>` log line says so. A card that reached one channel reached Omri: no retry.
+
 Channels, each on/off in config/notify.yaml (absent file = all off):
   toast  a Windows toast through `powershell -Command` and the WinRT ToastNotificationManager (no module)
   email  SMTP; host/port/from/to/user in the yaml, the password in the environment variable the yaml names
@@ -18,6 +23,7 @@ import os
 import shutil
 import smtplib
 import subprocess
+import time
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Callable
@@ -26,6 +32,8 @@ from xml.sax.saxutils import escape
 import yaml
 
 FLAG_PREFIX = "notified:"
+RETRY_PREFIX = "notified-retry:"          # notified-retry:<key>:<epoch seconds of the failed push>
+DEFAULT_RETRY_MINUTES = 10
 # the AppUserModelID of Windows PowerShell: registered on every Windows 10/11, so an unpackaged script may toast under it
 TOAST_APP_ID = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
 DEFAULT_URL = "http://127.0.0.1:8765/"
@@ -133,40 +141,86 @@ CHANNELS: dict[str, Callable[[list[dict], dict, dict], str]] = {"toast": toast, 
 
 
 # ---- dispatch --------------------------------------------------------------------------------------------
-def send(cfg: dict, cards: list[dict], names: list[str] | None = None) -> list[str]:
-    """One call per channel with every card; one result line per channel. Never raises."""
+def send_results(cfg: dict, cards: list[dict], names: list[str] | None = None) -> list[tuple[str, bool, str]]:
+    """One call per channel with every card; one `(channel, succeeded, result line)` per channel. Never raises."""
     out = []
     for name in (enabled(cfg) if names is None else names):
         try:
-            out.append(f"notify {name}: {CHANNELS[name](cards, cfg.get(name) or {}, cfg)}")
+            out.append((name, True, f"notify {name}: {CHANNELS[name](cards, cfg.get(name) or {}, cfg)}"))
         except Exception as e:  # noqa: BLE001 — a notification failure is a log line, never a tick crash
-            out.append(f"notify FAILED: {name}: {type(e).__name__}: {e}")
+            out.append((name, False, f"notify FAILED: {name}: {type(e).__name__}: {e}"))
+    return out
+
+
+def send(cfg: dict, cards: list[dict], names: list[str] | None = None) -> list[str]:
+    """One call per channel with every card; one result line per channel. Never raises."""
+    return [line for _, _, line in send_results(cfg, cards, names)]
+
+
+def _retry_flags(flags: set[str]) -> dict[str, tuple[str, float]]:
+    """key -> (flag, epoch of the failed push) for every `notified-retry:<key>:<epoch>` line (a key may hold `:`)."""
+    out = {}
+    for f in flags:
+        if f.startswith(RETRY_PREFIX):
+            key, _, ts = f[len(RETRY_PREFIX):].rpartition(":")
+            try:
+                out[key] = (f, float(ts))
+            except ValueError:
+                out[key] = (f, 0.0)          # a mangled stamp: due now, and retried once like any other
     return out
 
 
 def pending(cards: list[dict], flags: set[str], acked: set[str]) -> list[dict]:
-    """The cards not yet pushed and not acked."""
-    return [c for c in cards if c.get("key") and c["key"] not in acked and FLAG_PREFIX + c["key"] not in flags]
+    """The cards not yet pushed and not acked (a card waiting for its retry was pushed: it is not here)."""
+    waiting = _retry_flags(flags)
+    return [c for c in cards if c.get("key") and c["key"] not in acked and FLAG_PREFIX + c["key"] not in flags
+            and c["key"] not in waiting]
 
 
-def push(root: Path, cards: list[dict], flags: set[str], acked: set[str], log: Callable[[str], None]) -> list[dict]:
-    """Push the NEW cards on every enabled channel; record them in `flags` (the watcher saves it). Returns them.
-    With no channel enabled nothing is sent or recorded, so turning a channel on pushes what stands then."""
-    live = {FLAG_PREFIX + c["key"] for c in cards if c.get("key")}
-    for k in [k for k in flags if k.startswith(FLAG_PREFIX) and k not in live]:
+def retry_due(cards: list[dict], flags: set[str], acked: set[str], now: float, minutes: float) -> list[dict]:
+    """The cards whose push failed on every channel at least `minutes` ago, not acked since."""
+    waiting = _retry_flags(flags)
+    return [c for c in cards if c.get("key") in waiting and c["key"] not in acked
+            and now - waiting[c["key"]][1] >= minutes * 60]
+
+
+def push(root: Path, cards: list[dict], flags: set[str], acked: set[str], log: Callable[[str], None],
+         now: float | None = None) -> list[dict]:
+    """Push the NEW cards, and the ones due for their one retry, on every enabled channel; record them in `flags`
+    (the watcher saves it). Returns the cards sent. With no channel enabled nothing is sent or recorded, so
+    turning a channel on pushes what stands then."""
+    now = time.time() if now is None else now
+    keys = {c["key"] for c in cards if c.get("key")}
+    for k in [k for k in flags if k.startswith(FLAG_PREFIX) and k[len(FLAG_PREFIX):] not in keys]:
         flags.discard(k)
+    for key, (f, _) in _retry_flags(flags).items():
+        if key not in keys:
+            flags.discard(f)
     cfg = load(root)
     names = enabled(cfg)
     if not names:
         return []
     new = pending(cards, flags, acked)
-    if not new:
+    due = retry_due(cards, flags, acked, now, float(cfg.get("retry_minutes", DEFAULT_RETRY_MINUTES)))
+    if not new and not due:
         return []
-    flags.update(FLAG_PREFIX + c["key"] for c in new)     # once per card, even if a channel fails (no retry storm)
-    log(f"notify: {len(new)} new card(s): " + ", ".join(c["key"] for c in new)[:400])
-    for line in send(cfg, new, names):
+    if new:
+        log(f"notify: {len(new)} new card(s): " + ", ".join(c["key"] for c in new)[:400])
+    if due:
+        log(f"notify: retrying {len(due)} card(s) that failed on every channel: " + ", ".join(c["key"] for c in due)[:400])
+    results = send_results(cfg, new + due, names)
+    for _, _, line in results:
         log(line)
-    return new
+    reached = any(ok for _, ok, _ in results)
+    waiting = _retry_flags(flags)
+    for c in due:                                        # one retry, ever: whatever it did, the card is done
+        flags.discard(waiting[c["key"]][0])
+        flags.add(FLAG_PREFIX + c["key"])
+        if not reached:
+            log(f"notify GAVE UP: {c['key']}")
+    for c in new:
+        flags.add((FLAG_PREFIX + c["key"]) if reached else f"{RETRY_PREFIX}{c['key']}:{int(now)}")
+    return new + due
 
 
 def send_test(root: Path) -> list[str]:
