@@ -568,6 +568,27 @@ def cmd_ack(args):
     print(f"acknowledged {args.key}")
 
 
+def cmd_notify(args):
+    """--test: one test message on every enabled channel of config/notify.yaml. Without it: the cards that stand
+    and whether the watcher has pushed each (T-0090)."""
+    root, _, _ = _ctx(args)
+    from . import notify
+    if args.test:
+        lines = notify.send_test(root)
+        print("\n".join(lines))
+        if any("FAILED" in ln for ln in lines):
+            sys.exit(1)
+        return
+    from .ui import acked_keys, needs_cards
+    sf = root / ".scr" / "watch.state.txt"
+    flags = set(sf.read_text(encoding="utf-8").split()) if sf.exists() else set()
+    cards = needs_cards(root)
+    new = {c["key"] for c in notify.pending(cards, flags, acked_keys(root))}
+    print(f"channels on: {', '.join(notify.enabled(notify.load(root))) or 'none'}; {len(cards)} card(s) stand, {len(new)} not yet pushed")
+    for c in cards:
+        print(f"  {'new   ' if c['key'] in new else 'pushed'}  {c['key']}  {c.get('title', '')[:80]}")
+
+
 def cmd_journal(args):
     root, _, _ = _ctx(args)
     sha = journal(root, args.actor, args.note, push=args.push)
@@ -685,6 +706,8 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
     ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
+    nt = sub.add_parser("notify", parents=[common], help="push channel for needs-you cards (config/notify.yaml): --test sends one test message per enabled channel")
+    nt.add_argument("--test", action="store_true"); nt.set_defaults(fn=cmd_notify)
     hx = sub.add_parser("hotfix", parents=[common], help="fix the tooling in place, as a recorded task: open <symptom> | close [id] --summary | test | status")
     hx.add_argument("op", choices=["open", "close", "test", "status"]); hx.add_argument("id", nargs="?"); hx.add_argument("text", nargs="?")
     hx.add_argument("--summary"); hx.add_argument("--unlock", action="append", help='"<title> | <why>" (repeatable)'); hx.add_argument("--discuss", action="store_true", help="open the Toolsmith session too")
