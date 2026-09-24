@@ -197,6 +197,42 @@ def pid_alive(pid: int | None) -> bool:
         return True
 
 
+def process_created(pid: int | None) -> int | None:
+    """The creation time of the process with this pid, as a value only compared with `==`, or None when it
+    cannot be read (no such process, access denied, no /proc). Win32: GetProcessTimes' creation FILETIME as
+    an int, via ctypes; POSIX: the start time field of /proc/<pid>/stat. The launcher records it with the
+    pid, and the watcher compares it before trusting a pid again (T-0147): a pid Windows has reused for
+    another process has a different creation time."""
+    if not pid or int(pid) <= 0:
+        return None
+    pid = int(pid)
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32                                 # type: ignore[attr-defined]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k32.OpenProcess.restype = wintypes.HANDLE
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return None
+            try:
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                if not k32.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                    return None
+                value = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                return value or None
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rpartition(")")[2].split()[19])                  # field 22 (starttime); comm may hold spaces
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def kill(pid: int) -> bool:
     """Stop a process and, on Windows, its children (`taskkill /T /F`). True when the stop was made; False
     when taskkill refused it (no such pid, access denied) or raised (T-0124: the escalation note says so)."""
