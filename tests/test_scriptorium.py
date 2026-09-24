@@ -247,6 +247,47 @@ def test_verify_clean_after_crlf_rewrite(repo: Path):
     assert r["errors"] == [], r["errors"]
 
 
+def autocrlf_clone(tmp_path: Path, gitattributes: bytes) -> Path:
+    """T-0151 in miniature: a one-task scriptorium tree, written LF, carrying `gitattributes` as its
+    .gitattributes, committed and then cloned with core.autocrlf=true. Returns the clone."""
+    src = tmp_path / "src"
+    src.mkdir()
+    for d in ("config", "templates", "agents"):
+        shutil.copytree(REPO / d, src / d)
+    scr(src, "init", "--quiet")
+    scr(src, "--quiet", "task", "new", "A", "--id", "T-0001", "--origin", "omri")
+    for p in (p for sub in ("tasks", "config") for p in (src / sub).rglob("*") if p.is_file()):
+        p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
+    scr(src, "refresh", "--quiet")
+    (src / ".gitattributes").write_bytes(gitattributes)
+    (src / ".gitignore").write_text(".scr/\n__pycache__/\n", encoding="utf-8")
+    git(src, "init", "-q", "-b", "main")
+    git(src, "-c", "core.autocrlf=false", "add", "-A")
+    git(src, "commit", "-q", "-m", "seed")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", "-c", "core.autocrlf=true", str(src), str(clone))
+    return clone
+
+
+def test_autocrlf_clone_checks_out_lf_and_verifies(tmp_path: Path):
+    """T-0177: the root .gitattributes (`* text=auto eol=lf`, T-0100) keeps a core.autocrlf=true checkout
+    of tasks/ and config/ LF, and a read-only verify of that checkout is clean and leaves it clean."""
+    if shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+    clone = autocrlf_clone(tmp_path, (REPO / ".gitattributes").read_bytes())
+    assert git(clone, "config", "core.autocrlf") == "true"
+    eol = [line.split() for line in git(clone, "ls-files", "--eol", "--", "tasks", "config").splitlines()]
+    assert any(f[-1].startswith("tasks/") and f[-1].endswith("/task.yaml") for f in eol)
+    assert any(f[-1].startswith("tasks/") and f[-1].endswith("/spec.md") for f in eol)
+    assert any(f[-1].startswith("config/") and f[-1].endswith(".yaml") for f in eol)
+    crlf = [f[-1] for f in eol if f[1] == "w/crlf"]
+    assert crlf == [], f"core.autocrlf=true checkout has CRLF files: {crlf[:5]}"
+    env = {**os.environ, "SCRIPTORIUM_ROOT": str(clone), "PYTHONPATH": str(REPO), "SCR_NO_JOURNAL": "1"}
+    r = subprocess.run([sys.executable, "-m", "scr", "verify"], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    assert r.returncode == 0 and " 0 errors" in r.stdout, r.stdout + r.stderr
+    assert git(clone, "status", "--porcelain") == ""
+
+
 def test_tamper_events_detected(repo: Path):
     seed(repo)
     p = repo / "events" / "events.jsonl"
@@ -450,3 +491,15 @@ def test_ui_page_has_no_inbox_form_or_done_list():
         assert needle not in page, needle
     assert 'id="needs"' in page  # the rest of the panel is untouched
     assert "planTasks" in page  # the add-task button stays
+
+
+def test_ui_quit_button_waits_for_the_quit_job():
+    """T-0155: Quit shows a failed quit job's output and keeps the page; the shut-down screen is not on a blind timer."""
+    import re
+    from scr.ui import UI_DIR
+    page = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    start = page.index("$('#quitBtn').onclick")
+    handler = page[start:page.index("\n};", start) + 3]
+    assert "failed" in handler and "output" in handler
+    assert page.count("Scriptorium is shut down") == 1
+    assert not re.search(r"await start\(\{ kind: 'quit' \}[^;]*\);\s*setTimeout\(", handler)
