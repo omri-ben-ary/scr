@@ -1836,3 +1836,112 @@ def test_scr_notify_test_reports_every_channel(world, monkeypatch):
     _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
     out = scr(root, "notify", "--test").stdout
     assert "notify toast: skipped (pytest)" in out and "notify email: off" in out
+
+
+# ---- T-0171: one bounded retry of a card whose push failed on every channel -------------------------------------
+def _switch_channel(monkeypatch, name: str, state: dict) -> list[list[dict]]:
+    """A fake channel that raises while state[name] is True; flip it between ticks."""
+    calls: list[list[dict]] = []
+
+    def fake(cards, ch, cfg):
+        calls.append(list(cards))
+        if state[name]:
+            raise RuntimeError(f"{name} down")
+        return "ok"
+    monkeypatch.setitem(notify.CHANNELS, name, fake)
+    return calls
+
+
+def _push(root: Path, cards: list[dict], flags: set[str], now: float, acked: set[str] | None = None) -> list[str]:
+    lines: list[str] = []
+    notify.push(root, cards, flags, acked or set(), lines.append, now=now)
+    return lines
+
+
+def test_notify_failed_everywhere_is_retried_once_then_given_up(world, monkeypatch):
+    """DoD: every channel raises on tick 1 -> sent once; tick 2 before retry_minutes -> no send; tick 3 after it
+    (injected clock) -> sent exactly once more; that failing too -> one `notify GAVE UP:` line naming the key, and
+    ticks 4 and 5 send nothing."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": True}, "retry_minutes": 10})
+    down = {"toast": True, "email": True}
+    toast_calls, email_calls = _switch_channel(monkeypatch, "toast", down), _switch_channel(monkeypatch, "email", down)
+    flags: set[str] = set()
+    t0 = 1_800_000_000
+    log = _push(root, [CARD_A], flags, t0)
+    assert toast_calls == [[CARD_A]] and email_calls == [[CARD_A]]
+    assert flags == {f"notified-retry:{CARD_A['key']}:{t0}"}, flags
+    assert "notify FAILED: toast: RuntimeError: toast down" in log and "notify FAILED: email: RuntimeError: email down" in log
+    log += _push(root, [CARD_A], flags, t0 + 9 * 60 + 59)
+    assert len(toast_calls) == 1 and len(email_calls) == 1
+    log += _push(root, [CARD_A], flags, t0 + 10 * 60)
+    assert toast_calls == [[CARD_A]] * 2 and email_calls == [[CARD_A]] * 2
+    assert flags == {"notified:" + CARD_A["key"]}, flags
+    for dt in (11, 60):
+        log += _push(root, [CARD_A], flags, t0 + dt * 60)
+    assert len(toast_calls) == 2 and len(email_calls) == 2
+    gave_up = [ln for ln in log if ln.startswith("notify GAVE UP:")]
+    assert gave_up == [f"notify GAVE UP: {CARD_A['key']}"], log
+
+
+def test_notify_retry_that_reaches_a_channel_is_not_a_give_up(world, monkeypatch):
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}, "retry_minutes": 5})
+    down = {"toast": True}
+    calls = _switch_channel(monkeypatch, "toast", down)
+    flags: set[str] = set()
+    _push(root, [CARD_A], flags, 1000)
+    down["toast"] = False
+    log = _push(root, [CARD_A, CARD_B], flags, 1000 + 5 * 60)   # the retry rides with a new card: one channel call
+    assert calls == [[CARD_A], [CARD_B, CARD_A]]
+    assert flags == {"notified:" + CARD_A["key"], "notified:" + CARD_B["key"]}
+    assert not any("GAVE UP" in ln for ln in log) and any(ln.startswith("notify: retrying 1 card(s)") for ln in log)
+    _push(root, [CARD_A, CARD_B], flags, 1000 + 60 * 60)
+    assert len(calls) == 2
+
+
+def test_notify_one_channel_reached_is_never_retried(world, monkeypatch):
+    """DoD: toast fails, email succeeds on tick 1 -> the card is `notified:` and never retried."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": True}})
+    down = {"toast": True, "email": False}
+    toast_calls, email_calls = _switch_channel(monkeypatch, "toast", down), _switch_channel(monkeypatch, "email", down)
+    flags: set[str] = set()
+    _push(root, [CARD_A], flags, 0)
+    assert flags == {"notified:" + CARD_A["key"]}
+    for dt in (10, 11, 120):   # retry_minutes absent from the yaml: the default 10
+        _push(root, [CARD_A], flags, dt * 60)
+    assert len(toast_calls) == 1 and len(email_calls) == 1
+
+
+def test_notify_retry_skips_an_acked_card_and_a_gone_card_loses_its_flag(world, monkeypatch):
+    """DoD: a card acked while it waits for its retry is not retried; a card that disappears loses its retry flag."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
+    calls = _switch_channel(monkeypatch, "toast", {"toast": True})
+    flags: set[str] = set()
+    _push(root, [CARD_A, CARD_B], flags, 0)
+    assert len(calls) == 1 and all(f.startswith("notified-retry:") for f in flags) and len(flags) == 2
+    _push(root, [CARD_A, CARD_B], flags, 3600, acked={CARD_B["key"]})
+    assert calls[1:] == [[CARD_A]]
+    _push(root, [CARD_A, CARD_B], flags, 7200, acked={CARD_B["key"]})
+    assert len(calls) == 2
+    _push(root, [CARD_A], flags, 7300)                     # CARD_B no longer stands
+    assert not any(CARD_B["key"] in f for f in flags) and flags == {"notified:" + CARD_A["key"]}
+    _push(root, [CARD_C], flags, 7400)                     # a fresh failed card, then it disappears while waiting
+    assert any(f.startswith("notified-retry:" + CARD_C["key"] + ":") for f in flags)
+    _push(root, [], flags, 7500)
+    assert flags == set() and len(calls) == 3
+
+
+def test_notify_retry_flag_survives_a_watcher_restart(world, monkeypatch):
+    """Through the Watcher: the retry flag is a line of the flags file; the next tick (a fresh Watcher) reads it
+    back and does not resend before retry_minutes."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}, "retry_minutes": 10})
+    calls = _switch_channel(monkeypatch, "toast", {"toast": True})
+    _cards(monkeypatch, [CARD_A])
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert len(calls) == 1 and any(f.startswith("notified-retry:" + CARD_A["key"] + ":") for f in _flags(root))
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert len(calls) == 1
