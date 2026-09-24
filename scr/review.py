@@ -16,9 +16,15 @@ from pathlib import Path
 
 # ---- the Decision written in review.md (T-0091) ------------------------------------------------------
 VERDICTS = ("accepted", "returned", "escalated")
-# the explicit form the review brief asks for, anchored at column zero: `Decision: escalated (Gate 2, reason)`
-_DECISION_LINE = re.compile(r"^Decision:")
-_DECISION_VERDICT = re.compile(r"^Decision:\s*[*_`]*(accepted|returned|escalated)\b")
+# the explicit form the review brief asks for, anchored at column zero: `Decision: escalated (Gate 2, reason)`;
+# the label may be emphasised, `**Decision:** accepted` (T-0208). Leading whitespace is allowed only for the
+# first line under `## Decision` (the `_SECTION_*` twins), so an indented `Decision:` in a list item elsewhere
+# never becomes the explicit line
+_LABEL = r"[*_]{0,2}Decision:[*_]{0,2}"
+_DECISION_LINE = re.compile(rf"^{_LABEL}")
+_DECISION_VERDICT = re.compile(rf"^{_LABEL}\s*[*_`]*(accepted|returned|escalated)\b")
+_SECTION_DECISION_LINE = re.compile(rf"^\s*{_LABEL}")
+_SECTION_DECISION_VERDICT = re.compile(rf"^\s*{_LABEL}\s*[*_`]*(accepted|returned|escalated)\b")
 # the template form: the first non-blank line under a `## Decision` heading, its first word the verdict
 _DECISION_HEADING = re.compile(r"^#{1,6}\s*Decision\b")
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
@@ -59,7 +65,7 @@ def _verdict(line: str, rx: re.Pattern) -> str | None:
 
 def read_decision(review_md: str) -> tuple[str | None, str | None]:
     """(verdict, problem) from a review.md text. The verdict comes from the FIRST `Decision:` line at column
-    zero outside a code fence (the explicit form the review brief asks for) or, failing that, from the
+    zero (label optionally emphasised, `**Decision:**`, T-0208) outside a code fence (the explicit form the review brief asks for) or, failing that, from the
     first non-blank line under a `## Decision` heading whose first word is a verdict (the template form
     T-0062's review used; a `Decision:` line there is read by the explicit rule, T-0193). The untouched
     placeholder is no decision. When both forms are present they
@@ -81,13 +87,13 @@ def read_decision(review_md: str) -> tuple[str | None, str | None]:
     # `Decision: accepted` as the section's first line is the explicit form written under the heading (T-0193):
     # read it with the explicit rule, or the section pass would call its own `Decision:` prefix unreadable
     section_rx = _SECTION_VERDICT
-    if section is not None and _DECISION_LINE.match(section):
-        section_rx = _DECISION_VERDICT
-        if _PLACEHOLDER.match(section[len("Decision:"):]):
+    if section is not None and (m := _SECTION_DECISION_LINE.match(section)):
+        section_rx = _SECTION_DECISION_VERDICT
+        if _PLACEHOLDER.match(section[m.end():]):
             section = None
     if section is not None and _PLACEHOLDER.match(section):
         section = None
-    if explicit is not None and _PLACEHOLDER.match(explicit[len("Decision:"):]):   # the brief's own wording, copied
+    if explicit is not None and _PLACEHOLDER.match(explicit[_DECISION_LINE.match(explicit).end():]):   # the brief's own wording, copied
         explicit = None
     if explicit is None and section is None:
         return None, None

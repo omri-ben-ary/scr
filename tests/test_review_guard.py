@@ -406,6 +406,59 @@ def test_explicit_line_under_the_decision_heading_is_read():
     assert v is None and "disagree" in problem, problem   # an earlier explicit line vs the heading's
 
 
+# ---- T-0208: a bold or indented `Decision:` label ------------------------------------------------------------
+@pytest.mark.parametrize("line, verdict", [
+    ("**Decision:** accepted", "accepted"),
+    ("__Decision:__ returned (fix it)", "returned"),
+    ("*Decision:* escalated (Gate 1, statement changed)", "escalated"),
+    ("  Decision: returned (fix it)", "returned"),
+    ("  **Decision:** accepted", "accepted"),
+    ("**Decision:** **accepted**", "accepted"),
+])
+def test_bold_or_indented_label_under_the_decision_heading_is_read(line, verdict):
+    from scr.review import read_decision
+    assert read_decision(_review(line)) == (verdict, None)
+
+
+def test_bold_label_at_column_zero_is_the_explicit_line():
+    from scr.review import read_decision
+    no_heading = TEMPLATE.replace("## Decision\n" + PLACEHOLDER + "\n", "")
+    assert "## Decision" not in no_heading
+    assert read_decision(no_heading + "**Decision:** accepted\n") == ("accepted", None)
+    assert read_decision(_review(PLACEHOLDER, tail="**Decision:** returned (fix the lemma)")) == ("returned", None)
+    # two verdicts stay unreadable, bold or not
+    for text in (no_heading + "**Decision:** accepted | returned\n", _review("**Decision:** accepted | returned")):
+        v, problem = read_decision(text)
+        assert v is None and "unreadable" in problem, problem
+    # the placeholder copied with a bold label is still no decision
+    assert read_decision(_review("**Decision:** " + PLACEHOLDER)) == (None, None)
+    assert read_decision(no_heading + "**Decision:** " + PLACEHOLDER + "\n") == (None, None)
+    # a bullet `* Decision:` is a list item, not an emphasised label
+    assert read_decision(no_heading + "* Decision: accepted\n") == (None, None)
+    # first explicit line wins, bold or not; the heading's line must still agree
+    assert read_decision(_review("**Decision:** accepted", tail="Decision: returned")) == ("accepted", None)
+    v, problem = read_decision(_review("accepted", tail="**Decision:** returned"))
+    assert v is None and "disagree" in problem, problem
+
+
+def test_bold_label_inside_a_fence_is_ignored():
+    from scr.review import read_decision
+    no_heading = TEMPLATE.replace("## Decision\n" + PLACEHOLDER + "\n", "")
+    assert read_decision(no_heading + "```\n**Decision:** accepted\n```\n") == (None, None)
+    assert read_decision(no_heading + "~~~\n## Decision\n  **Decision:** accepted\n~~~\n") == (None, None)
+    assert read_decision(_review("returned (see below)", tail="```\n**Decision:** accepted\n```")) == ("returned", None)
+
+
+def test_indented_label_in_a_feedback_list_item_is_not_the_explicit_line():
+    """Leading whitespace is allowed only on the first line under `## Decision`: an indented `Decision:`
+    further down (a list item's continuation, a quoted note) is feedback, not a verdict."""
+    from scr.review import read_decision
+    body = "returned (feedback below)\n- lemma `a` is misstated\n  Decision: accepted was premature\n  **Decision:** accepted"
+    assert read_decision(_review(body)) == ("returned", None)
+    no_heading = TEMPLATE.replace("## Decision\n" + PLACEHOLDER + "\n", "")
+    assert read_decision(no_heading + "- note\n  Decision: accepted\n") == (None, None)
+
+
 # ---- T-0130: the Discuss brief shows the Decision the same parser reads -------------------------------------
 HEADING = "review.md — Decision"
 
