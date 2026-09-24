@@ -402,6 +402,8 @@ def test_explicit_line_under_the_decision_heading_is_read():
     assert v is None and "disagree" in problem, problem
     assert read_decision(_review("Decision: accepted", tail="Decision: returned")) == ("accepted", None)   # first explicit line wins, as before
     assert read_decision(_review("Decision: accepted", tail="Decision: accepted")) == ("accepted", None)
+    v, problem = read_decision("Decision: returned\n\n" + _review("Decision: accepted"))
+    assert v is None and "disagree" in problem, problem   # an earlier explicit line vs the heading's
 
 
 # ---- T-0130: the Discuss brief shows the Decision the same parser reads -------------------------------------
