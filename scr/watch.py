@@ -9,7 +9,8 @@ Per tick:
     scope drift  -> scope_drift events (once per file)
     HELP: lines  -> help events (once per line)
     wall budget  -> budget_wall (once)
-    submission   report.md != template -> submitted
+    submission   report.md != template -> submitted, unless report_unfinished (a *_PLACEHOLDER token, an empty
+                    or template-prompt `## Result`; T-0180): then one needs line, and the status stays
     dead session -> the launched pid is gone or the transcript .err says claude terminated it: returned
                     + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15)
     heartbeat    checkpoint -> in_progress
@@ -84,6 +85,46 @@ _LINE_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\
 # `scr task set` read it the same way this watcher does; re-exported here so callers and tests keep working.
 from .review import (DECISION_NOTE, VERDICTS, _ANY_HEADING, _DECISION_HEADING, _DECISION_LINE, _DECISION_VERDICT, _FENCE,  # noqa: E402,F401
                      _PLACEHOLDER, _SECTION_VERDICT, _unfenced, _verdict, acceptance_problem, decision_of, read_decision, review_digest)
+
+
+# ---- a half-written report.md is not a submission (T-0180) ---------------------------------------------------
+# T-0172 was submitted with a literal FULL_SUITE_<PLACEHOLDER> token where the full-suite result belonged.
+_REPORT_PLACEHOLDER = re.compile(r"\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b")
+_REPORT_HEADING = re.compile(r"^##\s")
+_RESULT_HEADING = re.compile(r"^##\s+Result\s*$")
+
+
+def _result_body(text: str) -> list[str] | None:
+    """The non-blank lines under `## Result` up to the next `## ` heading; None when there is no such heading."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if _RESULT_HEADING.match(line.strip()):
+            body = []
+            for nxt in lines[i + 1:]:
+                if _REPORT_HEADING.match(nxt):
+                    break
+                if nxt.strip():
+                    body.append(nxt.strip())
+            return body
+    return None
+
+
+def report_unfinished(text: str, tpl: str) -> str | None:
+    """A short reason when report.md is not finished yet, else None: it still holds an ALL-CAPS `*_PLACEHOLDER`
+    token, or its `## Result` section is empty or only the template's prompt line. A report with no
+    `## Result` heading at all is not judged here (None)."""
+    m = _REPORT_PLACEHOLDER.search(text)
+    if m:
+        return f"placeholder {m.group(0)} is still in it; replace it with the real text"
+    body = _result_body(text)
+    if body is None:
+        return None
+    if not body:
+        return "## Result is empty; write what was produced and which done_when lines pass"
+    prompt = set(_result_body(tpl) or [])
+    if prompt and all(line in prompt for line in body):
+        return "## Result is still the template prompt; replace it with what was produced and which done_when lines pass"
+    return None
 
 
 # ---- a stuck task leaves the slot (T-0092): pure functions of (record, review.md, log.md, events, now) -------
@@ -484,7 +525,19 @@ class Watcher:
                 self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
 
             rep = t.dir / "report.md"
-            submitted = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl and self.report_tpl
+            rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
+            submitted = rep.exists() and rep_text != self.report_tpl and self.report_tpl
+            # A report still holding a *_PLACEHOLDER token or no Result is not a submission (T-0180): the task
+            # keeps its status, so the dead-session and wall-budget paths below still route it.
+            unfinished = report_unfinished(rep_text, self.report_tpl) if submitted and t.status != "submitted" else None
+            if unfinished:
+                submitted = False
+                flags.append("REPORT-UNFINISHED")
+                self.need(f"report:{t.id}", f"{t.id} report.md unfinished: {unfinished}", t.id)
+                if self.flag(f"report_unfinished:{t.id}"):
+                    self.log(f"{t.id} report.md unfinished, not submitted: {unfinished}")
+            else:
+                self.unflag(f"report_unfinished:{t.id}")
             # A finished session with a report is a submission, never a death; a session that is gone
             # without one has nothing left to submit -> returned (dispatch relaunches it when ready).
             sess = self.session_of(t) if t.status in DEAD_CHECK_STATUSES else None
