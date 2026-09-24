@@ -771,11 +771,35 @@ _LAND_NEXT = {
     "scope": "widen the record's scope or revert the [checkpoint-drift] commit on {br}, then `scr land {tid}` again",
     "records": "move the named file's text from {wt} into the live root, `git checkout {trunk} -- <file>` in {wt}, then `scr land {tid}` again",
     "busy": "another landing of {tid} is running; wait for it, then `scr land {tid}` again",
+    "lost_worktree": "recreate the worktree (git worktree add {wt} {br}) or merge {br} into {trunk} by hand, then `scr land {tid}` again",
 }
 
 # The merged note of a checkout hotfix (an accepted scriptorium task with no worktree): the journal already
-# put its commits on the trunk. Word for word the note Watcher.land_scriptorium_task sets (T-0154).
+# put its commits on the trunk. Written only by land_no_worktree, for `scr land` and the watcher alike (T-0158).
 HOTFIX_MERGED_NOTE = "tooling task: change already on main (journal)"
+
+
+def land_no_worktree(root: Path, store: Store, t: Task, wl: Workload, dry_run: bool = False) -> dict:
+    """The one landing of an accepted scriptorium task with no worktree (T-0154, T-0158), for land_any and
+    Watcher.land_scriptorium_task. A checkout hotfix — no task/<id> branch, or one already contained in the
+    trunk — is recorded merged with HOTFIX_MERGED_NOTE and nothing else: no merge, no landed event. A task/<id>
+    that carries commits NOT on the trunk is a spawned task whose worktree was lost (removed by hand, a failed
+    retire): recording it merged would drop its work, so it is refused with reason `lost_worktree`, tip = the
+    branch tip, and the task stays accepted."""
+    tid = t.id
+    wt, br, trunk = task_worktree(wl, t), f"task/{tid}", wl.main
+    mg = Git(root)
+    head = f"=== {tid} [{t.status}] no worktree ({wt}) -> {trunk} (scriptorium"
+    if mg.branch_exists(br) and not mg.is_ancestor(br, trunk):
+        tip = mg.run("rev-parse", br).out.strip() or None
+        why = f"FAILED (lost_worktree): worktree missing, branch {br} not on {trunk}: {br} carries commits that are not on {trunk}"
+        return {"ok": False, "reason": "lost_worktree", "sha": None, "tip": tip, "url": None,
+                "out": [head + (", dry run: nothing changed)" if dry_run else ")"), ("  would refuse — " if dry_run else "  ") + why]}
+    if dry_run:
+        return {"ok": True, "reason": None, "sha": None, "tip": None, "url": None,
+                "out": [head + ", dry run: nothing changed)", f"  no worktree: record merged only (change already on {trunk} via the journal)"]}
+    out = [head + ")"] + _record_merged(root, store, tid, HOTFIX_MERGED_NOTE) + [f"  {tid} marked merged ({HOTFIX_MERGED_NOTE})"]
+    return {"ok": True, "reason": None, "out": out, "sha": None, "tip": None, "url": None}
 
 
 def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False) -> dict:
