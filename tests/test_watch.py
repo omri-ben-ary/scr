@@ -1767,8 +1767,7 @@ def test_session_dead_on_reused_pid(world, monkeypatch):
     calls = _mock_session(monkeypatch, alive=True)
     _mock_created(monkeypatch, 132000000000000002)
     res = Watcher(root, quiet=True, auto_decide=True).tick()
-    # returned, then (T-0187) straight back to ready: the session left no checkpoint and no [scriber] line
-    assert res["ok"] and [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["returned", "ready"], res
+    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
     dead = _events(root, "session_dead", "T-0001")
     assert len(dead) == 1 and "pid 4242 was reused by another process" in dead[0]["note"], dead
     assert not _events(root, "stale", "T-0001") and not [c for c in calls if c[0] == "kill"], calls
@@ -2684,12 +2683,18 @@ def test_no_work_death_is_ready_once_per_episode(world, monkeypatch):
     assert len(_events(root, "session_dead", "T-0001")) == 2
 
 
-@pytest.mark.parametrize("work", ["checkpoint", "scriber"])
+@pytest.mark.parametrize("work", ["checkpoint", "scriber", "report", "no_transcript"])
 def test_death_with_real_work_is_unchanged(world, monkeypatch, work):
-    """DoD 5: a dead session that did real work (a checkpoint commit this tick, or a [scriber] log line) is
-    returned as before, its attempt counted, one session_dead event, no pause."""
+    """DoD 5: a dead session that did real work (a checkpoint commit this tick, a [scriber] log line, a report.md
+    written) — or one with no transcript on disk, so no evidence it never ran — is returned as before, its attempt
+    counted, one session_dead event, no pause."""
     root, _, _ = world
     _dying(root, transcript="", work=work == "checkpoint", scriber_line=work == "scriber")
+    t = Store(root).get("T-0001")
+    if work == "report":
+        (t.dir / "report.md").write_text("# Report\n\n## Result\n\nFULL_SUITE_PLACEHOLDER\n", encoding="utf-8")   # unfinished: no submission
+    if work == "no_transcript":
+        (t.dir / TRANSCRIPT).unlink()
     _dead_pids(monkeypatch)
     res = Watcher(root, quiet=True, auto_decide=True).tick()
     t = Store(root).get("T-0001")

@@ -634,7 +634,7 @@ class Watcher:
                         if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
                             self.unflag(key)                              # retried next tick
                         else:
-                            requeued = self.requeue_no_work(t, sess, ckpt_now)
+                            requeued = self.requeue_no_work(t, sess, ckpt_now, dead)
                     self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — " + ("it did no work: set back to ready once (T-0187)" if requeued
                               else "returned; no relaunch from here"), t.id)
             elif ok and t.status in {"in_progress", "checkpoint"}:
@@ -787,15 +787,21 @@ class Watcher:
         self.credits_seen(t.id, line, now)
         return done
 
-    def requeue_no_work(self, t, sess: dict, ckpt_now: bool) -> bool:
+    def requeue_no_work(self, t, sess: dict, ckpt_now: bool, dead: str) -> bool:
         """A task just returned by a session death that did no work (no checkpoint commit since its launch, not this
         tick's either, and no `[scriber]` line after the launcher's) goes back to `ready` — once per episode: the flag
         `nowork:<id>` stays until the task is submitted or a session of it does work, so a second no-work death
-        leaves it `returned` for Omri. The attempt stays counted (max_attempts still bounds it)."""
+        leaves it `returned` for Omri. The attempt stays counted (max_attempts still bounds it). Only on evidence:
+        the session's transcript must exist (the launcher always creates it; without it nothing says the session
+        never ran), and a session claude killed at its background-task ceiling (DEAD_LINE) or one that wrote
+        report.md did work."""
         key = f"nowork:{t.id}"
         log_md = t.dir / "log.md"
         text = log_md.read_text(encoding="utf-8", errors="replace") if log_md.exists() else ""
-        if ckpt_now or did_work(self.read_events(), t.id, sess.get("ts"), text, sess["pid"]):
+        rep = t.dir / "report.md"
+        reported = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl
+        unseen = not sess.get("transcript") or not (t.dir / sess["transcript"]).exists()
+        if unseen or reported or DEAD_LINE in dead or ckpt_now or did_work(self.read_events(), t.id, sess.get("ts"), text, sess["pid"]):
             self.unflag(key)
             return False
         if not self.flag(key):
