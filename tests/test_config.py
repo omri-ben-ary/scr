@@ -308,7 +308,21 @@ def test_limits_valid_real_file_and_floats_do_not_warn(tmp_path: Path):
     (tmp_path / "config" / "limits.yaml").write_text("review_stale_hours: 1.5\nhelp_stale_hours: 0.25\n"
                                                       "dispatch_timeout_minutes: 7.5\nconcurrency: 2.0\n", encoding="utf-8")
     assert _limits_lines(tmp_path)[0] == []
-    from scr.state import LIMITS_NUMERIC
+    (tmp_path / "config" / "limits.yaml").write_text("max_depth: 0\n", encoding="utf-8")      # an agent-read key
+    assert _limits_lines(tmp_path)[0] == ["limits.yaml max_depth: 0 is not a positive number; readers fall back to "
+                                          "nothing (an agent reads the raw value)"]
+
+
+def test_limits_table_defaults_match_the_readers_constants():
+    """The code readers' named defaults are the table's; the table names no allowlisted (agent-read) key."""
+    from scr.ops import LAND_TEST_TIMEOUT_S
+    from scr.state import LIMITS_NOT_NUMERIC, LIMITS_NUMERIC
+    from scr.watch import CREDITS_PAUSE_MINUTES, DISPATCH_TIMEOUT_MINUTES, HELP_STALE_HOURS, REVIEW_STALE_HOURS
+    assert LIMITS_NUMERIC["land_test_timeout_seconds"][1] == LAND_TEST_TIMEOUT_S
+    assert LIMITS_NUMERIC["dispatch_timeout_minutes"][1] == DISPATCH_TIMEOUT_MINUTES
+    assert LIMITS_NUMERIC["review_stale_hours"][1] == REVIEW_STALE_HOURS
+    assert LIMITS_NUMERIC["help_stale_hours"][1] == HELP_STALE_HOURS
+    assert LIMITS_NUMERIC["credits_pause_minutes"][1] == CREDITS_PAUSE_MINUTES
+    assert not set(READERS) & (set(LIMITS_NUMERIC) | LIMITS_NOT_NUMERIC)
     real = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
-    numeric = {k for k, v in real.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
-    assert numeric <= set(LIMITS_NUMERIC), numeric - set(LIMITS_NUMERIC)   # a new numeric key joins the table
+    assert {k for k, v in real.items() if isinstance(v, str)} <= LIMITS_NOT_NUMERIC
