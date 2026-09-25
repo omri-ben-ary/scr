@@ -116,18 +116,22 @@ def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | Non
 
 
 def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode: str | None = None,
-                 model: str | None = None, extra: list[str] | None = None, root: Path | None = None) -> int | None:
+                 model: str | None = None, extra: list[str] | None = None, root: Path | None = None,
+                 env_extra: dict[str, str] | None = None) -> int | None:
     """Detached `claude -p` reading the brief from stdin; stdout/stderr to the transcript. Returns the pid.
-    Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv)."""
+    Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv).
+    `env_extra` is added to the inherited environment (the launcher's per-task background-wait ceiling,
+    scr/bgwait.py); None leaves the environment as it is."""
     args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra)
     if not args:
         return None
     flags = 0
     if os.name == "nt":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]  (+ CREATE_NO_WINDOW from scr/__init__)
+    env = {**os.environ, **env_extra} if env_extra else None
     p = subprocess.Popen(args, cwd=cwd, stdin=brief_file.open("rb"), stdout=transcript.open("ab"),
                          stderr=transcript.with_suffix(transcript.suffix + ".err").open("ab"),
-                         creationflags=flags, start_new_session=(os.name != "nt"))
+                         creationflags=flags, start_new_session=(os.name != "nt"), env=env)
     return p.pid
 
 

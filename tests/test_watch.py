@@ -54,7 +54,7 @@ def _record_launches(monkeypatch) -> list[dict]:
             f = kw.get(k)
             if hasattr(f, "close"):
                 f.close()
-        calls.append({"argv": list(args), "cwd": Path(cwd)})
+        calls.append({"argv": list(args), "cwd": Path(cwd), "env": kw.get("env")})
         return _Proc()
 
     def fake_run(args, cwd=None, **kw):
@@ -2743,3 +2743,82 @@ def test_credits_pause_key_is_read_and_mirrored():
     limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
     assert 'self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES)' in src
     assert limits["credits_pause_minutes"] == CREDITS_PAUSE_MINUTES
+
+
+# ---- per-task background-wait ceiling (scr/bgwait.py) -------------------------------------------------------
+# Headless sessions were killed 600 s after their turn ended while LPs still ran in the background (T-0015,
+# T-0051, T-0226). budget.max_bg_wait_minutes sets CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS for that task's session;
+# over 12 h it needs Omri: `task field` refuses other actors, and the launcher parks a hand-edited request.
+from scr import bgwait  # noqa: E402
+
+
+def test_bgwait_parse_rejects_zero_negative_and_junk():
+    assert bgwait.parse(90) == 90 and bgwait.parse("90") == 90
+    for bad in (0, -5, "x", None, True, 1.5):
+        with pytest.raises(ValueError):
+            bgwait.parse(bad)
+
+
+def test_task_field_bg_wait_over_12h_is_omri_only(world):
+    root, _, _ = world
+    scr(root, "--quiet", "--actor", "steward:T-0001", "task", "field", "T-0001", bgwait.FIELD, "720")
+    assert Store(root).get("T-0001").rec["budget"]["max_bg_wait_minutes"] == 720
+    r = scr(root, "--quiet", "--actor", "intake", "task", "field", "T-0001", bgwait.FIELD, "721", check=False)
+    assert r.returncode != 0 and "only Omri" in (r.stdout + r.stderr)
+    assert Store(root).get("T-0001").rec["budget"]["max_bg_wait_minutes"] == 720
+    r = scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0001", bgwait.FIELD, "0", check=False)
+    assert r.returncode != 0
+    scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0001", bgwait.FIELD, "1440")
+    assert Store(root).get("T-0001").rec["budget"]["max_bg_wait_minutes"] == 1440
+
+
+def test_launch_sets_the_ceiling_env_only_when_asked(world, monkeypatch):
+    from scr.launch import launch
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    _dispatched(root)
+    launch(root, ["T-0001"], mode="headless")
+    assert calls[-1]["env"] is None                       # no field: Claude Code's default, env untouched
+    scr(root, "--quiet", "--actor", "steward:T-0001", "task", "field", "T-0001", bgwait.FIELD, "240")
+    launch(root, ["T-0001"], mode="headless", relaunch=True)
+    assert calls[-1]["env"][bgwait.ENV] == str(240 * 60_000)
+    assert _events(root, "launch", "T-0001")[-1]["data"]["bg_wait_minutes"] == 240
+    assert "background-wait ceiling 240 min" in (Store(root).get("T-0001").dir / "log.md").read_text(encoding="utf-8")
+
+
+def test_launch_honours_omri_authorized_long_ceiling(world, monkeypatch):
+    from scr.launch import launch
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0001", bgwait.FIELD, "1800")
+    _dispatched(root)
+    launch(root, ["T-0001"], mode="headless")
+    assert calls and calls[-1]["env"][bgwait.ENV] == str(1800 * 60_000)
+    assert Store(root).get("T-0001").status == "in_progress"
+
+
+def test_launch_parks_an_unauthorized_long_ceiling(world, monkeypatch):
+    """A record edited by hand past the field guard: no session starts, the task goes to Omri's queue."""
+    from scr.launch import launch
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    t = Store(root).get("T-0001")
+    t.rec.setdefault("budget", {})["max_bg_wait_minutes"] = 1800
+    t.save()
+    scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "x")   # keep the log moving
+    _dispatched(root)
+    out = launch(root, ["T-0001"], mode="headless")
+    assert not calls, calls
+    assert any("NOT launched" in line for line in out), out
+    assert Store(root).get("T-0001").status == "omri_queue"
+    assert _events(root, "bg_wait_unauthorized", "T-0001")
+
+
+def test_brief_names_the_ceiling(world):
+    from scr.brief import brief_for
+    root, _, _ = world
+    st = Store(root)
+    assert "10 min (the default)" in brief_for(root, st, st.get("T-0001"))
+    scr(root, "--quiet", "--actor", "s", "task", "field", "T-0001", bgwait.FIELD, "300")
+    st = Store(root)
+    assert "300 min" in brief_for(root, st, st.get("T-0001"))

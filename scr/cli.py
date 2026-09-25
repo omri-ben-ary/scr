@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
-from . import lifecycle
+from . import bgwait, lifecycle
 from .canon import ZERO
 from .events import EventLog, now_iso
 from .journal import journal
@@ -141,6 +141,14 @@ def cmd_task_field(args):
     root, store, log = _ctx(args)
     t = store.get(args.id)
     val = yaml.safe_load(args.value)
+    if args.field == bgwait.FIELD:
+        try:
+            val = bgwait.parse(val)
+        except ValueError as e:
+            raise RepoError(str(e)) from None
+        if bgwait.needs_omri(val) and args.actor != "omri":
+            raise RepoError(f"{args.id}: {bgwait.FIELD} = {val} min is over {bgwait.AUTH_LIMIT_MINUTES // 60} h; "
+                            "only Omri can authorize that (scr --actor omri task field ...)")
     cur = t.rec
     parts = args.field.split(".")
     for p in parts[:-1]:
