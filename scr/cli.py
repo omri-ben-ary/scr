@@ -372,16 +372,26 @@ def cmd_land(args):
 def cmd_sweep(args):
     root, _, _ = _ctx(args)
     from .ops import sweep
-    rows = sweep(root, merge=args.merge, dry_run=args.dry_run)
+    # --all (T-0202): the hygiene audit, one typed row per worktree of every workload; it fetches origin first
+    # unless --dry-run, which leaves every repo's git state as it found it
+    rows = sweep(root, merge=args.merge, dry_run=args.dry_run, wl_name=args.workload, all_workloads=args.all,
+                 fetch=args.all and not args.dry_run)
     if args.json:
         _out(rows, True); return
     for r in rows:
+        if r["kind"] != "dirty-mission":
+            print(f"--- {r['workload']}/{r['worktree']} ({r['branch']}): {r['kind']}" + (f" — {r['note']}" if r["note"] else ""))
+            continue
         print(f"=== {r['worktree']} ({r['branch']}): {r['files']} uncommitted file(s)" + (f" -> {r['sha']}" if r["sha"] else "") + (f" PR {r['url']}" if r["url"] else ""))
         for f in r["sample"]:
             print(f"  {f}")
         if r["note"]:
             print(f"  {r['note']}")
-    print("sweep: nothing to do" if not rows else f"sweep: {len(rows)} worktree(s)" + (" (dry run)" if args.dry_run else ""))
+    if args.all:
+        from .ops import HYGIENE_KINDS
+        print("sweep --all: " + ", ".join(f"{k} {sum(1 for r in rows if r['kind'] == k)}" for k in HYGIENE_KINDS) + (" (dry run)" if args.dry_run else ""))
+    else:
+        print("sweep: nothing to do" if not rows else f"sweep: {len(rows)} worktree(s)" + (" (dry run)" if args.dry_run else ""))
     if any(not r["ok"] for r in rows):
         sys.exit(1)
 
@@ -678,7 +688,9 @@ def build_parser() -> argparse.ArgumentParser:
     ld = sub.add_parser("land", parents=[common], help=land_help, description=land_help)
     ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true"); ld.set_defaults(fn=cmd_land)
     sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
-    sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true"); sw.set_defaults(fn=cmd_sweep)
+    sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true")
+    sw.add_argument("--all", action="store_true", help="hygiene audit: every workload, one typed row per worktree (dirty-mission/finished/phantom/orphan/locked/live); only dirty missions are committed")
+    sw.add_argument("--workload", help="the workload to sweep (default: the first in config/workloads.yaml)"); sw.set_defaults(fn=cmd_sweep)
     pk = sub.add_parser("park", parents=[common], help="returned -> escalated -> omri_queue"); pk.add_argument("id"); pk.add_argument("--note"); pk.set_defaults(fn=cmd_park)
     rt = sub.add_parser("retire", parents=[common], help="quarantine a merged worktree (move, never delete)"); rt.add_argument("name"); rt.add_argument("--execute", action="store_true"); rt.set_defaults(fn=cmd_retire)
     sp = sub.add_parser("spawn", parents=[common], help="worktree per dispatched task from origin/<main>"); sp.add_argument("--tasks", nargs="*"); sp.add_argument("--no-lake", action="store_true"); sp.set_defaults(fn=cmd_spawn)

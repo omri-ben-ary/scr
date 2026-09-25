@@ -861,48 +861,192 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
     return {**r, "url": None}
 
 
-# ---- sweep -------------------------------------------------------------------------------
-def sweep(root: Path, merge: bool = False, dry_run: bool = False, wl_name: str | None = None) -> list[dict]:
-    """Every non-task worktree (missions like qi-mission-24) with uncommitted work: commit on its
-    branch, push, and with merge=True PR + merge into <main>. Returns one row per worktree."""
-    wl = workload(root, None, wl_name)
+# ---- sweep: the hygiene audit pass (docs/hygiene-protocols.md §3, §10, §11 F1) ------------------
+HYGIENE_KINDS = ("dirty-mission", "finished", "phantom", "orphan", "locked", "live")
+FINISHED_STATUSES = {"merged", "closed", "rejected"}
+TASK_DIR = re.compile(r"^T-\d+$")
+
+
+def _norm(p: str | Path) -> str:
+    return os.path.normcase(str(Path(p).resolve()))
+
+
+def registered_worktrees(repo: Path) -> list[dict]:
+    """`git worktree list --porcelain` of a repo minus its main checkout: [{path, branch, locked, reason}]."""
+    r = Git(repo).run("worktree", "list", "--porcelain")
+    if not r.ok:
+        return []
+    out: list[dict] = []
+    for block in r.out.replace("\r\n", "\n").split("\n\n"):
+        cur: dict = {}
+        for line in block.splitlines():
+            key, _, val = line.partition(" ")
+            if key == "worktree":
+                cur = {"path": val, "branch": None, "locked": False, "reason": ""}
+            elif key == "branch" and cur:
+                cur["branch"] = val.removeprefix("refs/heads/")
+            elif key == "detached" and cur:
+                cur["branch"] = "HEAD"
+            elif key == "locked" and cur:
+                cur["locked"], cur["reason"] = True, val
+        if cur:
+            out.append(cur)
+    return out[1:]                      # the first entry is the repo's own checkout
+
+
+def audit_workload(root: Path, wl: Workload, store: Store | None = None, fetch: bool = False) -> list[dict]:
+    """Protocol A's detector for one workload: one typed row per worktree the repo registers or the
+    worktree root holds, kind in HYGIENE_KINDS. Read-only apart from `fetch` (the daily pass fetches
+    origin first; `--dry-run` never does, so it leaves the repo's refs as they were). Classification only:
+    the repairs (retire, prune, quarantine, leftover commits) are F2."""
+    store = store or Store(root)
+    if not Git(wl.repo).is_repo():
+        return []
+    mg = Git(wl.repo)
+    if fetch and wl.repo != root.resolve():
+        mg.fetch()
+    base = branch_base(root, wl, mg)
+    records = store.load_all()
+    reg = {_norm(w["path"]): w for w in registered_worktrees(wl.repo)}
     rows: list[dict] = []
-    if not wl.wt_root.exists():
-        return rows
-    for d in sorted(p for p in wl.wt_root.iterdir() if p.is_dir() and not re.match(r"^T-\d+$", p.name)):
+
+    def row(name: str, path: Path | str, kind: str, branch: str | None = None, **kw) -> dict:
+        r = {"workload": wl.name, "worktree": name, "path": str(path), "branch": branch, "kind": kind,
+             "files": 0, "sample": [], "sha": None, "url": None, "ok": True, "note": ""}
+        r.update(kw)
+        rows.append(r)
+        return r
+
+    for key, w in sorted(reg.items()):
+        if not Path(w["path"]).exists():                                    # A2 phantom
+            row(Path(w["path"]).name, w["path"], "phantom", w["branch"], note="registered, directory gone")
+    dirs = sorted(p for p in wl.wt_root.iterdir() if p.is_dir()) if wl.wt_root.is_dir() else []
+    for d in dirs:
+        w = reg.get(_norm(d))
+        if w is None:                                                       # A3 orphan: not a worktree of wl.repo
+            row(d.name, d, "orphan", note="not registered in git worktree list")
+            continue
         g = Git(d)
-        if not g.is_repo():
+        br = w["branch"] or (g.run("rev-parse", "--abbrev-ref", "HEAD").out or None)
+        is_task = bool(TASK_DIR.match(d.name))
+        dirty = [] if is_task else g.dirty()
+        if dirty:                                                           # D3: what `scr sweep` commits
+            row(d.name, d, "dirty-mission", br, files=len(dirty), sample=dirty[:25])
             continue
-        dirty = g.dirty()
-        if not dirty:
+        if w["locked"]:                                                     # A4: a deliberate human act
+            row(d.name, d, "locked", br, note=w["reason"] or "locked")
             continue
-        br = g.branch()
-        row = {"worktree": d.name, "branch": br, "files": len(dirty), "sample": dirty[:25], "sha": None, "url": None, "ok": True, "note": ""}
-        rows.append(row)
-        if dry_run:
-            continue
-        try:
-            row["sha"] = g.commit_all(f"[sweep] uncommitted work found in .worktrees/{d.name} on {br} ({now_iso()})\n\nSwept by `scr sweep` so it exists in git history; content unreviewed.")
-        except GitError as e:
-            row["ok"] = False; row["note"] = str(e)[-300:]; continue
-        r = g.push(br)
-        if not r.ok:
-            row["ok"] = False; row["note"] = "push failed: " + r.out[-300:]; continue
-        if merge:
-            if not gh_available():
-                row["note"] = f"gh missing; PR by hand: {br} -> {wl.main}"; continue
-            url = pr_url_for(br, d)
-            if not url:
-                bf = root / ".scr" / f"sweep-{d.name}.md"; bf.parent.mkdir(exist_ok=True)
-                bf.write_text(f"Swept by `scr sweep`; see the commit message. Merging keeps the agents' {wl.main} a complete record.\n", encoding="utf-8")
-                url = pr_create(wl.main, br, f"[sweep] {d.name}: land uncommitted mission work", bf, d)
-            row["url"] = url
-            if url:
-                m = pr_merge(url, d)
-                if not m.ok:
-                    row["ok"] = False; row["note"] = "merge failed: " + m.out[-300:]
-        _log(root).append("system", name="sweep", actor="steward-watch", note=f"{d.name} ({br}): {len(dirty)} file(s) -> {row['sha']}" + (f" PR {row['url']}" if row["url"] else ""))
+        status = records[d.name].status if is_task and d.name in records else None
+        sha = g.head()
+        clean = not g.run("status", "--porcelain", "--untracked-files=no").out.strip()
+        merged = bool(sha) and mg.is_ancestor(sha, base)
+        if is_task:
+            done = status in FINISHED_STATUSES
+        else:
+            done = bool(br) and (mg.remote_contains(f"origin/{br}", sha or br) or mg.remote_contains(f"origin/{wl.main}", sha or br))
+        extra = {"status": status} if is_task else {}
+        if merged and clean and done:                                       # A1 finished
+            row(d.name, d, "finished", br, note=f"ancestor of {base}", **extra)
+        else:
+            why = [] if clean else ["uncommitted tracked changes"]
+            if not merged:
+                why.append(f"not in {base}")
+            if is_task and not done:
+                why.append(f"record {status or 'missing'}")
+            row(d.name, d, "live", br, note="; ".join(why), **extra)
     return rows
+
+
+def _sweep_commit(root: Path, wl: Workload, row: dict, merge: bool) -> None:
+    """Commit + push one dirty mission worktree (and with merge=True, PR + merge into <main>)."""
+    d, br = Path(row["path"]), row["branch"]
+    g = Git(d)
+    try:
+        row["sha"] = g.commit_all(f"[sweep] uncommitted work found in .worktrees/{d.name} on {br} ({now_iso()})\n\nSwept by `scr sweep` so it exists in git history; content unreviewed.")
+    except GitError as e:
+        row["ok"] = False; row["note"] = str(e)[-300:]; return
+    r = g.push(br)
+    if not r.ok:
+        row["ok"] = False; row["note"] = "push failed: " + r.out[-300:]; return
+    if merge:
+        if not gh_available():
+            row["note"] = f"gh missing; PR by hand: {br} -> {wl.main}"; return
+        url = pr_url_for(br, d)
+        if not url:
+            bf = root / ".scr" / f"sweep-{d.name}.md"; bf.parent.mkdir(exist_ok=True)
+            bf.write_text(f"Swept by `scr sweep`; see the commit message. Merging keeps the agents' {wl.main} a complete record.\n", encoding="utf-8")
+            url = pr_create(wl.main, br, f"[sweep] {d.name}: land uncommitted mission work", bf, d)
+        row["url"] = url
+        if url:
+            m = pr_merge(url, d)
+            if not m.ok:
+                row["ok"] = False; row["note"] = "merge failed: " + m.out[-300:]
+    _log(root).append("system", name="sweep", actor="steward-watch", note=f"{d.name} ({br}): {row['files']} file(s) -> {row['sha']}" + (f" PR {row['url']}" if row["url"] else ""))
+
+
+def sweep(root: Path, merge: bool = False, dry_run: bool = False, wl_name: str | None = None,
+          all_workloads: bool = False, fetch: bool = False) -> list[dict]:
+    """Every non-task worktree (missions like qi-mission-24) with uncommitted work: commit on its
+    branch, push, and with merge=True PR + merge into <main>. Returns one row per such worktree
+    (kind `dirty-mission`) of one workload — `scr/chores.py` `no_dirty_worktrees` reads exactly that.
+
+    all_workloads=True (`scr sweep --all`, T-0202) is the hygiene audit: every workload in
+    config/workloads.yaml, one typed row per worktree (HYGIENE_KINDS); only `dirty-mission` rows are
+    ever committed, so a `T-*` worktree is listed but never swept. dry_run never commits or pushes."""
+    store = Store(root)
+    names = list(store.config("workloads") or {}) if all_workloads else [wl_name]
+    rows: list[dict] = []
+    for name in names:
+        wl = workload(root, store, name)
+        for r in audit_workload(root, wl, store, fetch=fetch):
+            if not all_workloads and r["kind"] != "dirty-mission":
+                continue
+            rows.append(r)
+            if r["kind"] == "dirty-mission" and not dry_run:
+                _sweep_commit(root, wl, r, merge)
+    return rows
+
+
+def repo_position(wl: Workload) -> dict:
+    """The checkout's branch and <main> vs origin/<main> as (ahead, behind), for the digest; no fetch."""
+    g = Git(wl.repo)
+    br = g.run("rev-parse", "--abbrev-ref", "HEAD")
+    lr = g.run("rev-list", "--left-right", "--count", f"{wl.main}...origin/{wl.main}")
+    ahead, behind = (lr.out.split() + ["?", "?"])[:2] if lr.ok else ("?", "?")
+    return {"branch": br.out if br.ok else "?", "ahead": ahead, "behind": behind}
+
+
+def hygiene_digest(root: Path, rows: list[dict], day: str) -> Path:
+    """Write reports/hygiene/<day>.md from the audit rows (§10). Informational: nothing in it is a task,
+    a chore or a card."""
+    store = Store(root)
+    lines = [f"# Hygiene digest {day}", "",
+             "Written by the watcher's daily pass (`scr sweep --all`, classification only). Nothing here is an "
+             "Omri-queue item (docs/hygiene-protocols.md §9).", ""]
+    for name in (store.config("workloads") or {}):
+        wl = workload(root, store, name)
+        mine = [r for r in rows if r["workload"] == name]
+        pos = repo_position(wl) if Git(wl.repo).is_repo() else None
+        lines.append(f"## {name}")
+        lines.append("")
+        lines.append(f"- repo `{wl.repo}`: " + (f"checkout on `{pos['branch']}`, `{wl.main}` {pos['ahead']} ahead / {pos['behind']} behind `origin/{wl.main}`" if pos else "not a git repo"))
+        lines.append("- worktrees: " + ", ".join(f"{k} {sum(1 for r in mine if r['kind'] == k)}" for k in HYGIENE_KINDS))
+        shown = [r for r in mine if r["kind"] != "live"]
+        if shown:
+            lines += ["", "| worktree | branch | kind | detail |", "|---|---|---|---|"]
+            for r in shown:
+                detail = f"{r['files']} file(s)" if r["kind"] == "dirty-mission" else r.get("note", "")
+                lines.append(f"| {r['worktree']} | {r['branch'] or ''} | {r['kind']} | {detail} |")
+        lines.append("")
+    counts = {n: 0 for n in ("journal_failed", "push_failed", "fetch_failed")}
+    for e in _log(root).read():
+        if e.get("kind") == "system" and e.get("name") in counts and str(e.get("ts", "")).startswith(day):
+            counts[e["name"]] += 1
+    lines += ["## Failures today", "", ", ".join(f"{k} {v}" for k, v in counts.items()), ""]
+    p = root / "reports" / "hygiene" / f"{day}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
 
 
 # ---- retire (quarantine, never delete) ---------------------------------------------------
