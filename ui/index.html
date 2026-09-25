@@ -213,7 +213,7 @@ function renderNeeds() {
     const c = document.createElement('article'); c.className = 'card' + (running ? ' running' : '') + (CURRENT === n.id ? ' selected' : ''); c.dataset.type = n.type; if (n.name) c.dataset.name = n.name; c.tabIndex = 0;
     c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
     const top = document.createElement('div'); top.className = 'top';
-    const badge = n.name || n.type;   // system alarms wear their kind (scope_drift, session_dead, stale); escalated tasks say so
+    const badge = (n.type === 'system' || n.type === 'gate') && n.name ? n.name : n.type;   // system alarms wear their kind (scope_drift, session_dead, stale); escalated tasks say escalated / slot_freed
     top.innerHTML = `<span class="badge ${n.type} ${esc(badge)}">${esc(badge)}</span> <span>${esc(n.id)}</span>` + (n.age_h ? `<span>· ${n.age_h} h</span>` : '') + (n.ts ? `<span>· ${fmtTs(n.ts)}</span>` : '') + (n.waiting && n.waiting.length ? `<span>· ${n.waiting.length} waiting</span>` : '');
     const title = document.createElement('div'); title.className = 'title'; title.textContent = n.title;
     c.append(top, title);
@@ -237,7 +237,7 @@ function renderNeeds() {
       } else {
         for (const o of (n.options || [])) act.append(actionButton(o, 'primary', () => answer(n, o)));
         act.append(actionButton('Answer…', '', () => { select(n.id); setTimeout(() => $('#answerText') && $('#answerText').focus(), 50); }));
-        if (n.h) act.append(actionButton('Dismiss', '', () => start({ kind: 'ack', key: n.h }, n.key)));   // silences an escalated card until its status changes again
+        if (n.type === 'gate' && n.h) act.append(actionButton('Dismiss', '', () => start({ kind: 'ack', key: n.h }, n.key)));   // silences an escalated card until its status changes again
       }
       const discussItem = n.type === 'chore' ? 'chore:' + n.id : (n.type === 'system' ? 'event:' + n.h : (n.type === 'hotfix' ? 'hotfix:' + n.id : n.id));
       act.append(actionButton('Discuss', '', () => start({ kind: 'discuss', item: discussItem }, 'discuss:' + discussItem)));

@@ -481,7 +481,6 @@ def test_watcher_journal_push_comes_from_config(tmp_path: Path):
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
     assert not Watcher(root, quiet=True).push_journal and Watcher(root, quiet=True, push=True).push_journal
 
-<<<<<<< ours
 
 def test_ui_page_has_no_inbox_form_or_done_list():
     """T-0086: the left panel no longer carries the 'Add an idea to the Inbox' form or the 'Done' list.
@@ -504,11 +503,14 @@ def test_ui_quit_button_waits_for_the_quit_job():
     assert "failed" in handler and "output" in handler
     assert page.count("Scriptorium is shut down") == 1
     assert not re.search(r"await start\(\{ kind: 'quit' \}[^;]*\);\s*setTimeout\(", handler)
-=======
+
+
 NL = chr(10)
 
 # ---- T-0109: escalated scriber tasks are visible to Omri ----------------------------------------
 REVIEW_ESCALATED = "# Steward review" + NL + NL + "## Mechanical checks" + NL + "| check | result |" + NL + "|---|---|" + NL + NL + "## Decision" + NL + "escalated (landing path)" + NL + NL + "## Feedback / diagnosis" + NL + "none" + NL
+
+REVIEW_ACCEPTED = "# Steward review" + NL + NL + "## Mechanical checks" + NL + "| check | result |" + NL + "|---|---|" + NL + "| pytest | pass |" + NL + NL + "## Decision" + NL + "accepted" + NL
 
 
 def escalated_world(repo: Path) -> Path:
@@ -527,6 +529,7 @@ def escalated_world(repo: Path) -> Path:
     (Store(repo).get("T-0002").dir / "review.md").write_text(REVIEW_ESCALATED, encoding="utf-8")
     scr(repo, "--quiet", "task", "set", "T-0003", "escalated")
     (Store(repo).get("T-0003").dir / "review.md").unlink(missing_ok=True)
+    (Store(repo).get("T-0004").dir / "review.md").write_text(REVIEW_ACCEPTED, encoding="utf-8")   # T-0081: no acceptance without a review
     for s in ("accepted", "merged"):
         scr(repo, "--quiet", "task", "set", "T-0004", s)
     return repo
@@ -570,13 +573,11 @@ def test_decision_line_reads_the_review(tmp_path: Path):
 
 
 def test_ui_cards_for_escalated_tasks(repo: Path):
-    from scr.ui import _read, state, task_cards
+    from scr.ui import needs_cards, state
     escalated_world(repo)
 
-    def cards() -> dict[str, dict]:
-        tasks = Store(repo).load_all()
-        acked = set(_read(repo / "reports" / "ui.acks.txt").split())
-        return {c["key"]: c for c in task_cards(repo, tasks, Graph.build(tasks), acked)}
+    def cards() -> dict[str, dict]:   # the task cards of the payload (chore cards depend on the machine)
+        return {c["key"]: c for c in needs_cards(repo) if str(c.get("id", "")).startswith("T-")}
 
     c = cards()
     assert set(c) == {"decision:T-0001", "task:T-0002:escalated", "task:T-0003:escalated"}   # one card per task, no gate:/duplicate
@@ -606,4 +607,22 @@ def test_ui_cards_for_escalated_tasks(repo: Path):
         scr(repo, "--quiet", "task", "set", "T-0002", s)
     assert "task:T-0002:escalated" not in cards()
     assert "task:T-0003:escalated" in cards()
->>>>>>> theirs
+
+
+def test_ui_escalated_card_carries_the_slot_freed_action(repo: Path):
+    """T-0109 + T-0092: a task the watcher escalated has ONE card, the task:<id>:escalated card, whose body is the
+    newest slot_freed note (the ACTION for Omri) followed by the review's Decision line; no gate:<id> card and no
+    separate slot_freed alarm card. An action from an earlier escalation episode is not shown on a later one."""
+    from scr.ui import needs_cards
+    escalated_world(repo)
+    action = "ACTION for Omri: merge task/T-0003 by hand. Why: stuck 3 ticks."
+    scr(repo, "--quiet", "event", "system", "--name", "slot_freed", "--task", "T-0003", "--note", action)
+    cards = [c for c in needs_cards(repo) if c.get("id") == "T-0003"]
+    assert len(cards) == 1, cards
+    assert cards[0]["key"] == "task:T-0003:escalated" and cards[0]["name"] == "slot_freed"
+    assert cards[0]["text"].startswith("ACTION for Omri") and cards[0]["text"].endswith("review.md Decision: no review.md")
+    # a later episode: back to work and escalated again; the old action no longer stands for it
+    for s in ("omri_queue", "triaged", "ready", "dispatched", "in_progress", "submitted", "escalated"):
+        scr(repo, "--quiet", "task", "set", "T-0003", s)
+    cards = [c for c in needs_cards(repo) if c.get("id") == "T-0003"]
+    assert len(cards) == 1 and cards[0]["name"] == "escalated" and cards[0]["text"] == "no review.md", cards
