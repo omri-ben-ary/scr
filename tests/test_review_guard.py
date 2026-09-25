@@ -539,3 +539,81 @@ def test_discuss_brief_shows_the_decision_the_parser_reads(world, form, present,
         lines = brief[brief.index(HEADING):].splitlines()
         assert lines[1].startswith(present[0]), lines[:3]
         assert review_decision(t.dir) in (None, lines[1].split()[0]), (review_decision(t.dir), lines[1])
+
+
+# ---- T-0139: the decision and help answers check the rc of every scr call, like the gate branch -------------
+def _decide_item(root: Path, status: str) -> str:
+    """A `queue: omri`, `kind: decide` item on `world`, brought to `status` (triaged or omri_queue) and
+    rendered into queues/omri.md so the answer has an `Answer:` slot."""
+    scr(root, "--quiet", "--actor", "intake", "task", "new", "Pick an option", "--queue", "omri", "--kind", "decide", "--id", "T-0900")
+    for st in {"triaged": ("triaged",), "omri_queue": ("triaged", "omri_queue")}[status]:
+        scr(root, "--quiet", "--actor", "intake", "task", "set", "T-0900", st)
+    scr(root, "--quiet", "--actor", "intake", "refresh")
+    assert Store(root).get("T-0900").status == status
+    assert "### T-0900 ·" in (root / "queues" / "omri.md").read_text(encoding="utf-8")
+    return "T-0900"
+
+
+def test_decision_answer_on_a_triaged_item_is_refused(world):
+    """`triaged -> closed` is not in OMRI_TRANSITIONS: the close is refused, apply says so (ok False, the
+    refusal in log) instead of returning ok True over a record that never closed. Omri's words stay."""
+    root, _, _ = world
+    tid = _decide_item(root, "triaged")
+    r = apply(root, tid, "option 1", kind="decision", concierge=False)
+    assert r["ok"] is False, r
+    assert Store(root).get(tid).status == "triaged"
+    assert any("closed" in m and tid in m for m in r["log"]), r["log"]
+    assert not _events(root, tid, "state", to="closed")
+    assert len(_events(root, tid, "system", name="answer")) == 1
+    assert "answer: option 1" in (Store(root).get(tid).dir / "log.md").read_text(encoding="utf-8")
+
+
+def test_decision_answer_on_an_omri_queue_item_closes(world, monkeypatch):
+    root, _, _ = world
+    tid = _decide_item(root, "omri_queue")
+    # Every scr call re-renders queues/omri.md, and render_omri does not keep a filled `Answer:` (seen at
+    # T-0139), so read the queue as the first scr call (the `answer` event) is made: apply wrote it by then.
+    import scr.answers as answers
+    real, seen = answers.scr_cmd, []
+    def spy(root_, actor, *a, **k):
+        if "answer" in a:
+            seen.append((root / "queues" / "omri.md").read_text(encoding="utf-8"))
+        return real(root_, actor, *a, **k)
+    monkeypatch.setattr(answers, "scr_cmd", spy)
+    r = apply(root, tid, "option 1", kind="decision", concierge=False)
+    assert r["ok"] is True, r
+    assert Store(root).get(tid).status == "closed"
+    assert len(_events(root, tid, "system", name="answer")) == 1
+    st = _events(root, tid, "state", to="closed")
+    assert len(st) == 1 and st[0]["actor"] == "concierge", st
+    assert len(seen) == 1 and re.search(rf"### {tid} ·.*?\nAnswer: option 1\n", seen[0], re.S), seen
+
+
+def test_help_answer_with_a_failed_event_is_refused(world, monkeypatch):
+    root, _, _ = world
+    t = _submit(root, worktree=False)
+    import scr.answers as answers
+    real = answers.scr_cmd
+    monkeypatch.setattr(answers, "scr_cmd", lambda root, actor, *a, **k: (1, "refused") if "help_answered" in a else real(root, actor, *a, **k))
+    r = apply(root, t.id, "look at line 3", kind="help", concierge=False)
+    assert r["ok"] is False and "refused" in r["log"], r
+    log = (t.dir / "log.md").read_text(encoding="utf-8")
+    assert any("[steward]" in ln and "via UI" in ln and "look at line 3" in ln for ln in log.splitlines()), log
+    assert not _events(root, t.id, "system", name="help_answered")
+    monkeypatch.setattr(answers, "scr_cmd", real)
+    r = apply(root, t.id, "look at line 3", kind="help", concierge=False)
+    assert r["ok"] is True, r
+    assert len(_events(root, t.id, "system", name="help_answered")) == 1
+
+
+def test_decision_refused_close_does_not_start_the_concierge(world, monkeypatch):
+    root, _, _ = world
+    calls: list[tuple] = []
+    monkeypatch.setattr("scr.answers.start_concierge", lambda *a, **k: calls.append(a))
+    tid = _decide_item(root, "triaged")
+    r = apply(root, tid, "option 1", kind="decision", concierge=True)
+    assert r["ok"] is False and calls == [], (r, calls)
+    scr(root, "--quiet", "--actor", "intake", "task", "set", tid, "omri_queue")
+    r = apply(root, tid, "option 2", kind="decision", concierge=True)
+    assert r["ok"] is True and len(calls) == 1 and calls[0][1] == tid, (r, calls)
+    assert Store(root).get(tid).status == "closed"
