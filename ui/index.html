@@ -213,12 +213,16 @@ function renderNeeds() {
     const c = document.createElement('article'); c.className = 'card' + (running ? ' running' : '') + (CURRENT === n.id ? ' selected' : ''); c.dataset.type = n.type; if (n.name) c.dataset.name = n.name; c.tabIndex = 0;
     c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
     const top = document.createElement('div'); top.className = 'top';
-    const badge = n.type === 'system' && n.name ? n.name : n.type;   // system alarms wear their kind: scope_drift, session_dead, stale
+    const badge = (n.type === 'system' || n.type === 'gate') && n.name ? n.name : n.type;   // system alarms wear their kind (scope_drift, session_dead, stale); escalated tasks say escalated / slot_freed
     top.innerHTML = `<span class="badge ${n.type} ${esc(badge)}">${esc(badge)}</span> <span>${esc(n.id)}</span>` + (n.age_h ? `<span>· ${n.age_h} h</span>` : '') + (n.ts ? `<span>· ${fmtTs(n.ts)}</span>` : '') + (n.waiting && n.waiting.length ? `<span>· ${n.waiting.length} waiting</span>` : '');
     const title = document.createElement('div'); title.className = 'title'; title.textContent = n.title;
     c.append(top, title);
     if (n.text) { const t = document.createElement('div'); t.className = 'text'; t.textContent = n.text; c.append(t); }
     if (n.link) { const a = document.createElement('a'); a.href = n.link; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open the page this needs ↗'; c.append(a); }
+    if (n.review) {   // escalated by the Steward (T-0109): the Decision line is n.text; the record's review is one click away
+      const a = document.createElement('a'); a.href = '#' + n.id; a.textContent = 'Open the review (' + n.review + ')'; a.onclick = e => { e.preventDefault(); TAB = 'review'; select(n.id); }; c.append(a);
+      if (n.worktree) { const w = document.createElement('div'); w.className = 'text'; w.style.fontFamily = 'var(--mono)'; w.style.fontSize = '12px'; w.textContent = 'worktree: ' + n.worktree; c.append(w); }
+    }
     const act = document.createElement('div'); act.className = 'actions';
     if (running) {
       const s = document.createElement('span'); s.className = 'status'; s.textContent = `in progress since ${fmtTs(job.started)}…`; act.append(s);
@@ -233,6 +237,7 @@ function renderNeeds() {
       } else {
         for (const o of (n.options || [])) act.append(actionButton(o, 'primary', () => answer(n, o)));
         act.append(actionButton('Answer…', '', () => { select(n.id); setTimeout(() => $('#answerText') && $('#answerText').focus(), 50); }));
+        if (n.type === 'gate' && n.h) act.append(actionButton('Dismiss', '', () => start({ kind: 'ack', key: n.h }, n.key)));   // silences an escalated card until its status changes again
       }
       const discussItem = n.type === 'chore' ? 'chore:' + n.id : (n.type === 'system' ? 'event:' + n.h : (n.type === 'hotfix' ? 'hotfix:' + n.id : n.id));
       act.append(actionButton('Discuss', '', () => start({ kind: 'discuss', item: discussItem }, 'discuss:' + discussItem)));

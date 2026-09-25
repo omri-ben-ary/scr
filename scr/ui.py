@@ -31,6 +31,7 @@ from . import chores as chores_mod
 from .events import EventLog, now_iso
 from .graph import Graph
 from .journal import last_failure
+from .queue import ESCALATED_STATUSES, decision_line
 from .run import _env, scr_cmd, scr_exe
 from .state import State
 from .store import Store, find_root
@@ -206,6 +207,46 @@ def watch_cards(root: Path, tasks: dict, acked: set[str], now: datetime | None =
     return cards
 
 
+def escalation_episodes(root: Path) -> dict[str, dict]:
+    """Per task, from the whole event log: `since`, the ts of its latest state event (the moment its status last
+    changed), and `action`, the newest `slot_freed` note (the watcher's one action for Omri, T-0092) raised since the
+    task last entered `escalated`/`omri_queue` from another status — an older episode's action is not shown."""
+    out: dict[str, dict] = {}
+    for e in EventLog(root / "events" / "events.jsonl").read():
+        tid = e.get("task")
+        if not tid:
+            continue
+        ep = out.setdefault(tid, {"since": "", "action": None})
+        if e.get("kind") == "state":
+            ep["since"] = e.get("ts") or ""
+            if e.get("to") in ESCALATED_STATUSES and e.get("from") not in ESCALATED_STATUSES:
+                ep["action"] = None
+        elif e.get("kind") == "system" and e.get("name") == "slot_freed" and e.get("note"):
+            ep["action"] = str(e["note"])[:900]
+    return out
+
+
+def escalated_card(t, ep: dict, acked: set[str]) -> list[dict]:
+    """The Needs-you card of a task that waits on Omri by status (T-0109): one per open task in `escalated` or
+    `omri_queue` that is not a `queue: omri` item (those carry their decision card). Status-driven: it goes when the
+    status moves on, no ack needed; `h` carries the ts of the last status change, so an ack silences it until the
+    status changes again. Its text is the watcher's slot_freed ACTION when this episode has one, then the review's
+    Decision line — what to do is on the card, not behind a click. It replaces the old `gate:<id>` card and the
+    separate slot_freed alarm card, so an escalated task has exactly one card."""
+    rec, d = t.rec, t.dir
+    since = ep.get("since") or rec.get("updated") or ""
+    h = f"task:{t.id}:escalated:{since}"
+    if h in acked:
+        return []
+    decision = decision_line(d)
+    action = ep.get("action")
+    return [{"key": f"task:{t.id}:escalated", "h": h, "id": t.id, "kind": rec.get("kind"), "name": "slot_freed" if action else "escalated",
+             "title": rec.get("title", ""), "status": t.status, "type": "gate", "options": ["accept", "return", "reject"],
+             "text": f"{action}\nreview.md Decision: {decision}" if action else decision, "decision": decision,
+             "review": f"{d.name}/review.md", "record": f"/api/task/{t.id}", "worktree": rec.get("worktree"),
+             "since": since, "age_h": _age_h(since)}]
+
+
 def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
     """The needs-you cards, in page order: what the page shows and what the watcher pushes out of band
     (scr/notify.py, T-0090) — one source for both. Each card has a `key` (what `scr ack` takes)."""
@@ -213,6 +254,7 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
         tasks = Store(root).load_all()
     g = Graph.build(tasks)
     acked = acked_keys(root)
+    esc = escalation_episodes(root)
     needs: list[dict] = []
     for t in tasks.values():
         rec, d = t.rec, t.dir
@@ -221,13 +263,12 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
             needs.append({"key": f"decision:{t.id}", "id": t.id, "kind": rec.get("kind"), "title": rec.get("title", ""), "status": t.status,
                           "type": "decision", "options": _options(_read(d / "spec.md")), "waiting": waiting,
                           "created": rec.get("created"), "age_h": _age_h(rec.get("created"))})
+        elif t.status in ESCALATED_STATUSES:
+            needs += escalated_card(t, esc.get(t.id, {}), acked)
         if t.status in {"in_progress", "checkpoint", "dispatched", "submitted"}:
             for h in _help_lines(_read(d / "log.md")):
                 needs.append({"key": f"help:{t.id}:{h['line']}", "id": t.id, "kind": "help", "title": rec.get("title", ""), "status": t.status,
                               "type": "help", "text": h["text"], "line": h["line"], "options": []})
-        if t.status == "escalated" or (t.status == "omri_queue" and rec.get("queue") == "scribers"):
-            needs.append({"key": f"gate:{t.id}", "id": t.id, "kind": "gate", "title": rec.get("title", ""), "status": t.status,
-                          "type": "gate", "options": ["accept", "return", "reject"], "text": "escalated by the Steward — see review.md"})
     # System alarms: ONE card per (task, alarm kind), not one per event — a watcher that logs per file can
     # otherwise produce hundreds of cards (583 on 2026-09-16). A card's key `events:<task>:<name>:<latest ts>`
     # acks every event of that task and kind up to that timestamp in one click; old per-event acks
@@ -247,6 +288,8 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
         if age is not None and age > 24 * 7:
             continue
         if e.get("kind") != "system" or e.get("name") not in ALARM_EVENTS:
+            continue
+        if e.get("name") == "slot_freed":   # its note is the body of the task:<id>:escalated card (T-0109), never a card of its own
             continue
         task, name, ts = e.get("task") or "-", e.get("name"), e.get("ts") or ""
         if e.get("h") in acked or ts <= group_acked.get((task, name), ""):

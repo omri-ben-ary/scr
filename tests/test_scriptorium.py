@@ -503,3 +503,126 @@ def test_ui_quit_button_waits_for_the_quit_job():
     assert "failed" in handler and "output" in handler
     assert page.count("Scriptorium is shut down") == 1
     assert not re.search(r"await start\(\{ kind: 'quit' \}[^;]*\);\s*setTimeout\(", handler)
+
+
+NL = chr(10)
+
+# ---- T-0109: escalated scriber tasks are visible to Omri ----------------------------------------
+REVIEW_ESCALATED = "# Steward review" + NL + NL + "## Mechanical checks" + NL + "| check | result |" + NL + "|---|---|" + NL + NL + "## Decision" + NL + "escalated (landing path)" + NL + NL + "## Feedback / diagnosis" + NL + "none" + NL
+
+REVIEW_ACCEPTED = "# Steward review" + NL + NL + "## Mechanical checks" + NL + "| check | result |" + NL + "|---|---|" + NL + "| pytest | pass |" + NL + NL + "## Decision" + NL + "accepted" + NL
+
+
+def escalated_world(repo: Path) -> Path:
+    """T-0001 queue: omri decide in omri_queue; T-0002 scriber in omri_queue with a written Decision and a
+    worktree; T-0003 scriber in escalated with no review.md; T-0004 scriber merged (the 2026-09-21 shape)."""
+    scr(repo, "--quiet", "task", "new", "Decide X", "--id", "T-0001", "--kind", "decide", "--queue", "omri", "--origin", "omri")
+    for s in ("triaged", "omri_queue"):
+        scr(repo, "--quiet", "task", "set", "T-0001", s)
+    for tid, title in (("T-0002", "hand merge me"), ("T-0003", "escalated without a review"), ("T-0004", "already merged")):
+        scr(repo, "--quiet", "task", "new", title, "--id", tid, "--kind", "refactor", "--origin", "omri")
+        for s in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+            scr(repo, "--quiet", "task", "set", tid, s)
+    scr(repo, "--quiet", "task", "set", "T-0002", "escalated", "--note", "review.md Decision: escalated (landing path)")
+    scr(repo, "--quiet", "task", "set", "T-0002", "omri_queue", "--note", "hand merge of task/T-0002")
+    scr(repo, "--quiet", "task", "field", "T-0002", "worktree", "../scriptorium-worktrees/T-0002")
+    (Store(repo).get("T-0002").dir / "review.md").write_text(REVIEW_ESCALATED, encoding="utf-8")
+    scr(repo, "--quiet", "task", "set", "T-0003", "escalated")
+    (Store(repo).get("T-0003").dir / "review.md").unlink(missing_ok=True)
+    (Store(repo).get("T-0004").dir / "review.md").write_text(REVIEW_ACCEPTED, encoding="utf-8")   # T-0081: no acceptance without a review
+    for s in ("accepted", "merged"):
+        scr(repo, "--quiet", "task", "set", "T-0004", s)
+    return repo
+
+
+def test_render_omri_lists_escalated_scriber_tasks(repo: Path):
+    from scr.queue import ESCALATED_MARK, INBOX_MARK, render_omri
+    escalated_world(repo)
+    g = Graph.build(Store(repo).load_all())
+    out = render_omri(g, "## Inbox" + NL + NL + "- keep me" + NL)
+    decisions, rest = out.split(ESCALATED_MARK, 1)
+    escalated, inbox = rest.split(INBOX_MARK, 1)
+    # the decide item is unchanged: still first, still with its Answer: slot
+    assert "### T-0001 · decide · Decide X" in decisions and "Answer:" in decisions
+    assert "T-0002" not in decisions and "T-0003" not in decisions
+    # the escalated section names the two scriber tasks with their Decision line, and nothing else
+    assert "### T-0002 · refactor · hand merge me" in escalated
+    assert "Decision: escalated (landing path)" in escalated
+    assert "Worktree: `../scriptorium-worktrees/T-0002`" in escalated
+    assert "### T-0003 · refactor · escalated without a review" in escalated
+    assert "Decision: no review.md" in escalated
+    assert "T-0004" not in out and "T-0001" not in escalated
+    assert "Answer:" not in escalated                      # the slot stays only for queue: omri items
+    assert escalated.index("T-0002") < escalated.index("T-0003")
+    assert "- keep me" in inbox                            # the Inbox block is preserved verbatim
+    # `scr refresh` writes the same view to queues/omri.md, which the Discuss brief reads
+    scr(repo, "refresh", "--quiet")
+    assert ESCALATED_MARK in (repo / "queues" / "omri.md").read_text(encoding="utf-8")
+
+
+def test_decision_line_reads_the_review(tmp_path: Path):
+    from scr.queue import NO_DECISION, NO_REVIEW, UNFILLED_DECISION, decision_line
+    d = tmp_path
+    assert decision_line(d) == NO_REVIEW
+    (d / "review.md").write_text("# r" + NL + "## Decision" + NL + NL + "## Feedback" + NL + "x" + NL, encoding="utf-8")
+    assert decision_line(d) == NO_DECISION
+    (d / "review.md").write_text("## Decision" + NL + "accepted | returned (feedback below) | escalated (Gate N, reason)" + NL, encoding="utf-8")
+    assert decision_line(d) == UNFILLED_DECISION
+    (d / "review.md").write_text("## Decision" + NL + "escalated (no landing path: the fix is uncommitted," + NL + "commit it by hand)" + NL + NL + "trailing para" + NL, encoding="utf-8")
+    assert decision_line(d) == "escalated (no landing path: the fix is uncommitted, commit it by hand)"
+
+
+def test_ui_cards_for_escalated_tasks(repo: Path):
+    from scr.ui import needs_cards, state
+    escalated_world(repo)
+
+    def cards() -> dict[str, dict]:   # the task cards of the payload (chore cards depend on the machine)
+        return {c["key"]: c for c in needs_cards(repo) if str(c.get("id", "")).startswith("T-")}
+
+    c = cards()
+    assert set(c) == {"decision:T-0001", "task:T-0002:escalated", "task:T-0003:escalated"}   # one card per task, no gate:/duplicate
+    assert c["task:T-0002:escalated"]["text"] == "escalated (landing path)"
+    assert c["task:T-0002:escalated"]["worktree"] == "../scriptorium-worktrees/T-0002"
+    assert c["task:T-0002:escalated"]["review"].endswith("/review.md") and c["task:T-0002:escalated"]["record"] == "/api/task/T-0002"
+    assert c["task:T-0003:escalated"]["text"] == "no review.md"
+    assert c["task:T-0002:escalated"]["status"] == "omri_queue" and c["task:T-0003:escalated"]["status"] == "escalated"
+    # the full status payload carries the same cards
+    payload = state(repo)
+    keys = [n["key"] for n in payload["needs"]]
+    assert "task:T-0002:escalated" in keys and "task:T-0003:escalated" in keys and "gate:T-0002" not in keys
+    # ack silences the card until the status changes again; a status change brings it back
+    h2 = c["task:T-0002:escalated"]["h"]
+    assert h2.startswith("task:T-0002:escalated:20")
+    scr(repo, "--quiet", "ack", h2)
+    assert "task:T-0002:escalated" not in cards() and "task:T-0003:escalated" in cards()
+    scr(repo, "--quiet", "task", "set", "T-0002", "triaged", "--note", "back to intake")
+    scr(repo, "--quiet", "task", "set", "T-0002", "ready")
+    scr(repo, "--quiet", "task", "set", "T-0002", "blocked")
+    scr(repo, "--quiet", "task", "set", "T-0002", "escalated", "--note", "again")
+    c = cards()
+    assert "task:T-0002:escalated" in c and c["task:T-0002:escalated"]["h"] != h2
+    # merged: the card clears by itself, no ack needed
+    scr(repo, "--quiet", "task", "set", "T-0002", "omri_queue")
+    for s in ("accepted", "merged"):
+        scr(repo, "--quiet", "task", "set", "T-0002", s)
+    assert "task:T-0002:escalated" not in cards()
+    assert "task:T-0003:escalated" in cards()
+
+
+def test_ui_escalated_card_carries_the_slot_freed_action(repo: Path):
+    """T-0109 + T-0092: a task the watcher escalated has ONE card, the task:<id>:escalated card, whose body is the
+    newest slot_freed note (the ACTION for Omri) followed by the review's Decision line; no gate:<id> card and no
+    separate slot_freed alarm card. An action from an earlier escalation episode is not shown on a later one."""
+    from scr.ui import needs_cards
+    escalated_world(repo)
+    action = "ACTION for Omri: merge task/T-0003 by hand. Why: stuck 3 ticks."
+    scr(repo, "--quiet", "event", "system", "--name", "slot_freed", "--task", "T-0003", "--note", action)
+    cards = [c for c in needs_cards(repo) if c.get("id") == "T-0003"]
+    assert len(cards) == 1, cards
+    assert cards[0]["key"] == "task:T-0003:escalated" and cards[0]["name"] == "slot_freed"
+    assert cards[0]["text"].startswith("ACTION for Omri") and cards[0]["text"].endswith("review.md Decision: no review.md")
+    # a later episode: back to work and escalated again; the old action no longer stands for it
+    for s in ("omri_queue", "triaged", "ready", "dispatched", "in_progress", "submitted", "escalated"):
+        scr(repo, "--quiet", "task", "set", "T-0003", s)
+    cards = [c for c in needs_cards(repo) if c.get("id") == "T-0003"]
+    assert len(cards) == 1 and cards[0]["name"] == "escalated" and cards[0]["text"] == "no review.md", cards
