@@ -60,7 +60,8 @@ from .events import EventLog
 from .gitops import Git
 from .journal import journal
 from .lifecycle import requeue
-from .ops import LOG_PATHS, checkpoint, is_scriptorium_task, land, land_any, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
+from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
+                  scope_drift, self_workload, sweep, task_worktree, workload, workload_for)
 from .run import kill, pid_alive, process_created, scr_cmd, start_claude
 from .state import State
 from .store import Store
@@ -716,6 +717,9 @@ class Watcher:
                     self.retire_refused(t.id, r["code"])
         self.retire_refused_needs(tasks)
 
+        if ok:
+            self.hygiene_pass()
+
         if self.auto_intake and ok:
             nightly = datetime.now().hour == 22 and self.flag(f"intake:{datetime.now():%Y-%m-%d}")
             if merged_now or nightly:
@@ -752,6 +756,29 @@ class Watcher:
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
                 "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- the daily hygiene pass (docs/hygiene-protocols.md §3, §10; T-0202) ------------------------------------------
+    def hygiene_pass(self) -> Path | None:
+        """Once per local date (flag `hygiene:<date>`, like `intake:<date>`): `sweep --all` as a classification
+        (fetch, no commit), `reports/hygiene/<date>.md`, and one `hygiene_digest` event. Informational only: no
+        needs line, chore or task comes from it. A failure leaves the flag unset, so the next tick retries."""
+        day = f"{datetime.now():%Y-%m-%d}"
+        key = f"hygiene:{day}"
+        if key in self.flags:
+            return None
+        try:
+            rows = sweep(self.root, dry_run=True, all_workloads=True, fetch=True)
+            path = hygiene_digest(self.root, rows, day)
+        except Exception as e:  # noqa: BLE001 — a hygiene failure is a log line, never a tick crash
+            self.log(f"hygiene pass FAILED: {e}")
+            return None
+        self.flags.add(key)
+        rel = path.relative_to(self.root).as_posix()
+        counts = ", ".join(f"{k} {n}" for k in HYGIENE_KINDS if (n := sum(1 for r in rows if r["kind"] == k)))
+        EventLog(self.root / "events" / "events.jsonl").append("system", name="hygiene_digest", actor="steward-watch",
+                                                                note=f"{rel}: {counts or 'no worktrees'}")
+        self.log(f"hygiene digest {rel}: {counts or 'no worktrees'}")
+        return path
 
     # ---- out of usage credits is not a session death (T-0187) ------------------------------------------
     def credits_paused(self, now: datetime) -> dict | None:
