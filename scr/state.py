@@ -12,6 +12,42 @@ from .graph import Graph
 from .store import Store, STATES
 
 
+# T-0207: the numeric config/limits.yaml keys -> (reader's conversion, the default its reader falls back to).
+# Every code reader swallows a bad value into its inline default (or crashes on int("abc") later), so verify
+# names it instead. `int` keys also refuse a non-integral float (int(0.5) is a silent 0); None as the default
+# means an agent reads the key through its brief and has no fallback. statement_window is not numeric (T-0135).
+LIMITS_NUMERIC: dict[str, tuple[type, Any]] = {
+    "concurrency": (int, 3),                    # scr/cli.py:259, scr/queue.py:14, scr/watch.py:741, scr/ui.py:316
+    "wip_ready_scribers": (int, None),          # the Intake agent (scr/launch.py INTAKE_BRIEF, agents/intake.md)
+    "max_successors_per_task": (int, None),     # the Intake agent (agents/intake.md)
+    "max_depth": (int, None),                   # the Intake agent (scr/launch.py INTAKE_BRIEF, agents/intake.md)
+    "default_max_attempts": (int, 3),           # scr/cli.py:68
+    "omri_stale_hours": (float, None),          # the Concierge agent (agents/concierge.md)
+    "dispatch_timeout_minutes": (float, 30),    # scr/watch.py:881 (DISPATCH_TIMEOUT_MINUTES)
+    "checkpoint_every_minutes": (int, 30),      # scr/cli.py:442, scr/watch.py:361
+    "land_test_timeout_seconds": (int, 3600),   # scr/ops.py:484 land_test_timeout (LAND_TEST_TIMEOUT_S)
+    "review_stale_hours": (float, 2.0),         # scr/watch.py:917 (REVIEW_STALE_HOURS)
+    "help_stale_hours": (float, 3.0),           # scr/watch.py:918 (HELP_STALE_HOURS)
+    "credits_pause_minutes": (float, 60),       # scr/watch.py:785,793 (CREDITS_PAUSE_MINUTES)
+}
+
+
+def limits_warnings(limits: dict) -> list[str]:
+    """One line per LIMITS_NUMERIC key present in `limits` whose value is not a positive number (bools and
+    strings count as not numbers). Absent keys are not reported."""
+    out = []
+    for key, (kind, default) in LIMITS_NUMERIC.items():
+        if key not in limits:
+            continue
+        v = limits[key]
+        ok = (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+              and (kind is float or float(v).is_integer()))
+        if not ok:
+            fallback = default if default is not None else "nothing (an agent reads the raw value)"
+            out.append(f"limits.yaml {key}: {v!r} is not a positive number; readers fall back to {fallback}")
+    return out
+
+
 def git_head(root: Path) -> str | None:
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, timeout=10)
@@ -145,6 +181,9 @@ class State:
                 if t.is_open and (not key or key not in wls):
                     warnings.append(f"{tid}: workload '{key or ''}' is not registered in config/workloads.yaml "
                                     f"(resolves to the first entry, '{wls[0]}')")
+
+        limits = self.store.config("limits")
+        warnings += limits_warnings(limits if isinstance(limits, dict) else {})
 
         if self.graph_path.exists():
             try:

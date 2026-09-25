@@ -272,3 +272,43 @@ def test_land_test_timeout_reads_limits_and_defaults_to_3600(tmp_path: Path):
         assert land_test_timeout(Store(tmp_path)) == 3600, bad
     line = [l for l in (REPO / "config" / "limits.yaml").read_text(encoding="utf-8").splitlines() if "land_test_timeout_seconds" in l]
     assert len(line) == 1 and line[0].startswith("land_test_timeout_seconds:") and "scr/ops.py" in line[0], line
+
+
+# ---- T-0207: scr verify warns on a present but unusable numeric limits key -------------------------------
+def _limits_lines(root: Path) -> tuple[list[str], list[str]]:
+    from scr.state import State
+    r = State(root).verify()
+    return [w for w in r["warnings"] if w.startswith("limits.yaml")], r["errors"]
+
+
+def test_limits_invalid_values_warn_in_verify(tmp_path: Path):
+    """0, a negative and a string each give one warning naming the key; errors are the same as with no
+    limits.yaml at all (verify stays green on a bad value); an absent key gives nothing."""
+    (tmp_path / "config").mkdir()
+    lim = tmp_path / "config" / "limits.yaml"
+    lim.write_text("concurrency: 2\n", encoding="utf-8")
+    clean, base_errors = _limits_lines(tmp_path)
+    assert clean == []
+    lim.write_text('land_test_timeout_seconds: 0\nreview_stale_hours: -1\nconcurrency: "two"\n', encoding="utf-8")
+    lines, errors = _limits_lines(tmp_path)
+    assert len(lines) == 3, lines
+    for key, default in (("land_test_timeout_seconds", "3600"), ("review_stale_hours", "2.0"), ("concurrency", "3")):
+        assert any(l.startswith(f"limits.yaml {key}:") and l.endswith(f"fall back to {default}") for l in lines), (key, lines)
+    assert errors == base_errors
+    for bad in ("true", "null", "0.5", "[]"):                               # bool, empty, fractional int key, non-scalar
+        lim.write_text(f"default_max_attempts: {bad}\n", encoding="utf-8")
+        assert len(_limits_lines(tmp_path)[0]) == 1, bad
+
+
+def test_limits_valid_real_file_and_floats_do_not_warn(tmp_path: Path):
+    """The real config/limits.yaml gives no limits warning; a float is fine where the reader uses float()."""
+    (tmp_path / "config").mkdir()
+    shutil.copy(REPO / "config" / "limits.yaml", tmp_path / "config" / "limits.yaml")
+    assert _limits_lines(tmp_path)[0] == []
+    (tmp_path / "config" / "limits.yaml").write_text("review_stale_hours: 1.5\nhelp_stale_hours: 0.25\n"
+                                                      "dispatch_timeout_minutes: 7.5\nconcurrency: 2.0\n", encoding="utf-8")
+    assert _limits_lines(tmp_path)[0] == []
+    from scr.state import LIMITS_NUMERIC
+    real = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    numeric = {k for k, v in real.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    assert numeric <= set(LIMITS_NUMERIC), numeric - set(LIMITS_NUMERIC)   # a new numeric key joins the table
