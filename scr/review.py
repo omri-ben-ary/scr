@@ -16,15 +16,16 @@ from pathlib import Path
 
 # ---- the Decision written in review.md (T-0091) ------------------------------------------------------
 VERDICTS = ("accepted", "returned", "escalated")
-# the explicit form the review brief asks for, anchored at column zero: `Decision: escalated (Gate 2, reason)`;
-# the label may be emphasised, `**Decision:** accepted` (T-0208). Leading whitespace is allowed only for the
-# first line under `## Decision` (the `_SECTION_*` twins), so an indented `Decision:` in a list item elsewhere
-# never becomes the explicit line
-_LABEL = r"[*_]{0,2}Decision:[*_]{0,2}"
-_DECISION_LINE = re.compile(rf"^{_LABEL}")
-_DECISION_VERDICT = re.compile(rf"^{_LABEL}\s*[*_`]*(accepted|returned|escalated)\b")
-_SECTION_DECISION_LINE = re.compile(rf"^\s*{_LABEL}")
-_SECTION_DECISION_VERDICT = re.compile(rf"^\s*{_LABEL}\s*[*_`]*(accepted|returned|escalated)\b")
+# the explicit form the review brief asks for, anchored at column zero: `Decision: escalated (Gate 2, reason)`.
+# A candidate line is normalised once (`_normalise`, T-0210) and then matched against the plain form, so every
+# markdown spelling of the label reads the same: blockquoted (`> Decision:`), emphasised with the colon inside
+# or outside (`**Decision:**`, `**Decision**:`, `_Decision_:`, T-0208), any case (`decision:`). Leading
+# whitespace is stripped only for the first line under `## Decision`, so an indented `Decision:` in a list item
+# elsewhere never becomes the explicit line; `* Decision:` (emphasis marker, then a space) is a bullet, not a label
+_BLOCKQUOTE = re.compile(r"^(?:>[ \t]*)+")
+_LABEL = re.compile(r"^[*_]{0,3}decision[*_]{0,3}:[*_]{0,3}", re.IGNORECASE)
+_DECISION_LINE = re.compile(r"^Decision:")
+_DECISION_VERDICT = re.compile(r"^Decision:\s*[*_`]*(accepted|returned|escalated)\b")
 # the template form: the first non-blank line under a `## Decision` heading, its first word the verdict
 _DECISION_HEADING = re.compile(r"^#{1,6}\s*Decision\b")
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
@@ -53,6 +54,16 @@ def _unfenced(text: str) -> list[str]:
     return out
 
 
+def _normalise(line: str) -> str:
+    """A candidate Decision line in the plain form: a leading `>` blockquote marker dropped, and a label that
+    is emphasised or not lowercase rewritten to `Decision:`. Only the label is touched — the verdict word
+    stays case-sensitive (`Decision: Accepted` is unreadable, not accepted) — and leading whitespace is kept,
+    so the caller decides whether an indented line may qualify."""
+    line = _BLOCKQUOTE.sub("", line)
+    m = _LABEL.match(line)
+    return "Decision:" + line[m.end():] if m else line
+
+
 def _verdict(line: str, rx: re.Pattern) -> str | None:
     """The verdict a candidate line states, or None when it names none or more than one
     (`accepted | returned` left over from the placeholder is ambiguous, not a verdict)."""
@@ -65,7 +76,7 @@ def _verdict(line: str, rx: re.Pattern) -> str | None:
 
 def read_decision(review_md: str) -> tuple[str | None, str | None]:
     """(verdict, problem) from a review.md text. The verdict comes from the FIRST `Decision:` line at column
-    zero (label optionally emphasised, `**Decision:**`, T-0208) outside a code fence (the explicit form the review brief asks for) or, failing that, from the
+    zero (after `_normalise`: blockquoted, emphasised or lowercase labels read too, T-0208/T-0210) outside a code fence (the explicit form the review brief asks for) or, failing that, from the
     first non-blank line under a `## Decision` heading whose first word is a verdict (the template form
     T-0062's review used; a `Decision:` line there is read by the explicit rule, T-0193). The untouched
     placeholder is no decision. When both forms are present they
@@ -73,7 +84,7 @@ def read_decision(review_md: str) -> tuple[str | None, str | None]:
     read (`Decision: maybe`, a section that opens with prose, the two forms disagreeing): that is for
     Omri, never a transition."""
     lines = _unfenced(review_md)
-    explicit = next((l for l in lines if _DECISION_LINE.match(l)), None)
+    explicit = next((l for l in lines if _DECISION_LINE.match(_normalise(l))), None)
     section = None
     for i, line in enumerate(lines):
         if _DECISION_HEADING.match(line):
@@ -86,22 +97,25 @@ def read_decision(review_md: str) -> tuple[str | None, str | None]:
             break
     # `Decision: accepted` as the section's first line is the explicit form written under the heading (T-0193):
     # read it with the explicit rule, or the section pass would call its own `Decision:` prefix unreadable
-    section_rx = _SECTION_VERDICT
-    if section is not None and (m := _SECTION_DECISION_LINE.match(section)):
-        section_rx = _SECTION_DECISION_VERDICT
-        if _PLACEHOLDER.match(section[m.end():]):
-            section = None
-    if section is not None and _PLACEHOLDER.match(section):
+    section_rx, section_norm = _SECTION_VERDICT, None
+    if section is not None:
+        section_norm = _normalise(section.lstrip())
+        if (m := _DECISION_LINE.match(section_norm)):
+            section_rx = _DECISION_VERDICT
+            if _PLACEHOLDER.match(section_norm[m.end():]):
+                section = None
+    if section is not None and _PLACEHOLDER.match(section_norm):
         section = None
-    if explicit is not None and _PLACEHOLDER.match(explicit[_DECISION_LINE.match(explicit).end():]):   # the brief's own wording, copied
+    explicit_norm = _normalise(explicit) if explicit is not None else None
+    if explicit is not None and _PLACEHOLDER.match(explicit_norm[_DECISION_LINE.match(explicit_norm).end():]):   # the brief's own wording, copied
         explicit = None
     if explicit is None and section is None:
         return None, None
     found: dict[str, str | None] = {}
     if explicit is not None:
-        found[explicit] = _verdict(explicit, _DECISION_VERDICT)
+        found[explicit] = _verdict(explicit_norm, _DECISION_VERDICT)
     if section is not None:
-        found[section] = _verdict(section, section_rx)
+        found[section] = _verdict(section_norm, section_rx)
     bad = [l for l, v in found.items() if v is None]
     if bad:
         return None, f"unreadable Decision line {bad[0].strip()[:120]!r}"
