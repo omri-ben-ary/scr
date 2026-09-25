@@ -12,7 +12,11 @@ Per tick:
     submission   report.md != template -> submitted, unless report_unfinished (a *_PLACEHOLDER token, an empty
                     or template-prompt `## Result`; T-0180): then one needs line, and the status stays
     dead session -> the launched pid is gone or the transcript .err says claude terminated it: returned
-                    + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15)
+                    + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15); a session that did
+                    no work (no checkpoint since its launch, no [scriber] line) is then set ready, once per episode;
+                    one whose transcript ends in the credit-exhaustion line is no death at all (T-0187): ready with
+                    its attempt refunded, and ONE credits_exhausted event pauses auto-dispatch and reviews (one
+                    `credits` needs line) for credits_pause_minutes or until a credits_resumed / watcher_resumed event
     heartbeat    checkpoint -> in_progress
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
@@ -55,6 +59,7 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
+from .lifecycle import requeue
 from .ops import LOG_PATHS, checkpoint, is_scriptorium_task, land, land_any, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
 from .run import kill, pid_alive, process_created, scr_cmd, start_claude
 from .state import State
@@ -74,6 +79,13 @@ DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}
 REVIEW_STALE_HOURS, HELP_STALE_HOURS = 2.0, 3.0      # limits.yaml: review_stale_hours / help_stale_hours
 DISPATCH_TIMEOUT_MINUTES = 30                        # limits.yaml: dispatch_timeout_minutes (T-0122)
+CREDITS_PAUSE_MINUTES = 60                           # limits.yaml: credits_pause_minutes (T-0187)
+# What a headless claude prints, alone, when the account has no usage credits left (T-0121's transcript,
+# 2026-09-23): the session never ran. Anchored at a line start and read only in a transcript's last lines, so
+# a report or log that merely quotes it is not a credit death.
+CREDITS_LINE = re.compile(r"^\W{0,4}(You['’]re|You are) out of usage credits|^\W{0,4}Credit balance is too low", re.I)
+# The events that end a credit pause before its clock does: Omri's own, or the page's Resume button.
+CREDITS_RESUME_EVENTS = {"credits_resumed", "watcher_resumed"}
 # A HELP line the scriber cannot proceed past: plain `HELP:` or `HELP[blocks: …]:`. `HELP[proceeding: …]:`
 # (T-0068) is a question asked while working, never a block.
 _HELP_BLOCKING = re.compile(r"^\s*(-\s*)?HELP(\[blocks:[^\]]*\])?:")
@@ -227,6 +239,54 @@ def help_stale(log_md: str, hours: float, now: datetime, seen: dict[str, datetim
     return {"line": i + 1, "text": text, "since": since, "age_h": round(age_h, 1)}
 
 
+# ---- out of usage credits is not a session death (T-0187) ----------------------------------------------------
+def credits_line(*paths: Path) -> str | None:
+    """The credit-exhaustion line when one of the last three non-blank lines of any of the files matches
+    CREDITS_LINE (a session's transcript and its .err), else None. Unreadable or missing files are skipped."""
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        except OSError:
+            continue
+        for line in [l.strip() for l in text.splitlines() if l.strip()][-3:]:
+            if CREDITS_LINE.search(line):
+                return line[:200]
+    return None
+
+
+def credits_pause(events: list[dict], now: datetime, minutes: float) -> dict | None:
+    """{since, until} while auto-dispatch is paused for exhausted credits: the newest `credits_exhausted` system
+    event has no `credits_resumed` / `watcher_resumed` event after it and is younger than `minutes`. When the
+    clock runs out the next tick's dispatch is the probe: a session that dies of credits again opens a new pause."""
+    since = None
+    for e in events:
+        if e.get("kind") != "system":
+            continue
+        if e.get("name") == "credits_exhausted":
+            since = _event_ts(e) or since
+        elif e.get("name") in CREDITS_RESUME_EVENTS and since is not None:
+            since = None
+    if since is None:
+        return None
+    until = since + timedelta(minutes=minutes)
+    return {"since": since, "until": until} if now < until else None
+
+
+def did_work(events: list[dict], tid: str, since: str | None, log_md: str, pid: int) -> bool:
+    """A launched session did work: a `checkpoint_commit` event for the task at or after its launch (`since`, the
+    launch event's ts), or a `[scriber]` line in log.md after the launcher's line for `pid` (the whole log when
+    that line is missing). An undatable launch counts every checkpoint of the task (never a false 'no work')."""
+    start = _parse_ts(since) if since else None
+    for e in events:
+        if e.get("kind") == "system" and e.get("name") == "checkpoint_commit" and e.get("task") == tid:
+            ts = _event_ts(e)
+            if start is None or ts is None or ts >= start:
+                return True
+    lines = log_md.splitlines()
+    at = max((i for i, l in enumerate(lines) if re.search(rf"\[launcher\] pid {int(pid)}\b", l)), default=-1)
+    return any("[scriber]" in l for l in lines[at + 1:])
+
+
 class Watcher:
     def __init__(self, root: Path, *, stale_minutes: int = 45, auto_review=False, auto_decide=False, auto_dispatch=False,
                  allow_statements=False, auto_land=False, auto_intake=False, permission_mode=None, push=False,
@@ -259,6 +319,7 @@ class Watcher:
         self.escalated: list[dict] = []            # the stuck tasks this tick moved to `escalated` (T-0092)
         self.timed_out: list[dict] = []            # the dispatches this tick moved back to `ready` (T-0122)
         self.events: list[dict] | None = None      # events.jsonl, read once per tick
+        self.credit_hits: list[str] = []           # the sessions this tick found dead of exhausted credits (T-0187)
 
     # ---- helpers ------------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -424,6 +485,7 @@ class Watcher:
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
         self.needs, self.need_items, self.rows, self.escalated, self.timed_out, self.events = [], [], [], [], [], None
+        self.credit_hits = []
         if (self.root / ".scr" / "paused").exists():
             self.log("paused (resume from the UI)")
             self.need("paused", "watcher paused")
@@ -454,6 +516,7 @@ class Watcher:
             newest = max([x for x in (self.newest_change(wt), datetime.fromtimestamp(log_md.stat().st_mtime, tz=timezone.utc) if log_md.exists() else None) if x], default=None)
             idle = int((now - newest).total_seconds() // 60) if newest else -1
             flags: list[str] = []
+            ckpt_now = False                                # this tick's checkpoint committed something (T-0187)
 
             # A spawned worktree is checkpointed whatever its workload: until T-0078 (2026-09-21) a scriptorium
             # task was assumed to live in the checkout ("tooling") and its worktree was never committed, so
@@ -465,6 +528,7 @@ class Watcher:
                         c = checkpoint(self.root, t.id, push=self.push)
                         if c and c.head:
                             flags.append(f"ckpt:{c.head}")
+                            ckpt_now = True
                         # T-0079: the checkpoint put these in a [checkpoint-drift] commit and raised the ONE
                         # scope_drift event for them; the drift block below must not raise a second one
                         for p in (c.drift if c else []):
@@ -552,15 +616,27 @@ class Watcher:
                 self.scr(f"steward:{t.id}", "task", "set", t.id, "submitted", "--note", "report.md written (watcher)", "--quiet")
                 self.log(f"{t.id} -> submitted (report.md written)")
                 flags.append("SUBMITTED")
+                self.unflag(f"nowork:{t.id}")                         # a submission ends the no-work episode (T-0187)
             elif ok and dead:
                 flags.append(f"DEAD pid {sess['pid']}")
                 key = f"dead:{t.id}:{sess['pid']}"
-                if self.flag(key):
-                    self.log(f"{t.id} session dead: {dead} -> returned")
-                    self.scr(f"steward:{t.id}", "event", "system", "--name", "session_dead", "--task", t.id, "--note", f"pid {sess['pid']}: {dead}"[:300], "--quiet")
-                    if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
+                # T-0187: a session that printed the credit-exhaustion line never ran — not a death, not an attempt
+                credit = credits_line(t.dir / sess["transcript"], t.dir / (sess["transcript"] + ".err")) if sess.get("transcript") else None
+                if credit:
+                    flags.append("CREDITS")
+                    if self.flag(key) and not self.credit_death(t, sess, credit, now):
                         self.unflag(key)                                  # retried next tick
-                self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — returned; no relaunch from here", t.id)
+                else:
+                    requeued = False
+                    if self.flag(key):
+                        self.log(f"{t.id} session dead: {dead} -> returned")
+                        self.scr(f"steward:{t.id}", "event", "system", "--name", "session_dead", "--task", t.id, "--note", f"pid {sess['pid']}: {dead}"[:300], "--quiet")
+                        if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
+                            self.unflag(key)                              # retried next tick
+                        else:
+                            requeued = self.requeue_no_work(t, sess, ckpt_now, dead)
+                    self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — " + ("it did no work: set back to ready once (T-0187)" if requeued
+                              else "returned; no relaunch from here"), t.id)
             elif ok and t.status in {"in_progress", "checkpoint"}:
                 if t.status == "in_progress":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "checkpoint", "--quiet")
@@ -587,7 +663,15 @@ class Watcher:
             # is applied here; a task whose decision is applied needs no review session.
             if self.auto_decide and ok and self.apply_decision(t, decided):
                 continue
-            if self.auto_review and ok and self.flag(f"review:{t.id}"):
+            # T-0187: a review session that printed the credit-exhaustion line never reviewed; its flag goes, so a
+            # fresh review starts once the credit pause is over (never while it stands)
+            tr = self.newest_review_transcript(t)
+            if ok and tr and f"review:{t.id}" in self.flags and (line := credits_line(tr, tr.with_name(tr.name + ".err"))):
+                if self.flag(f"credits_review:{t.id}:{tr.name}"):
+                    self.log(f"{t.id} review session out of usage credits ({tr.name}): review relaunched after the pause")
+                    self.unflag(f"review:{t.id}")
+                    self.credits_seen(t.id, line, now)
+            if self.auto_review and ok and not self.credits_paused(now) and self.flag(f"review:{t.id}"):
                 self.start_review(t)
         if decided:
             tasks = self.store.load_all()                   # auto-land below sees an `accepted` applied this tick
@@ -640,7 +724,16 @@ class Watcher:
                 for line in intake(self.root):
                     self.log(f"  intake: {line}")
 
-        if self.auto_dispatch and ok:
+        pause = self.credits_paused(now)
+        if pause:
+            self.need("credits", f"Out of usage credits (since {pause['since']:%Y-%m-%d %H:%M}Z): auto-dispatch and reviews are paused; "
+                      "the sessions that hit it went back to ready without spending an attempt. Resumes by itself at "
+                      f"{pause['until']:%H:%M}Z (that tick's dispatch is the probe; another credit death pauses again), or now: "
+                      "top up at claude.ai/settings/usage, then Pause + Resume on the page, or "
+                      "`scr --actor omri event system --name credits_resumed`")
+        if self.auto_dispatch and ok and pause:
+            self.log("auto-dispatch held: out of usage credits")
+        elif self.auto_dispatch and ok:
             cap = int(self.limits.get("concurrency", 3))
             tasks = self.store.load_all()
             n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES)   # escalated / returned never count (T-0092)
@@ -659,6 +752,78 @@ class Watcher:
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
                 "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- out of usage credits is not a session death (T-0187) ------------------------------------------
+    def credits_paused(self, now: datetime) -> dict | None:
+        return credits_pause(self.read_events(), now, float(self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES)))
+
+    def credits_seen(self, tid: str, line: str, now: datetime) -> None:
+        """A session (scriber or review) printed the credit-exhaustion line: ONE `credits_exhausted` event opens the
+        pause; a hit while the pause stands (the same tick's second session, a later one) raises nothing more."""
+        self.credit_hits.append(tid)
+        if self.credits_paused(now):
+            return
+        mins = float(self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES))
+        self.log(f"OUT OF USAGE CREDITS ({tid}: {line}) — auto-dispatch and reviews paused for {mins:g} min or until resumed")
+        self.scr("steward-watch", "event", "system", "--name", "credits_exhausted", "--note",
+                 f"{tid}: {line}; auto-dispatch paused (credits_pause_minutes {mins:g}); resume: credits_resumed event or the page's Resume"[:300],
+                 "--data", json.dumps({"task": tid}), "--quiet")
+        self.events = None
+
+    def credit_death(self, t, sess: dict, line: str, now: datetime) -> bool:
+        """A running task whose session printed the credit-exhaustion line goes back to `ready` with its attempt
+        refunded (lifecycle.requeue), and the pause opens (credits_seen). No session_dead event, no relaunch from
+        here: dispatch stays the normal path. False when the record could not be changed (retried next tick)."""
+        note = f"out of usage credits (pid {sess['pid']}): not an attempt; ready again"
+        try:
+            done = requeue(self.store, EventLog(self.root / "events" / "events.jsonl"), t.id, note, actor=f"steward:{t.id}", refund=True)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} credit death: requeue FAILED: {e}")
+            return False
+        self.events = None
+        from .cli import refresh            # local import: cli imports this module
+        refresh(self.root, quiet=True)
+        self.log(f"{t.id} session out of usage credits (pid {sess['pid']}) -> ready, attempt refunded")
+        self.credits_seen(t.id, line, now)
+        return done
+
+    def requeue_no_work(self, t, sess: dict, ckpt_now: bool, dead: str) -> bool:
+        """A task just returned by a session death that did no work (no checkpoint commit since its launch, not this
+        tick's either, and no `[scriber]` line after the launcher's) goes back to `ready` — once per episode: the flag
+        `nowork:<id>` stays until the task is submitted or a session of it does work, so a second no-work death
+        leaves it `returned` for Omri. The attempt stays counted (max_attempts still bounds it). Only on evidence:
+        the session's transcript must exist (the launcher always creates it; without it nothing says the session
+        never ran), and a session claude killed at its background-task ceiling (DEAD_LINE) or one that wrote
+        report.md did work."""
+        key = f"nowork:{t.id}"
+        log_md = t.dir / "log.md"
+        text = log_md.read_text(encoding="utf-8", errors="replace") if log_md.exists() else ""
+        rep = t.dir / "report.md"
+        reported = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl
+        unseen = not sess.get("transcript") or not (t.dir / sess["transcript"]).exists()
+        if unseen or reported or DEAD_LINE in dead or ckpt_now or did_work(self.read_events(), t.id, sess.get("ts"), text, sess["pid"]):
+            self.unflag(key)
+            return False
+        if not self.flag(key):
+            self.log(f"{t.id} died again without doing any work: stays returned")
+            return False
+        try:
+            done = requeue(self.store, EventLog(self.root / "events" / "events.jsonl"), t.id,
+                           f"session pid {sess['pid']} did no work (no checkpoint, no [scriber] line): ready again, once", actor=f"steward:{t.id}")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} no-work requeue FAILED: {e}")
+            self.unflag(key)
+            return False
+        self.events = None
+        from .cli import refresh
+        refresh(self.root, quiet=True)
+        self.log(f"{t.id} returned session did no work -> ready (once)")
+        return done
+
+    @staticmethod
+    def newest_review_transcript(t) -> Path | None:
+        trs = sorted(t.dir.glob("review-session-*.txt"))
+        return trs[-1] if trs else None
 
     # ---- out-of-band push of NEW needs-you cards (T-0090) -------------------------------------------
     def notify_cards(self) -> list[dict]:
@@ -734,6 +899,9 @@ class Watcher:
                 row = submitted_stale(t.status, text, submitted_since(events, t.id), review_h, now)
                 if not row:
                     continue
+                tr = self.newest_review_transcript(t)
+                if tr and credits_line(tr, tr.with_name(tr.name + ".err")):
+                    continue                # the review never ran (T-0187): relaunched after the credit pause, not escalated
                 transcripts = sorted(p.name for p in t.dir.glob("review-session-*.txt"))
                 reason = (f"submitted for {row['age_h']} h with no Decision written in review.md "
                           f"(review_stale_hours {review_h:g}); the review did not finish")

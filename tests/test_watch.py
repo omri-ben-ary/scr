@@ -2548,3 +2548,198 @@ def test_retire_still_refuses_a_branch_not_in_origin_main(world):
     res = retire(root, "T-0001", execute=True)
     assert not res["ok"] and res["code"] == 2 and wt.exists(), res["out"]
     assert res["out"][-1].startswith("REFUSING: task/T-0001 is 2 commit(s) ahead of origin/master")
+
+
+# ---- T-0187: out of usage credits is not a session death ---------------------------------------------------
+# 2026-09-23 09:47Z-13:56Z the account had no credits: each headless session printed one line and exited, the
+# watcher returned the task and spent its attempt, then dispatched the next two into the same wall (16 tasks).
+# Now a credit death is ready again with its attempt refunded, ONE credits_exhausted event pauses auto-dispatch,
+# and a death that did no work is set ready once. pid_alive is replaced in scr.watch; no real claude runs.
+from scr.watch import CREDITS_PAUSE_MINUTES, credits_line, credits_pause, did_work  # noqa: E402
+
+CREDIT_MSG = ("You're out of usage credits. Switch to another model, or manage usage credits at "
+              "claude.ai/settings/usage?from=cc_cli_limit_message, to continue.\n")
+TRANSCRIPT = "session-20260923-000000.txt"          # the name _launched records
+
+
+def _dying(root: Path, tid: str = "T-0001", pid: int = 4242, transcript: str = CREDIT_MSG, work: bool = False,
+           scriber_line: bool = False) -> None:
+    """A ready task dispatched, spawned (once), in_progress and launched as `pid`, whose session has exited leaving
+    `transcript` (and an empty .err, as on 2026-09-23). `work` edits the worktree (the tick checkpoints it);
+    `scriber_line` appends a [scriber] line to log.md."""
+    _dispatched(root, tid)
+    t = Store(root).get(tid)
+    wt = task_worktree(workload_for(root, Store(root), t), t)
+    if not wt.exists():
+        spawn(root, [tid], lake=False)
+    scr(root, "--quiet", "--actor", f"steward:{tid}", "task", "set", tid, "in_progress")
+    _launched(root, tid, pid)
+    (t.dir / TRANSCRIPT).write_text(transcript, encoding="utf-8")
+    (t.dir / (TRANSCRIPT + ".err")).write_text("", encoding="utf-8")
+    if scriber_line:
+        with (t.dir / "log.md").open("a", encoding="utf-8") as f:
+            f.write("- 2026-09-23T10:00:00 [scriber] read the spec; plan written\n")
+    if work:
+        (wt / "QuantumInsertion" / "A.lean").write_text("theorem a : True := by trivial\n", encoding="utf-8")
+
+
+def _dead_pids(monkeypatch) -> None:
+    import scr.watch as watch_mod
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: False)
+
+
+def _sys_events(root: Path, name: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "system" and e.get("name") == name]
+
+
+def _credit_needs(res: dict) -> list[str]:
+    return [n for n in res["needs"] if "usage credits" in n]
+
+
+def test_credits_line_reads_the_tail_and_not_a_quote(tmp_path: Path):
+    p = tmp_path / "s.txt"
+    p.write_text(CREDIT_MSG, encoding="utf-8")
+    assert credits_line(p).startswith("You're out of usage credits")
+    p.write_text("Done. The watcher now reads `You're out of usage credits` as a pause.\nreport written\n", encoding="utf-8")
+    assert credits_line(p) is None                       # a quote inside a sentence is not the message
+    p.write_text(CREDIT_MSG + "\n".join(f"line {i}" for i in range(5)), encoding="utf-8")
+    assert credits_line(p) is None                       # only the last lines count
+    assert credits_line(tmp_path / "missing.txt", p.with_name("e.err")) is None
+
+
+def test_credits_pause_is_a_pure_function_of_the_log_and_time():
+    t0 = datetime(2026, 9, 23, 9, 47, tzinfo=timezone.utc)
+    ev = lambda name, m: {"kind": "system", "name": name, "ts": (t0 + timedelta(minutes=m)).isoformat().replace("+00:00", "Z")}  # noqa: E731
+    assert credits_pause([], t0, 60) is None
+    p = credits_pause([ev("credits_exhausted", 0)], t0 + timedelta(minutes=10), 60)
+    assert p and p["since"] == t0 and p["until"] == t0 + timedelta(minutes=60)
+    assert credits_pause([ev("credits_exhausted", 0)], t0 + timedelta(minutes=61), 60) is None          # the probe
+    for resume in ("credits_resumed", "watcher_resumed"):
+        assert credits_pause([ev("credits_exhausted", 0), ev(resume, 5)], t0 + timedelta(minutes=10), 60) is None
+    assert credits_pause([ev("credits_resumed", 0), ev("credits_exhausted", 5)], t0 + timedelta(minutes=10), 60)
+
+
+def test_credit_death_is_ready_unspent_and_pauses_dispatch(world, monkeypatch):
+    """DoD 2: a dead session whose transcript holds the credit message -> one credits_exhausted event, the task
+    ready, attempts as before its dispatch, and neither that tick nor the next dispatches anything; a
+    credits_resumed event ends the pause and the next tick dispatches again."""
+    root, _, _ = world
+    before = int(Store(root).get("T-0001").rec.get("attempts", 0))
+    _dying(root)
+    assert int(Store(root).get("T-0001").rec["attempts"]) == before + 1
+    _dead_pids(monkeypatch)
+    launches = _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "ready" and int(t.rec["attempts"]) == before, res
+    assert [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["returned", "ready"]
+    assert len(_sys_events(root, "credits_exhausted")) == 1 and not _events(root, "session_dead", "T-0001")
+    assert len(_credit_needs(res)) == 1 and "credits_resumed" in _credit_needs(res)[0]
+    assert [n["key"] for n in _needs_file(root)["needs"]].count("credits") == 1
+    res2 = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert not [a for _, a in calls if a and a[0] == "dispatch"] and not launches, calls
+    assert Store(root).get("T-0001").status == "ready" and len(_credit_needs(res2)) == 1
+    assert len(_sys_events(root, "credits_exhausted")) == 1                       # the standing pause raises nothing more
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "credits_resumed")
+    res3 = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert not _credit_needs(res3) and [a for _, a in calls if a and a[0] == "dispatch"], calls
+    assert Store(root).get("T-0001").status == "in_progress" and len(launches) == 1
+
+
+def test_two_credit_deaths_in_one_tick_are_one_event_and_one_line(world, monkeypatch):
+    """DoD 3: two dead sessions with the message in one tick -> one event and one needs line, both tasks ready
+    with their attempts refunded."""
+    root, _, _ = world
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    _dying(root, "T-0001", 4242)
+    _dying(root, "T-0002", 4343)
+    _dead_pids(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert res["ok"], res
+    for tid in ("T-0001", "T-0002"):
+        t = Store(root).get(tid)
+        assert t.status == "ready" and int(t.rec["attempts"]) == 0, (tid, t.rec)
+    assert len(_sys_events(root, "credits_exhausted")) == 1
+    assert len(_credit_needs(res)) == 1 and [n["key"] for n in _needs_file(root)["needs"]].count("credits") == 1
+
+
+def test_no_work_death_is_ready_once_per_episode(world, monkeypatch):
+    """DoD 4: a returned-by-death task with no checkpoint and no [scriber] log line goes back to ready once
+    (attempt counted); the next death in the same episode, again without work, leaves it returned."""
+    root, _, _ = world
+    _dying(root, transcript="")
+    _dead_pids(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "ready" and int(t.rec["attempts"]) == 1, res
+    assert [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["returned", "ready"]
+    assert len(_events(root, "session_dead", "T-0001")) == 1 and not _sys_events(root, "credits_exhausted")
+    _dying(root, pid=4343, transcript="")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "returned" and int(t.rec["attempts"]) == 2, res
+    assert len(_events(root, "session_dead", "T-0001")) == 2
+
+
+@pytest.mark.parametrize("work", ["checkpoint", "scriber", "report", "no_transcript"])
+def test_death_with_real_work_is_unchanged(world, monkeypatch, work):
+    """DoD 5: a dead session that did real work (a checkpoint commit this tick, a [scriber] log line, a report.md
+    written) — or one with no transcript on disk, so no evidence it never ran — is returned as before, its attempt
+    counted, one session_dead event, no pause."""
+    root, _, _ = world
+    _dying(root, transcript="", work=work == "checkpoint", scriber_line=work == "scriber")
+    t = Store(root).get("T-0001")
+    if work == "report":
+        (t.dir / "report.md").write_text("# Report\n\n## Result\n\nFULL_SUITE_PLACEHOLDER\n", encoding="utf-8")   # unfinished: no submission
+    if work == "no_transcript":
+        (t.dir / TRANSCRIPT).unlink()
+    _dead_pids(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "returned" and int(t.rec["attempts"]) == 1, res
+    assert len(_events(root, "session_dead", "T-0001")) == 1 and not _sys_events(root, "credits_exhausted")
+    if work == "checkpoint":
+        assert _events(root, "checkpoint_commit", "T-0001")
+    assert not _credit_needs(res)
+
+
+def test_credit_review_session_pauses_and_is_relaunched_after(world, monkeypatch):
+    """A review transcript that holds the credit message opens the same pause (one event): no review starts while
+    it stands, and once it is resumed the review is launched afresh."""
+    root, _, _ = world
+    _dispatched(root)
+    spawn(root, ["T-0001"], lake=False)
+    for st in ("in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    launches = _record_launches(monkeypatch)
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 1 and "review:T-0001" in _flags(root)
+    t = Store(root).get("T-0001")
+    trs = sorted(t.dir.glob("review-session-*.txt"))
+    assert trs, "the review launch names its transcript"
+    trs[-1].write_text(CREDIT_MSG, encoding="utf-8")          # the review session exited on the credit wall
+    res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 1 and "review:T-0001" not in _flags(root), launches
+    assert len(_sys_events(root, "credits_exhausted")) == 1 and len(_credit_needs(res)) == 1
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 1 and len(_sys_events(root, "credits_exhausted")) == 1
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "credits_resumed")
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 2 and Store(root).get("T-0001").status == "submitted"
+
+
+def test_did_work_counts_only_this_launch():
+    evs = [{"kind": "system", "name": "checkpoint_commit", "task": "T-1", "ts": "2026-09-23T09:00:00Z"}]
+    log = "- [launcher] pid 7, transcript x\n- [scriber] old run\n- [launcher] pid 8, transcript y\n"
+    assert not did_work(evs, "T-1", "2026-09-23T10:00:00Z", log, 8)
+    assert did_work(evs, "T-1", "2026-09-23T08:00:00Z", log, 8)
+    assert did_work([], "T-1", "2026-09-23T10:00:00Z", log, 7)
+
+
+def test_credits_pause_key_is_read_and_mirrored():
+    src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
+    limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    assert 'self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES)' in src
+    assert limits["credits_pause_minutes"] == CREDITS_PAUSE_MINUTES
