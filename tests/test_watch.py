@@ -54,7 +54,7 @@ def _record_launches(monkeypatch) -> list[dict]:
             f = kw.get(k)
             if hasattr(f, "close"):
                 f.close()
-        calls.append({"argv": list(args), "cwd": Path(cwd)})
+        calls.append({"argv": list(args), "cwd": Path(cwd), "env": kw.get("env")})
         return _Proc()
 
     def fake_run(args, cwd=None, **kw):
@@ -178,6 +178,30 @@ def test_explicit_override_beats_the_config_default(world, monkeypatch):
     Watcher(root, quiet=True).start_review(Store(root).get("T-0001"))
     assert _mode(calls[-1]["argv"]) == "acceptEdits"
     assert _mode(session_argv(root, root=root, permission_mode="dontAsk")) == "dontAsk"
+
+
+def test_review_brief_uses_default_base_and_fetch(world, monkeypatch):
+    """T-0117 (T-0060 R1 after T-0111): the workload review brief tells the Steward to run the checkers with
+    --fetch and their default base (merge-base of origin/<main> and HEAD), never with a --base flag."""
+    from scr.watch import Watcher
+    root, _, _ = world
+    _record_launches(monkeypatch)
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched"); spawn(root, ["T-0001"], lake=False)
+    for st in ("in_progress", "submitted"):
+        scr(root, "--actor", "s", "task", "set", "T-0001", st)
+    t = Store(root).get("T-0001")
+    Watcher(root, quiet=True).start_review(t)
+    brief = (t.dir / "review-brief.txt").read_text(encoding="utf-8")
+    assert "--fetch" in brief and "merge-base" in brief and "origin/" in brief, brief
+    assert "--base" not in brief, brief
+
+
+def test_workloads_yaml_checker_comment_has_no_bare_base():
+    text = (REPO / "config" / "workloads.yaml").read_text(encoding="utf-8")
+    assert "--base master" not in text
+    line = next(l for l in text.splitlines() if l.strip().startswith("done_when_checker:"))
+    assert "--fetch" in line and "merge-base" in line, line
+    assert isinstance(yaml.safe_load(text)["quantum-insertion"]["done_when_checker"], str)
 
 
 def _discuss_lines(root: Path, items: list[str], monkeypatch) -> dict[str, str]:
@@ -369,6 +393,29 @@ def test_merge_conflict_is_not_merged_and_raises_land_failed(tmp_path: Path, mon
     assert not any(k.startswith("land_failed:T-0007:") for k in (root / ".scr" / "watch.state.txt").read_text(encoding="utf-8").split())
 
 
+def test_landing_test_timeout_comes_from_limits_yaml(tmp_path: Path, monkeypatch):
+    """T-0186: land_scriptorium runs the tests within limits.yaml land_test_timeout_seconds (it was a
+    hardcoded 1800 s in ops._run_tests). With the key at 5 and a test command that sleeps 10 s, the landing
+    fails as `tests`, and the land_failed event names the 5 s and the key to raise."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    lim = yaml.safe_load((root / "config" / "limits.yaml").read_text(encoding="utf-8")) or {}
+    lim["land_test_timeout_seconds"] = 5
+    (root / "config" / "limits.yaml").write_text(yaml.safe_dump(lim), encoding="utf-8")
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["scriptorium"]["tests"] = f'{sys.executable} -c "import time; time.sleep(10)"'
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    sscr(root, "--quiet", "snapshot")                                   # the config hash moved: keep verify green
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] 5 s landing timeout, 10 s tests")
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "tests" in ev[0]["note"], ev
+    assert "timed out after 5s" in ev[0]["note"] and "land_test_timeout_seconds" in ev[0]["note"], ev
+    assert Store(root).get("T-0007").status == "accepted" and sgit(root, "rev-parse", "main") == main_before
+
+
 def test_failing_tests_are_not_merged_and_raise_land_failed(tmp_path: Path, monkeypatch):
     """DoD 3b: the merge is clean but the workload's tests fail on the result: not merged, land_failed says
     `tests`, the trunk untouched. The tests ran in the worktree, on task/<id> with the trunk merged in, so
@@ -431,6 +478,379 @@ def test_running_scriptorium_worktree_is_checkpointed_each_tick(tmp_path: Path, 
         sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0010", st)
     res = Watcher(root, quiet=True).tick()
     assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
+
+
+# ---- T-0120: record paths on task/<id> follow the trunk; one landing per task at a time ---------------------
+# A scriber that runs `scr` with its worktree as root journals there as [omri] and can open a phantom hotfix
+# task on the branch (T-0059: b4a70dc, phantom T-0108 59a57e2): events.jsonl, STATE.json, a tasks/ folder.
+def _phantom_journal_commit(wt: Path) -> list[str]:
+    """The shape of a worktree journal commit, committed on task/T-0007: an event appended to the branch's
+    events.jsonl, STATE.json rewritten, a phantom task folder. Returns the three paths."""
+    from scr.events import EventLog
+    EventLog(wt / "events" / "events.jsonl").append("system", name="phantom", task="T-0099", actor="omri", note="journaled in a worktree")
+    (wt / "state").mkdir(exist_ok=True)
+    (wt / "state" / "STATE.json").write_text('{"phantom": "T-0099"}\n', encoding="utf-8")
+    (wt / "tasks" / "T-0099-phantom").mkdir(parents=True)
+    (wt / "tasks" / "T-0099-phantom" / "task.yaml").write_text("id: T-0099\ntitle: phantom hotfix\n", encoding="utf-8")
+    paths = ["events/events.jsonl", "state/STATE.json", "tasks/T-0099-phantom/task.yaml"]
+    sgit(wt, "add", "--", *paths); sgit(wt, "commit", "-q", "-m", "[omri] phantom journal commit in the worktree")
+    return paths
+
+
+def _trunk_journals(root: Path) -> str:
+    """The checkout journals after the spawn: its own event appended (the same last line the branch appended
+    to — a conflict). Returns main's events.jsonl as committed."""
+    sscr(root, "--quiet", "--actor", "steward", "event", "system", "--name", "trunk_moved", "--note", "a journal commit on the trunk")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk journals")
+    return sgit(root, "show", "main:events/events.jsonl")
+
+
+def test_records_follow_the_trunk_on_a_phantom_journal_commit(tmp_path: Path, monkeypatch):
+    """T-0120 (a): the branch carries a phantom journal commit and the trunk journals too, so events.jsonl
+    conflicts. The conflict is on record paths only: they take the trunk's side, the leftovers (STATE.json,
+    the phantom task folder) are reverted before the tests, the task lands with its tool change, and the
+    log.md landing line lists every record path that followed the trunk. No land_failed, no scope refusal."""
+    root, _, wt = _land_world(tmp_path, monkeypatch, journal=True)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    paths = _phantom_journal_commit(wt)
+    trunk_events = _trunk_journals(root)
+    res = _tick(root)
+    assert res["ok"], res
+    t = Store(root).get("T-0007")
+    assert t.status == "merged", (t.status, res["needs"])
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok"
+    assert "T-0099-phantom" not in sgit(root, "ls-tree", "--name-only", "main", "tasks/")
+    main_events = sgit(root, "show", "main:events/events.jsonl")
+    assert main_events.startswith(trunk_events) and '"phantom"' not in main_events       # the trunk's chain, plus the landing's own events
+    from scr.events import EventLog
+    assert EventLog(root / "events" / "events.jsonl").verify_chain() == []
+    landed = [l for l in (t.dir / "log.md").read_text(encoding="utf-8").splitlines() if "landed: task/T-0007 -> main @" in l]
+    assert len(landed) == 1 and "records follow the trunk" in landed[0], landed
+    assert all(p in landed[0] for p in paths), landed[0]
+    # both halves ran on task/T-0007: the conflicted events.jsonl took the trunk's side in the step-3 merge
+    # commit, the clean leftovers were reverted by the step-3b commit
+    msgs = sgit(root, "log", "--format=%B", "main")
+    assert "records follow the trunk: " in msgs and "events/events.jsonl" in msgs.split("records follow the trunk: ")[1].splitlines()[0], msgs[:800]
+    assert "[land] T-0007: record paths follow the trunk (" in msgs and "tasks/T-0099-phantom/task.yaml" in msgs
+    assert not _events(root, "land_failed", "T-0007") and not res["needs"], res["needs"]
+
+
+def test_record_conflict_next_to_a_tool_conflict_still_aborts(tmp_path: Path, monkeypatch):
+    """T-0120 (b): the same phantom commit, but the branch's tool.txt also conflicts with the trunk. The
+    trunk's side is taken by path, never for the whole merge: a non-record conflict aborts as before —
+    land_failed (conflict) naming tool.txt, the worktree clean, the trunk untouched."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    _phantom_journal_commit(wt)
+    (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
+    _trunk_journals(root)
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    assert Store(root).get("T-0007").status == "accepted"
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "conflict" in ev[0]["note"] and "tool.txt" in ev[0]["note"], ev
+    assert any(n.startswith("T-0007 landing failed (conflict)") for n in res["needs"]), res["needs"]
+    assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "trunk edit"
+    assert not (root / ".git" / "worktrees" / "T-0007" / "MERGE_HEAD").exists()
+    assert sgit(wt, "status", "--porcelain") == "" and not _events(root, "landed", "T-0007")
+
+
+def test_record_report_written_in_worktree_fails_the_landing_by_name(tmp_path: Path, monkeypatch):
+    """T-0120 (c): the task's own report.md was written in the worktree, not the live root. It is never
+    dropped: one land_failed (records) names report.md and the one action, the trunk is untouched; once the
+    branch takes main's report.md back, the next tick lands."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    rel = f"tasks/{Store(root).get('T-0007').dir.name}/report.md"
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    (wt / rel).write_text("# Report\n\nwritten in the worktree by mistake\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and "records" in ev[0]["note"] and "report.md" in ev[0]["note"] and "live root" in ev[0]["note"], ev
+    assert any("landing failed (records)" in n for n in res["needs"]), res["needs"]
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
+    # the Steward moved the text to the live root; the branch takes main's copy back -> lands
+    sgit(wt, "checkout", "main", "--", rel)
+    res2 = _tick(root)
+    assert Store(root).get("T-0007").status == "merged", res2["needs"]
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "land_failed", "T-0007")) == 1
+
+
+def test_land_lock_held_makes_a_second_landing_busy(tmp_path: Path, monkeypatch):
+    """T-0120 (from T-0119's review): while one landing of T-0007 holds .scr/land-T-0007.lock, a second
+    land_scriptorium returns busy and touches nothing; a lock whose holder is dead is taken over, and a
+    landing releases its lock."""
+    from scr.ops import _LandLock, land_scriptorium
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    status, head, main_before = sgit(wt, "status", "--porcelain"), sgit(wt, "rev-parse", "HEAD"), sgit(root, "rev-parse", "main")
+    lock = _LandLock(root, "T-0007")
+    assert lock.acquire() and lock.path == root / ".scr" / "land-T-0007.lock"
+    try:
+        r = land_scriptorium(root, "T-0007")
+    finally:
+        lock.release()
+    assert not r["ok"] and r["reason"] == "busy" and any("FAILED (busy)" in l for l in r["out"]), r
+    assert sgit(wt, "status", "--porcelain") == status and sgit(wt, "rev-parse", "HEAD") == head
+    assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "accepted"
+    assert not lock.path.exists()
+    # a dead holder's lock is stale: taken over, the landing runs, the lock is gone afterwards
+    p = subprocess.Popen([sys.executable, "-c", "pass"]); p.wait()
+    lock.path.write_text(f"{p.pid} 0\n", encoding="utf-8")
+    r2 = land_scriptorium(root, "T-0007")
+    assert r2["ok"], r2["out"]
+    assert Store(root).get("T-0007").status == "merged" and not lock.path.exists()
+
+
+def test_land_lock_older_than_the_journal_stale_limit_is_taken_over(tmp_path: Path):
+    """A lock held by a live pid is busy until it is older than LOCK_STALE_S (the holder's heartbeat keeps
+    a real landing fresh); then it is stale."""
+    from scr.journal import LOCK_STALE_S
+    from scr.ops import _LandLock
+    lock = _LandLock(tmp_path, "T-0007")
+    lock.path.parent.mkdir(parents=True)
+    lock.path.write_text(f"{os.getpid()} 0\n", encoding="utf-8")
+    assert not lock.stale() and not _LandLock(tmp_path, "T-0007").acquire()
+    old = lock.path.stat().st_mtime - LOCK_STALE_S - 10
+    os.utime(lock.path, (old, old))
+    assert lock.stale() and lock.acquire()
+    lock.release()
+    assert not lock.path.exists()
+
+
+# ---- T-0119: `scr land <id>` routes a scriptorium task to land_scriptorium ---------------------------------
+# Until T-0119 cmd_land and land_all_submitted called the QI land() for every id: on a scriptorium task that
+# pushed task/<id> to origin and opened a PR on the scriptorium repo. ops.land_any decides, by repo identity.
+def test_scr_land_scriptorium_task_lands_like_the_watcher_tick(tmp_path: Path, monkeypatch):
+    """`scr land T-0007` on the accepted scriptorium task: committed, trunk merged in, tests, merged into the
+    trunk, `merged` with one landed event and a log.md line naming the trunk commit — and nothing pushed,
+    no PR (origin untouched). --merge is accepted and ignored with one line."""
+    root, origin, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    origin_before = sgit(origin, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--merge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.splitlines()[0] == "scriptorium task: --merge is implied, --no-pr/--draft do not apply", r.stdout
+    assert "(scriptorium)" in r.stdout and "pushed" not in r.stdout and "PR" not in r.stdout, r.stdout
+    t = Store(root).get("T-0007")
+    assert t.status == "merged"
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok" and sgit(root, "merge-base", "--is-ancestor", "task/T-0007", "main") == ""
+    subject = sgit(root, "log", "-1", "--format=%s", "main")
+    assert subject.startswith("[land] T-0007:") or subject.startswith("[T-0007]"), subject
+    ev = _events(root, "landed", "T-0007")
+    assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"], ev
+    sha = ev[0]["note"].split("@")[1].split()[0]
+    assert sgit(root, "rev-parse", "--short", "main") == sha
+    assert f"landed: task/T-0007 -> main @ {sha}" in (t.dir / "log.md").read_text(encoding="utf-8")
+    # the QI path's traces are absent: origin's main unmoved, no task branch on origin, no PR body written
+    assert sgit(origin, "rev-parse", "main") == origin_before
+    assert sgit(origin, "branch", "--list", "task/T-0007") == "" and not (t.dir / "pr-body.md").exists()
+    assert not _events(root, "land_failed", "T-0007") and not _events(root, "pr", "T-0007")
+
+
+def test_scr_land_dry_run_scriptorium_changes_nothing(tmp_path: Path, monkeypatch):
+    """`scr land T-0007 --dry-run` prints the plan (branch, trunk, dirty-file count, containment) and stops
+    before step 1: trunk sha, task status, branch tip and the worktree's dirty file are as they were."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    main_before, tip_before, dirty_before = sgit(root, "rev-parse", "main"), sgit(wt, "rev-parse", "HEAD"), sgit(wt, "status", "--porcelain")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "task/T-0007 -> main (scriptorium, dry run" in r.stdout and "1 uncommitted file(s)" in r.stdout, r.stdout
+    assert "would merge main into task/T-0007" in r.stdout and "check.py" in r.stdout, r.stdout
+    assert sgit(root, "rev-parse", "main") == main_before and sgit(wt, "rev-parse", "HEAD") == tip_before
+    assert sgit(wt, "status", "--porcelain") == dirty_before != ""
+    assert Store(root).get("T-0007").status == "accepted" and not _events(root, "landed", "T-0007")
+
+
+def test_scr_land_qi_task_still_reaches_ops_land(tmp_path: Path, monkeypatch):
+    """A quantum-insertion task in the same world goes to ops.land with the QI flags; a task naming an
+    unregistered workload falls back to the first entry (QI) as workload_for does; land_all_submitted routes
+    the accepted scriptorium task to land_scriptorium, never to land()."""
+    import scr.ops as ops
+    from scr.cli import main
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "task", "new", "QI", "--id", "T-0011", "--workload", "quantum-insertion", "--files", "Foo.lean", "--origin", "omri")
+    calls: list[tuple] = []
+    monkeypatch.setattr(ops, "land", lambda root, tid, **kw: calls.append((tid, kw)) or {"ok": True, "url": None, "out": [f"fake land {tid}"]})
+    main(["land", "T-0011", "--root", str(root), "--no-pr", "--merge"])
+    assert calls == [("T-0011", {"no_pr": True, "draft": False, "dry_run": False, "merge": True})], calls
+    store = Store(root)
+    t = store.get("T-0011")
+    t.rec["workload"] = "nonesuch"
+    assert not ops.is_scriptorium_task(root, store, t) and ops.is_scriptorium_task(root, store, store.get("T-0007"))
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    out = ops.land_all_submitted(root)
+    assert len(calls) == 1 and Store(root).get("T-0007").status == "merged", out
+    assert any("(scriptorium)" in l for l in out) and len(_events(root, "landed", "T-0007")) == 1, out
+
+
+def test_scr_land_scriptorium_refuses_submitted_and_names_the_next_step(tmp_path: Path, monkeypatch):
+    """The hand path is post-acceptance: a submitted scriptorium task is refused before anything moves. A
+    landing failure exits 1 with the watcher's reason (tests) and the next action on one line, and raises
+    no land_failed event (that event is the watcher's)."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (wt / "tool.txt").write_text("broken\n", encoding="utf-8")
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", check=False)
+    assert r.returncode == 1, r.stdout + r.stderr
+    last = r.stdout.strip().splitlines()[-1]
+    assert last.startswith("T-0007: NOT landed (tests) — next: fix task/T-0007") and "scr land T-0007" in last, r.stdout
+    assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "accepted"
+    assert not _events(root, "land_failed", "T-0007")
+    t = Store(root).get("T-0007")
+    t.rec["status"] = "submitted"; t.save()                     # accepted -> submitted is no transition: set the record
+    r = sscr(root, "--actor", "omri", "land", "T-0007", check=False)
+    assert r.returncode == 2 and "T-0007 is submitted, not accepted — write the Decision first (T-0081)" in r.stderr, r.stdout + r.stderr
+    assert sgit(root, "rev-parse", "main") == main_before and Store(root).get("T-0007").status == "submitted"
+
+
+# ---- T-0154: `scr land <id>` on a checkout hotfix (accepted scriptorium task, no worktree) -----------------
+# land_any sent it to land_scriptorium, which raised `worktree missing`; the watcher records it merged.
+def _hotfix(root: Path, tid: str = "T-0008", status: str = "accepted") -> None:
+    """The hotfix test's task: workload scriptorium, never spawned, walked to `status` (review first)."""
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", tid, "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    if status == "accepted":
+        (Store(root).get(tid).dir / "review.md").write_text(accepted_review(), encoding="utf-8")   # T-0081
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, "accepted")
+
+
+def _merged_states(root: Path, tid: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == tid and e.get("to") == "merged"]
+
+
+def test_scr_land_hotfix_no_worktree_is_merged_like_the_watcher(tmp_path: Path, monkeypatch):
+    """`scr land T-0008` on the hotfix: rc 0, merged, one state event with the watcher's note and actor, the
+    trunk untouched, no landed event — the record test_accepted_hotfix_without_worktree_is_merged_without_a_merge
+    pins for the watcher. The note is one constant, and it is the watcher's word for word."""
+    import scr.ops as ops
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root)
+    assert not (tmp_path / "scriptorium-worktrees" / "T-0008").exists()
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0008")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "worktree missing" not in r.stdout + r.stderr and "T-0008 marked merged" in r.stdout, r.stdout
+    assert Store(root).get("T-0008").status == "merged"
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+    st = _merged_states(root, "T-0008")
+    assert len(st) == 1 and "already on main (journal)" in st[0]["note"], st
+    assert st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0008" and st[0]["from"] == "accepted", st
+    assert "change already on main (journal)" not in (REPO / "scr" / "watch.py").read_text(encoding="utf-8")   # T-0158: one owner, ops
+    assert Store(root).get("T-0007").status == "accepted"                                       # the spawned task is not touched
+
+
+def test_scr_land_hotfix_no_worktree_dry_run_changes_nothing(tmp_path: Path, monkeypatch):
+    """`scr land T-0008 --dry-run`: rc 0, the plan says `no worktree`, and nothing moved (status, trunk, events)."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root)
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0008", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "no worktree: record merged only (change already on main via the journal)" in r.stdout and "dry run" in r.stdout, r.stdout
+    assert Store(root).get("T-0008").status == "accepted" and not _merged_states(root, "T-0008")
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0008")
+
+
+def test_scr_land_hotfix_no_worktree_submitted_still_refuses(tmp_path: Path, monkeypatch):
+    """No worktree does not skip the Decision: a submitted hotfix is refused as T-0119 made it, dry run too."""
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    _hotfix(root, status="submitted")
+    for extra in ([], ["--dry-run"]):
+        r = sscr(root, "--actor", "omri", "land", "T-0008", *extra, check=False)
+        assert r.returncode == 2 and "T-0008 is submitted, not accepted — write the Decision first (T-0081)" in r.stderr, r.stdout + r.stderr
+    assert Store(root).get("T-0008").status == "submitted" and not _merged_states(root, "T-0008")
+
+
+# ---- T-0158: one owner for the no-worktree landing; a lost worktree is refused, not merged ----------------
+# land_any and the watcher both recorded "no worktree" as a merged hotfix. A spawned task whose worktree was
+# removed while task/<id> still carries commits not on the trunk lost its work that way; now ops.land_no_worktree
+# decides for both callers: merged only with no task/<id> or task/<id> already on the trunk, else lost_worktree.
+def _lost_worktree(tmp_path: Path, monkeypatch, ahead: bool = True) -> tuple[Path, str]:
+    """_land_world's T-0007 with (ahead) one commit on task/T-0007 that is not on main, then its worktree
+    removed. Returns (root, main sha)."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    if ahead:
+        (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+        sgit(wt, "commit", "-q", "-am", "the scriber's work")
+    sgit(root, "worktree", "remove", "--force", str(wt))
+    assert not wt.exists() and sgit(root, "rev-parse", "--verify", "task/T-0007")
+    on_main = subprocess.run(["git", "merge-base", "--is-ancestor", "task/T-0007", "main"], cwd=root).returncode == 0
+    assert on_main is not ahead
+    return root, sgit(root, "rev-parse", "main")
+
+
+def _no_merge(root: Path, main_before: str) -> None:
+    assert Store(root).get("T-0007").status == "accepted" and not _merged_states(root, "T-0007")
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
+
+
+def test_scr_land_lost_worktree_branch_not_on_main_is_refused(tmp_path: Path, monkeypatch):
+    """`scr land T-0007` with the worktree gone and task/T-0007 ahead of main: rc 1, the reason and the one
+    next action, the task still accepted, no merged event, the trunk unmoved. `--dry-run` says the same."""
+    root, main_before = _lost_worktree(tmp_path, monkeypatch)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--dry-run", check=False)
+    assert r.returncode == 1 and "would refuse" in r.stdout and "not on main" in r.stdout and "dry run" in r.stdout, r.stdout + r.stderr
+    _no_merge(root, main_before)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", check=False)
+    assert r.returncode == 1 and "not on main" in r.stdout, r.stdout + r.stderr
+    assert "FAILED (lost_worktree): worktree missing, branch task/T-0007 not on main" in r.stdout, r.stdout
+    nxt = [l for l in r.stdout.splitlines() if "NOT landed (lost_worktree)" in l]
+    assert len(nxt) == 1 and "git worktree add" in nxt[0] and "task/T-0007" in nxt[0] and "`scr land T-0007` again" in nxt[0], r.stdout
+    _no_merge(root, main_before)
+
+
+def test_watcher_lost_worktree_branch_not_on_main_stays_accepted_one_land_failed(tmp_path: Path, monkeypatch):
+    """Same world, the watcher: accepted after the tick, ONE land_failed event, a NEEDS-YOU line naming the
+    reason; the second tick adds a NEEDS-YOU line but no event and still does not record merged."""
+    root, main_before = _lost_worktree(tmp_path, monkeypatch)
+    for n in (1, 2):
+        res = _tick(root)
+        _no_merge(root, main_before)
+        ev = _events(root, "land_failed", "T-0007")
+        assert len(ev) == 1 and "lost_worktree" in ev[0]["note"] and "not on main" in ev[0]["note"], (n, ev)
+        need = [l for l in res["needs"] if l.startswith("T-0007 landing failed (lost_worktree)")]
+        assert len(need) == 1 and "git worktree add" in need[0], (n, res["needs"])
+
+
+def test_scr_land_no_worktree_branch_already_on_main_is_merged(tmp_path: Path, monkeypatch):
+    """task/T-0007 exists but is contained in main (nothing to lose): `scr land` records it merged exactly as
+    a hotfix — HOTFIX_MERGED_NOTE, actor steward:T-0007, no merge, no landed event."""
+    import scr.ops as ops
+    root, main_before = _lost_worktree(tmp_path, monkeypatch, ahead=False)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--dry-run")
+    assert "record merged only" in r.stdout and "would refuse" not in r.stdout, r.stdout
+    r = sscr(root, "--actor", "omri", "land", "T-0007")
+    assert r.returncode == 0 and "T-0007 marked merged" in r.stdout, r.stdout + r.stderr
+    st = _merged_states(root, "T-0007")
+    assert len(st) == 1 and st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0007", st
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
+
+
+def test_watcher_no_worktree_branch_already_on_main_is_merged_like_scr_land(tmp_path: Path, monkeypatch):
+    """The watcher on the same world: merged with the same record `scr land` writes — note, actor, and the
+    cascade actor of the dependent it unblocks (the old `scr task set` subprocess cascaded as `scr`) — and
+    queues/STATE.json follow the merge (the refresh the subprocess did)."""
+    import scr.ops as ops
+    root, main_before = _lost_worktree(tmp_path, monkeypatch, ahead=False)
+    sscr(root, "--quiet", "task", "new", "After", "--id", "T-0009", "--workload", "scriptorium", "--files", "other.txt", "--origin", "omri", "--blocked-by", "T-0007")
+    sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0009", "triaged")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0007").status == "merged", res
+    st = _merged_states(root, "T-0007")
+    assert len(st) == 1 and st[0]["note"] == ops.HOTFIX_MERGED_NOTE and st[0]["actor"] == "steward:T-0007", st
+    from scr.events import EventLog
+    up = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("task") == "T-0009" and e.get("to") == "ready"]
+    assert len(up) == 1 and up[0]["actor"] == "steward:T-0007" and up[0]["note"] == "unblocked by T-0007", up
+    from scr.state import State
+    snap = State(root).read_snapshot()
+    assert snap["state_root"] == State(root).compute()["state_root"], "STATE.json does not follow the merge"
+    assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007") and not _events(root, "land_failed", "T-0007")
 
 
 # ---- T-0091: the watcher applies a Decision written in review.md ----------------------------------------
@@ -983,10 +1403,14 @@ def _dispatched(root: Path, tid: str = "T-0001") -> None:
     scr(root, "--quiet", "--actor", "prioritizer", "task", "set", tid, "dispatched")
 
 
-def _launched(root: Path, tid: str = "T-0001", pid: int = 4242) -> None:
-    """The launcher's `launch` event, pid recorded in `data` as scr/launch.py writes it."""
+def _launched(root: Path, tid: str = "T-0001", pid: int = 4242, created: int | None = None) -> None:
+    """The launcher's `launch` event, pid recorded in `data` as scr/launch.py writes it (`created` only when
+    given: without it the event has the pre-T-0147 shape)."""
+    data = {"pid": pid, "transcript": "session-20260923-000000.txt"}
+    if created is not None:
+        data["created"] = created
     scr(root, "--quiet", "--actor", f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid,
-        "--note", f"headless pid {pid}", "--data", json.dumps({"pid": pid, "transcript": "session-20260923-000000.txt"}))
+        "--note", f"headless pid {pid}", "--data", json.dumps(data))
 
 
 def _backdate(root: Path, tid: str, to: str, minutes: float) -> None:
@@ -1117,3 +1541,1284 @@ def test_dispatch_timeout_key_is_read_and_mirrored():
     assert "dispatch_timeout_minutes" in src and "dispatch_timeout" in src
     limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
     assert float(limits["dispatch_timeout_minutes"]) == DISPATCH_TIMEOUT_MINUTES == 30
+
+
+# ---- T-0124: escalating a running task stops its session ---------------------------------------------------
+# `_escalate` left the launched scriber running (T-0092 review, item 3): auto-dispatch refilled the slot on the
+# same tick, so cap + 1 claude sessions ran, and the old one's `task set submitted` was later refused unexplained.
+# Now an alive session_of pid is checkpoint-committed, then stopped with run.kill; no real process is touched:
+# pid_alive and kill are replaced in scr.watch and every call recorded.
+from scr.gitops import Git  # noqa: E402
+from scr.ops import task_worktree, workload_for  # noqa: E402
+
+
+def _stuck_running(root: Path, tid: str = "T-0001", pid: int = 4242, created: int | None = None) -> Path:
+    """An in_progress task with a worktree, a launch event (pid recorded) and a blocking HELP line 4 h old."""
+    _dispatched(root, tid)
+    spawn(root, [tid], lake=False)
+    scr(root, "--quiet", "--actor", f"steward:{tid}", "task", "set", tid, "in_progress")
+    _launched(root, tid, pid, created)
+    t = Store(root).get(tid)
+    log = t.dir / "log.md"
+    log.write_text(log.read_text(encoding="utf-8") + "- HELP[blocks: Phase C]: which lemma closes the goal?\n", encoding="utf-8")
+    old = time.time() - 4 * 3600
+    os.utime(log, (old, old))
+    return task_worktree(workload_for(root, Store(root), t), t)
+
+
+def _mock_session(monkeypatch, alive, kill_result=True, wt: Path | None = None) -> list[tuple]:
+    """Replace pid_alive / kill / checkpoint in scr.watch; return the ordered calls. A live pid_alive also
+    writes to the worktree, as a running scriber would, so a checkpoint made after it has something to commit."""
+    import scr.watch as watch_mod
+    calls: list[tuple] = []
+    real_ckpt = watch_mod.checkpoint
+
+    def fake_alive(pid):
+        calls.append(("alive", pid))
+        if alive and wt is not None:
+            (wt / "QuantumInsertion" / "A.lean").write_text(f"theorem a : True := trivial -- {len(calls)}\n", encoding="utf-8")
+        return alive
+
+    def fake_kill(pid):
+        calls.append(("kill", pid))
+        if isinstance(kill_result, Exception):
+            raise kill_result
+        return kill_result
+
+    def spy_ckpt(root, tid, **kw):
+        c = real_ckpt(root, tid, **kw)
+        calls.append(("checkpoint", tid, c.head if c else None))
+        return c
+
+    monkeypatch.setattr(watch_mod, "pid_alive", fake_alive)
+    monkeypatch.setattr(watch_mod, "kill", fake_kill)
+    monkeypatch.setattr(watch_mod, "checkpoint", spy_ckpt)
+    return calls
+
+
+def test_escalating_a_running_task_checkpoints_then_stops_its_session(world, monkeypatch):
+    """DoD 2: pid recorded and alive, a stale blocking HELP line -> after one tick() escalated; the checkpoint
+    made inside _escalate (it commits what the session wrote after the tick's own pass) precedes the one kill,
+    of that pid, and the slot_freed note says the session was stopped after that checkpoint, on the branch."""
+    root, _, _ = world
+    wt = _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    kills = [c for c in calls if c[0] == "kill"]
+    assert kills == [("kill", 4242)], calls
+    i_kill = calls.index(("kill", 4242))
+    ckpts = [(i, c) for i, c in enumerate(calls) if c[0] == "checkpoint"]
+    assert len(ckpts) == 2 and ckpts[-1][0] < i_kill, calls                  # the tick's pass, then _escalate's own
+    sha = ckpts[-1][1][2]
+    assert sha and sha != ckpts[0][1][2] and Git(wt).head().startswith(sha), calls   # a new commit: the work after the pass
+    assert not Git(wt).dirty()
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "session pid 4242 stopped after checkpoint " + sha in ev[0]["note"], ev
+    assert "the work is on task/T-0001" in ev[0]["note"] and "left running" not in ev[0]["note"]
+    last = _state_events(root, "T-0001")[-1]
+    assert last["to"] == "escalated" and "stopped after checkpoint" in last["note"], last
+    # one escalation per episode: a second tick neither escalates nor kills again
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)] and len(_events(root, "slot_freed", "T-0001")) == 1
+
+
+def test_escalating_a_task_whose_session_is_gone_kills_nothing(world, monkeypatch):
+    """DoD 3: the same task with pid_alive False -> no kill, the note says the session was already gone. (On a
+    whole tick the dead check returns such a task first, so the escalation pass is driven directly: the pid
+    can die between the two.)"""
+    root, _, _ = world
+    _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=False)
+    w = Watcher(root, quiet=True, auto_decide=True)
+    assert w.escalation_checks(datetime.now(timezone.utc), Store(root).load_all()) == 1
+    assert Store(root).get("T-0001").status == "escalated"
+    assert not [c for c in calls if c[0] in {"kill", "checkpoint"}], calls
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "session pid 4242 was already gone" in ev[0]["note"], ev
+
+
+def test_escalating_a_submitted_task_never_kills(world, monkeypatch):
+    """DoD 4: a stuck `submitted` task has no scriber session (its review session is T-0075's): kill is never
+    called, even with a launch event on record and every pid alive."""
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _launched(root)
+    calls = _mock_session(monkeypatch, alive=True)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert not [c for c in calls if c[0] == "kill"], calls
+    assert "stopped" not in _events(root, "slot_freed", "T-0001")[0]["note"]
+
+
+@pytest.mark.parametrize("result", [False, OSError("taskkill missing")])
+def test_escalation_does_not_depend_on_the_kill(world, monkeypatch, result):
+    """DoD 5: kill returning False or raising -> the task is still escalated and the note says the stop failed,
+    naming the pid."""
+    root, _, _ = world
+    wt = _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=True, kill_result=result, wt=wt)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)]
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "stopping session pid 4242 FAILED" in ev[0]["note"] and "may still be running" in ev[0]["note"], ev
+
+
+@pytest.mark.skipif(os.name != "nt", reason="taskkill is the Windows path")
+def test_run_kill_reports_a_refused_taskkill(monkeypatch):
+    """run.kill's return value is what the note trusts: a non-zero taskkill exit (no such pid) is False."""
+    import scr.run as run_mod
+
+    class R:
+        def __init__(self, rc):
+            self.returncode = rc
+    for rc, want in ((0, True), (128, False)):
+        monkeypatch.setattr(run_mod, "subprocess", _Shim(subprocess, run=lambda *a, rc=rc, **k: R(rc)))
+        assert run_mod.kill(99999) is want
+
+
+# ---- T-0147: a reused pid is never stopped -------------------------------------------------------------------
+# pid_alive counts a pid Windows reused for another process as alive, so a silently dead scriber's pid could be
+# `taskkill /T /F`-ed by the escalation above. The launcher now records the process creation time (`created`), and
+# session_dead / stop_session compare it with the live process's (run.process_created, replaced in scr.watch).
+def _mock_created(monkeypatch, value) -> list[int]:
+    """Replace process_created in scr.watch with a constant; return the pids it was asked about."""
+    import scr.watch as watch_mod
+    asked: list[int] = []
+    monkeypatch.setattr(watch_mod, "process_created", lambda pid: (asked.append(pid), value)[1])
+    return asked
+
+
+def test_stop_session_skips_a_reused_pid(world, monkeypatch):
+    """Launch recorded created X, the pid is alive but its process was created at Y != X, a stale blocking HELP ->
+    escalated, kill never called (nor a checkpoint for a session that is gone), the note says the pid was reused.
+    (On a whole tick the dead check returns such a task first, so the escalation pass is driven directly.)"""
+    root, _, _ = world
+    _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True)
+    asked = _mock_created(monkeypatch, 132000000000000002)
+    w = Watcher(root, quiet=True, auto_decide=True)
+    assert w.escalation_checks(datetime.now(timezone.utc), Store(root).load_all()) == 1
+    assert Store(root).get("T-0001").status == "escalated"
+    assert not [c for c in calls if c[0] in {"kill", "checkpoint"}], calls
+    assert asked == [4242]
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "session pid 4242 was already gone (pid reused by another process)" in ev[0]["note"], ev
+    assert "stopped after" not in ev[0]["note"]
+
+
+def test_stop_session_kills_when_creation_time_matches(world, monkeypatch):
+    """The same with Y == X: it is the launched session, so T-0124's behaviour: one kill, of that pid."""
+    root, _, _ = world
+    wt = _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    _mock_created(monkeypatch, 132000000000000001)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)], calls
+    assert "session pid 4242 stopped after checkpoint " in _events(root, "slot_freed", "T-0001")[0]["note"]
+
+
+@pytest.mark.parametrize("live", [132000000000000002, None])
+def test_stop_session_kills_on_an_old_launch_event(world, monkeypatch, live):
+    """A launch event without `created` (recorded before T-0147): the pid is trusted exactly as today, whatever
+    the live creation time is; the helper is not even asked."""
+    root, _, _ = world
+    wt = _stuck_running(root)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    asked = _mock_created(monkeypatch, live)
+    assert Watcher(root, quiet=True).session_of(Store(root).get("T-0001")).get("created") is None
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "escalated", res
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)], calls
+    assert asked == []
+
+
+def test_stop_session_kills_when_the_live_creation_time_is_unreadable(world, monkeypatch):
+    """created recorded, but the live process's cannot be read (access denied): today's behaviour, one kill."""
+    root, _, _ = world
+    wt = _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True, wt=wt)
+    _mock_created(monkeypatch, None)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert [c for c in calls if c[0] == "kill"] == [("kill", 4242)], calls
+
+
+def test_session_dead_on_reused_pid(world, monkeypatch):
+    """session_dead names the reuse when the creation times differ, and only then; on a tick the dead-session
+    card fires (task returned) instead of the stale one, and nothing is killed."""
+    import scr.watch as watch_mod
+    root, _, _ = world
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: True)
+    t = Store(root).get("T-0001")
+    sess = {"pid": 4242, "transcript": None, "created": 132000000000000001}
+    _mock_created(monkeypatch, 132000000000000002)
+    assert Watcher.session_dead(t, sess) == "pid 4242 was reused by another process"
+    _mock_created(monkeypatch, 132000000000000001)
+    assert Watcher.session_dead(t, sess) is None
+    _mock_created(monkeypatch, None)
+    assert Watcher.session_dead(t, sess) is None
+    assert Watcher.session_dead(t, {"pid": 4242, "transcript": None}) is None
+
+    _stuck_running(root, created=132000000000000001)
+    calls = _mock_session(monkeypatch, alive=True)
+    _mock_created(monkeypatch, 132000000000000002)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
+    dead = _events(root, "session_dead", "T-0001")
+    assert len(dead) == 1 and "pid 4242 was reused by another process" in dead[0]["note"], dead
+    assert not _events(root, "stale", "T-0001") and not [c for c in calls if c[0] == "kill"], calls
+
+
+def test_launch_records_the_process_creation_time(world, monkeypatch):
+    """The headless launcher reads the creation time of the pid start_claude returned and puts it in the
+    `launch` event's data next to pid and transcript; session_of hands it on."""
+    import scr.launch as launch_mod
+    from scr.launch import launch
+    root, _, _ = world
+    _record_launches(monkeypatch)
+    monkeypatch.setattr(launch_mod, "claude_bin", lambda: FAKE_CLAUDE)
+    asked: list[int] = []
+    monkeypatch.setattr(launch_mod, "process_created", lambda pid: (asked.append(pid), 132000000000000007)[1])
+    _dispatched(root)
+    launch(root, ["T-0001"], mode="headless")
+    assert asked == [4242]
+    ev = _events(root, "launch", "T-0001")[-1]
+    assert ev["data"]["pid"] == 4242 and ev["data"]["created"] == 132000000000000007, ev
+    assert ev["data"]["transcript"].startswith("session-"), ev
+    sess = Watcher(root, quiet=True).session_of(Store(root).get("T-0001"))
+    assert sess["pid"] == 4242 and sess["created"] == 132000000000000007, sess
+
+
+def test_process_created_identifies_a_real_child_process():
+    """run.process_created on a real process: the same value on every read while it lives, None (or another
+    value) once it has exited and been reaped, None for a pid that cannot exist."""
+    import gc
+
+    from scr.run import process_created
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        first = process_created(p.pid)
+        assert first is not None and process_created(p.pid) == first
+        assert process_created(os.getpid()) not in (None, first)
+    finally:
+        p.kill()
+        p.wait()
+    pid = p.pid
+    del p
+    gc.collect()                                   # the Popen's process handle closes: the pid is released
+    for _ in range(40):                            # (the venv launcher's own handle goes a moment later)
+        if process_created(pid) != first:
+            break
+        time.sleep(0.25)
+    assert process_created(pid) != first
+    assert process_created(0) is None and process_created(None) is None
+
+
+# ---- T-0153: the watcher routes by ops.is_scriptorium_task (repo identity), not the `workload:` string --------
+# The hand path (T-0119, land_any) and the watcher's land step, review launch and status flag share one decider.
+def _rename_workload(root: Path, tid: str = "T-0007") -> None:
+    """Register the checkout a second time, as `tooling` (`repo: .`), and point the task's record at that key."""
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["tooling"] = dict(wl["scriptorium"])
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    sscr(root, "--quiet", "--actor", "s", "task", "field", tid, "workload", "tooling")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] second key for the checkout")
+
+
+def test_watch_land_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, monkeypatch):
+    """An accepted worktree task whose `workload:` is `tooling` (the checkout under another key) lands through
+    land_scriptorium on the tick: landed event, a `[land]` commit on the trunk, and the QI land() (push/PR)
+    is never called."""
+    import scr.ops as ops
+    import scr.watch as watch
+    root, origin, wt = _land_world(tmp_path, monkeypatch)
+    _rename_workload(root)
+    store = Store(root)
+    assert ops.is_scriptorium_task(root, store, store.get("T-0007"))
+    calls: list[str] = []
+    monkeypatch.setattr(watch, "land", lambda root, tid, **kw: calls.append(tid) or {"ok": False, "url": None, "out": ["QI land called"]})
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    origin_before = sgit(origin, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"] and not calls, (calls, res)
+    assert Store(root).get("T-0007").status == "merged", res["needs"]
+    ev = _events(root, "landed", "T-0007")
+    assert len(ev) == 1 and "task/T-0007 -> main @" in ev[0]["note"], ev
+    assert sgit(root, "show", "main:tool.txt").strip() == "ok"
+    assert any(s.startswith("[land] T-0007") for s in sgit(root, "log", "--format=%s", "main").splitlines())
+    assert sgit(origin, "rev-parse", "main") == origin_before and sgit(origin, "branch", "--list", "task/T-0007") == ""
+
+
+def test_watch_review_routes_by_is_scriptorium_task_repo_identity(tmp_path: Path, monkeypatch):
+    """A submitted task under the renamed key gets the tooling review, not the Lean review brief; the same
+    rule flags a worktree-less task under that key `tooling` rather than `no-worktree`."""
+    import scr.watch as watch
+    from scr.watch import Watcher
+    root, _, _ = _land_world(tmp_path, monkeypatch)
+    sscr(root, "--quiet", "task", "new", "Tooling 2", "--id", "T-0012", "--workload", "scriptorium", "--files", "tool.txt", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0012", st)
+    _rename_workload(root, "T-0012")
+    tooling: list[str] = []
+    lean: list[tuple] = []
+    monkeypatch.setattr(Watcher, "start_tooling_review", lambda self, t: tooling.append(t.id))
+    monkeypatch.setattr(watch, "start_claude", lambda *a, **kw: lean.append(a))
+    res = Watcher(root, quiet=True, auto_review=True).tick()
+    assert res["ok"] and "T-0012" in res["review"], res
+    assert tooling == ["T-0012"] and not lean, (tooling, lean)
+    # the status flag: a worktree-less task under `tooling` is a hotfix in the checkout
+    sscr(root, "--quiet", "task", "new", "Hotfix", "--id", "T-0010", "--workload", "scriptorium", "--files", "scr/x.py", "--origin", "omri")
+    for st in ("triaged", "ready", "dispatched", "in_progress"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", "T-0010", st)
+    _rename_workload(root, "T-0010")
+    res = Watcher(root, quiet=True).tick()
+    assert next(r for r in res["rows"] if r["task"] == "T-0010")["flags"] == "tooling"
+
+
+# ---- T-0090: out-of-band push of needs-you cards -------------------------------------------------------------
+import scr.notify as notify  # noqa: E402
+import scr.ui as ui_mod  # noqa: E402
+
+
+def _card(key: str, tid: str, title: str) -> dict:
+    return {"key": key, "id": tid, "type": "system", "kind": "system", "title": title, "options": [], "text": "note"}
+
+
+CARD_A = _card("events:T-0001:session_dead:2026-09-24T01:00:00Z", "T-0001", "scriber session died")
+CARD_B = _card("decision:T-0002", "T-0002", "Pick a direction")
+CARD_C = _card("chore:push-main", "push-main", "Push main to origin")
+
+
+def _notify_cfg(root: Path, cfg: dict | None) -> None:
+    """Write (or, with None, delete) config/notify.yaml and commit it, like _set_limit (config/ is a tooling path)."""
+    p = root / "config" / "notify.yaml"
+    if cfg is None:
+        if p.exists():
+            p.unlink()
+    else:
+        p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    sgit(root, "add", "-A", "config"); sgit(root, "commit", "-q", "--allow-empty", "-m", "[test] notify config")
+
+
+def _fake_channel(monkeypatch, name: str = "toast", fail: bool = False) -> list[list[dict]]:
+    calls: list[list[dict]] = []
+
+    def fake(cards, ch, cfg):
+        calls.append(list(cards))
+        if fail:
+            raise RuntimeError("smtp down")
+        return "ok"
+    monkeypatch.setitem(notify.CHANNELS, name, fake)
+    return calls
+
+
+def _cards(monkeypatch, cards: list[dict]) -> None:
+    monkeypatch.setattr(ui_mod, "needs_cards", lambda root, tasks=None: list(cards))
+
+
+def test_notify_pushes_each_new_card_once_and_never_an_acked_one(world, monkeypatch):
+    """DoD: two new cards on tick 1 -> the channel is called once with both; the same cards on tick 2 -> not
+    called; one card acked, one new -> called with the new one only. Every tick is a fresh Watcher, so the
+    dedup state is the flags file, which survives a watcher restart."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
+    calls = _fake_channel(monkeypatch)
+    email_calls = _fake_channel(monkeypatch, "email")
+    _cards(monkeypatch, [CARD_A, CARD_B])
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert calls == [[CARD_A, CARD_B]] and not email_calls
+    assert {"notified:" + CARD_A["key"], "notified:" + CARD_B["key"]} <= _flags(root)
+    Watcher(root, quiet=True).tick()
+    assert len(calls) == 1
+    scr(root, "--quiet", "--actor", "omri", "ack", CARD_B["key"])   # a decision card stays listed after an ack
+    _cards(monkeypatch, [CARD_A, CARD_B, CARD_C])
+    Watcher(root, quiet=True).tick()
+    assert calls[1:] == [[CARD_C]]
+    Watcher(root, quiet=True).tick()
+    assert len(calls) == 2
+    # a card that no longer stands leaves the flags file (it stays as long as the card list)
+    _cards(monkeypatch, [CARD_C])
+    Watcher(root, quiet=True).tick()
+    assert "notified:" + CARD_A["key"] not in _flags(root) and "notified:" + CARD_C["key"] in _flags(root) and len(calls) == 2
+
+
+def test_notify_channel_failure_is_a_log_line_not_a_crash(world, monkeypatch):
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": True}})
+    toast_calls = _fake_channel(monkeypatch, "toast")
+    _fake_channel(monkeypatch, "email", fail=True)
+    _cards(monkeypatch, [CARD_A])
+    res = Watcher(root, quiet=True).tick()
+    assert res["ok"] and toast_calls == [[CARD_A]]
+    log = (root / LOG).read_text(encoding="utf-8")
+    assert "notify FAILED: email: RuntimeError: smtp down" in log and "notify toast: ok" in log
+    # the card list itself failing is the same kind of line
+    monkeypatch.setattr(ui_mod, "needs_cards", lambda root, tasks=None: 1 / 0)
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert "notify FAILED: ZeroDivisionError" in (root / LOG).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("cfg", [None, {"toast": {"enabled": False}, "email": {"enabled": False}}, {}])
+def test_notify_config_absent_or_all_off_calls_nothing(world, monkeypatch, cfg):
+    root, _, _ = world
+    _notify_cfg(root, cfg)
+    calls = _fake_channel(monkeypatch) + _fake_channel(monkeypatch, "email")
+    _cards(monkeypatch, [CARD_A, CARD_B])
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert not calls and not any(k.startswith("notified:") for k in _flags(root))
+    assert "notify" not in (root / LOG).read_text(encoding="utf-8")
+
+
+def test_toast_argv_names_the_card_title_and_task_id():
+    card = _card("gate:T-0042", "T-0042", "Omri's gate: accept the <new> lemma & go")
+    argv = notify.toast_argv([card, CARD_A])
+    assert argv[0] == "powershell" and "-Command" in argv
+    cmd = argv[-1]
+    assert "T-0042" in cmd and "T-0001" in cmd and "scriber session died" in cmd
+    # the title is XML-escaped and its quote doubled for the PowerShell single-quoted string
+    assert "Omri''s gate: accept the &lt;new&gt; lemma &amp; go" in cmd
+    assert "ToastNotificationManager" in cmd and notify.TOAST_APP_ID in cmd
+
+
+@pytest.mark.skipif(os.name != "nt" or not shutil.which("powershell"), reason="needs Windows and powershell on PATH")
+def test_toast_smoke_runs_the_real_script_through_powershell():
+    """T-0172: toast() is skipped under pytest, so this is the one test that runs the WinRT script itself
+    (dry: types, LoadXml, notifier and toast are built, `.Show` is not called: nothing reaches the screen).
+    Deselect with -k "not toast_smoke"."""
+    card = _card("chore:toast-smoke", "toast-smoke", "scr test suite: toast smoke (ignore)")
+    argv = notify.toast_argv([card], shutil.which("powershell"), dry=True)
+    assert ".Show(" not in argv[-1]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    assert r.returncode == 0 and not r.stderr.strip(), f"rc {r.returncode}: {r.stderr or r.stdout}"
+
+
+def test_toast_without_windows_powershell_raises(monkeypatch):
+    """T-0179: pwsh cannot load the WinRT types, so a box with only pwsh gets a clear error and no process."""
+    monkeypatch.setattr(notify, "_under_pytest", lambda: False)
+    monkeypatch.setattr(notify.shutil, "which", lambda name: None if name == "powershell" else rf"C:\fake\{name}.exe")
+
+    def no_run(*a, **k):
+        pytest.fail(f"subprocess.run called: {a}")
+    monkeypatch.setattr(notify.subprocess, "run", no_run)
+    with pytest.raises(RuntimeError, match=r"Windows PowerShell \(powershell\.exe\)") as e:
+        notify.toast([CARD_A], {}, {})
+    assert "pwsh" in str(e.value)
+
+
+def test_email_password_comes_from_the_named_env_var_only(monkeypatch):
+    """The message is built from the yaml; the channel refuses to run without the env var the yaml names."""
+    ch = {"enabled": True, "host": "smtp.example", "from": "a@example", "to": ["b@example"], "user": "a", "password_env": "SCR_TEST_SMTP_PW"}
+    msg = notify.email_message([CARD_A], ch, {})
+    assert msg["To"] == "b@example" and CARD_A["key"] in msg.get_content() and "T-0001" in msg.get_content()
+    monkeypatch.setattr(notify, "_under_pytest", lambda: False)
+    monkeypatch.delenv("SCR_TEST_SMTP_PW", raising=False)
+    with pytest.raises(RuntimeError, match="SCR_TEST_SMTP_PW"):
+        notify.email([CARD_A], ch, {})
+    live = yaml.safe_load((REPO / "config" / "notify.yaml").read_text(encoding="utf-8"))
+    assert set(live["email"]) >= {"host", "port", "from", "to", "password_env"} and "password" not in live["email"]
+
+
+def test_scr_notify_test_reports_every_channel(world, monkeypatch):
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
+    out = scr(root, "notify", "--test").stdout
+    assert "notify toast: skipped (pytest)" in out and "notify email: off" in out
+
+
+# ---- T-0171: one bounded retry of a card whose push failed on every channel -------------------------------------
+def _switch_channel(monkeypatch, name: str, state: dict) -> list[list[dict]]:
+    """A fake channel that raises while state[name] is True; flip it between ticks."""
+    calls: list[list[dict]] = []
+
+    def fake(cards, ch, cfg):
+        calls.append(list(cards))
+        if state[name]:
+            raise RuntimeError(f"{name} down")
+        return "ok"
+    monkeypatch.setitem(notify.CHANNELS, name, fake)
+    return calls
+
+
+def _push(root: Path, cards: list[dict], flags: set[str], now: float, acked: set[str] | None = None) -> list[str]:
+    lines: list[str] = []
+    notify.push(root, cards, flags, acked or set(), lines.append, now=now)
+    return lines
+
+
+def test_notify_failed_everywhere_is_retried_once_then_given_up(world, monkeypatch):
+    """DoD: every channel raises on tick 1 -> sent once; tick 2 before retry_minutes -> no send; tick 3 after it
+    (injected clock) -> sent exactly once more; that failing too -> one `notify GAVE UP:` line naming the key, and
+    ticks 4 and 5 send nothing."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": True}, "retry_minutes": 10})
+    down = {"toast": True, "email": True}
+    toast_calls, email_calls = _switch_channel(monkeypatch, "toast", down), _switch_channel(monkeypatch, "email", down)
+    flags: set[str] = set()
+    t0 = 1_800_000_000
+    log = _push(root, [CARD_A], flags, t0)
+    assert toast_calls == [[CARD_A]] and email_calls == [[CARD_A]]
+    assert flags == {f"notified-retry:{CARD_A['key']}:{t0}"}, flags
+    assert "notify FAILED: toast: RuntimeError: toast down" in log and "notify FAILED: email: RuntimeError: email down" in log
+    log += _push(root, [CARD_A], flags, t0 + 9 * 60 + 59)
+    assert len(toast_calls) == 1 and len(email_calls) == 1
+    log += _push(root, [CARD_A], flags, t0 + 10 * 60)
+    assert toast_calls == [[CARD_A]] * 2 and email_calls == [[CARD_A]] * 2
+    assert flags == {"notified:" + CARD_A["key"]}, flags
+    for dt in (11, 60):
+        log += _push(root, [CARD_A], flags, t0 + dt * 60)
+    assert len(toast_calls) == 2 and len(email_calls) == 2
+    gave_up = [ln for ln in log if ln.startswith("notify GAVE UP:")]
+    assert gave_up == [f"notify GAVE UP: {CARD_A['key']}"], log
+
+
+def test_notify_retry_that_reaches_a_channel_is_not_a_give_up(world, monkeypatch):
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}, "retry_minutes": 5})
+    down = {"toast": True}
+    calls = _switch_channel(monkeypatch, "toast", down)
+    flags: set[str] = set()
+    _push(root, [CARD_A], flags, 1000)
+    down["toast"] = False
+    log = _push(root, [CARD_A, CARD_B], flags, 1000 + 5 * 60)   # the retry rides with a new card: one channel call
+    assert calls == [[CARD_A], [CARD_B, CARD_A]]
+    assert flags == {"notified:" + CARD_A["key"], "notified:" + CARD_B["key"]}
+    assert not any("GAVE UP" in ln for ln in log) and any(ln.startswith("notify: retrying 1 card(s)") for ln in log)
+    _push(root, [CARD_A, CARD_B], flags, 1000 + 60 * 60)
+    assert len(calls) == 2
+
+
+def test_notify_one_channel_reached_is_never_retried(world, monkeypatch):
+    """DoD: toast fails, email succeeds on tick 1 -> the card is `notified:` and never retried."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": True}})
+    down = {"toast": True, "email": False}
+    toast_calls, email_calls = _switch_channel(monkeypatch, "toast", down), _switch_channel(monkeypatch, "email", down)
+    flags: set[str] = set()
+    _push(root, [CARD_A], flags, 0)
+    assert flags == {"notified:" + CARD_A["key"]}
+    for dt in (10, 11, 120):   # retry_minutes absent from the yaml: the default 10
+        _push(root, [CARD_A], flags, dt * 60)
+    assert len(toast_calls) == 1 and len(email_calls) == 1
+
+
+def test_notify_retry_skips_an_acked_card_and_a_gone_card_loses_its_flag(world, monkeypatch):
+    """DoD: a card acked while it waits for its retry is not retried; a card that disappears loses its retry flag."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}})
+    calls = _switch_channel(monkeypatch, "toast", {"toast": True})
+    flags: set[str] = set()
+    _push(root, [CARD_A, CARD_B], flags, 0)
+    assert len(calls) == 1 and all(f.startswith("notified-retry:") for f in flags) and len(flags) == 2
+    _push(root, [CARD_A, CARD_B], flags, 3600, acked={CARD_B["key"]})
+    assert calls[1:] == [[CARD_A]]
+    _push(root, [CARD_A, CARD_B], flags, 7200, acked={CARD_B["key"]})
+    assert len(calls) == 2
+    _push(root, [CARD_A], flags, 7300)                     # CARD_B no longer stands
+    assert not any(CARD_B["key"] in f for f in flags) and flags == {"notified:" + CARD_A["key"]}
+    _push(root, [CARD_C], flags, 7400)                     # a fresh failed card, then it disappears while waiting
+    assert any(f.startswith("notified-retry:" + CARD_C["key"] + ":") for f in flags)
+    _push(root, [], flags, 7500)
+    assert flags == set() and len(calls) == 3
+
+
+def test_notify_retry_flag_survives_a_watcher_restart(world, monkeypatch):
+    """Through the Watcher: the retry flag is a line of the flags file; the next tick (a fresh Watcher) reads it
+    back and does not resend before retry_minutes."""
+    root, _, _ = world
+    _notify_cfg(root, {"toast": {"enabled": True}, "email": {"enabled": False}, "retry_minutes": 10})
+    calls = _switch_channel(monkeypatch, "toast", {"toast": True})
+    _cards(monkeypatch, [CARD_A])
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert len(calls) == 1 and any(f.startswith("notified-retry:" + CARD_A["key"] + ":") for f in _flags(root))
+    assert Watcher(root, quiet=True).tick()["ok"]
+    assert len(calls) == 1
+
+
+# ---- T-0146: a failed landing is a needs-you card while the task stays accepted ------------------------------
+def _land_cards(root: Path, tid: str) -> list[dict]:
+    return [c for c in ui_mod.needs_cards(root) if c["type"] == "system" and c.get("name") == "land_failed" and c["id"] == tid]
+
+
+def _accepted(root: Path, tid: str = "T-0001") -> None:
+    """The world's ready T-0001 through to accepted (review.md first, T-0081)."""
+    for st in ("dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    (Store(root).get(tid).dir / "review.md").write_text(accepted_review(), encoding="utf-8")
+    scr(root, "--quiet", "--actor", "s", "task", "set", tid, "accepted")
+
+
+def test_land_failed_conflict_is_one_card_with_the_note_until_acked(tmp_path: Path, monkeypatch):
+    """DoD: an accepted task whose landing failed (the real watcher path, a conflict on tool.txt) -> exactly one
+    land_failed needs card for it, carrying the event note and the next step; more ticks add no card; /api/state
+    returns the same card; `scr ack <key>` dismisses it."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk moved on tool.txt")
+    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    _tick(root)
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and Store(root).get("T-0007").status == "accepted"
+    cards = _land_cards(root, "T-0007")
+    assert len(cards) == 1, cards
+    c = cards[0]
+    assert ev[0]["note"] in c["text"] and "landing failed" in c["title"] and "not on main" in c["title"]
+    assert "merge main into task/T-0007" in c["text"] and "task set T-0007 returned" in c["text"]
+    _tick(root); _tick(root)                                                     # ticks: no second event, no second card
+    assert [x["key"] for x in _land_cards(root, "T-0007")] == [c["key"]]
+    assert [x["key"] for x in ui_mod.state(root)["needs"] if x.get("name") == "land_failed"] == [c["key"]]
+    sscr(root, "--quiet", "--actor", "omri", "ack", c["key"])
+    assert _land_cards(root, "T-0007") == []
+
+
+def test_land_failed_card_goes_when_the_task_leaves_accepted_and_never_doubles(world):
+    """DoD: two land_failed events on one accepted task -> ONE card (x2, both notes, the scope next step); the task
+    returned -> no card, no ack; accepted again -> the old failures do not come back; a fresh failure does, alone."""
+    root, _, _ = world
+    _accepted(root)
+    for note in ("FAILED (conflict): main does not merge into task/T-0001: QuantumInsertion/A.lean",
+                 "FAILED (scope): task/T-0001 carries 1 path(s) outside T-0001's scope: state/STATE.json"):
+        scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "land_failed", "--task", "T-0001", "--note", note)
+    cards = _land_cards(root, "T-0001")
+    assert len(cards) == 1 and "×2" in cards[0]["title"], cards
+    assert "(conflict)" in cards[0]["text"] and "(scope)" in cards[0]["text"] and "widen T-0001's scope.files" in cards[0]["text"]
+    scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0001", "returned", "--note", "rebase")
+    assert _land_cards(root, "T-0001") == []
+    for st in ("ready", "dispatched", "in_progress", "submitted", "accepted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    assert _land_cards(root, "T-0001") == []
+    scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "land_failed", "--task", "T-0001", "--note", "FAILED (tests): x")
+    cards = _land_cards(root, "T-0001")
+    assert len(cards) == 1 and cards[0]["text"].startswith("FAILED (tests): x") and "×" not in cards[0]["title"], cards
+
+
+# ---- T-0173: every watcher NEEDS-YOU line is a needs-you card, live ----------------------------------------------
+from scr.watch import NEEDS_FILE  # noqa: E402
+
+
+def _watch_cards(root: Path, tid: str | None = None) -> list[dict]:
+    return [c for c in ui_mod.needs_cards(root) if c["type"] == "watch" and (tid is None or c["id"] == tid)]
+
+
+def _needs_file(root: Path) -> dict:
+    return json.loads((root / NEEDS_FILE).read_text(encoding="utf-8"))
+
+
+def _refuse_escalation(monkeypatch) -> None:
+    real = Watcher.scr
+
+    def scr_(self, actor, *args):
+        if args[:2] == ("task", "set") and "escalated" in args:
+            return None
+        return real(self, actor, *args)
+
+    monkeypatch.setattr(Watcher, "scr", scr_)
+
+
+def test_watch_need_is_one_live_card_with_a_stable_key(world, monkeypatch):
+    """DoD: a tick whose stuck task cannot be escalated (the `task set escalated` refused) leaves exactly one card
+    naming the task and the line; a second tick with the condition keeps the SAME key (no spam); the next tick
+    without the condition leaves none."""
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)
+    _refuse_escalation(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted"
+    line = next(n for n in res["needs"] if n.startswith("T-0001 is stuck"))
+    cards = _watch_cards(root)
+    assert len(cards) == 1, cards
+    c = cards[0]
+    assert c["id"] == "T-0001" and c["text"] == line and "could not be escalated" in c["text"] and c["name"] == "escalate_failed"
+    assert c["key"].startswith("need:escalate_failed:T-0001:") and "escalate" in c["title"]
+    assert [n["key"] for n in _needs_file(root)["needs"]] == ["escalate_failed:T-0001"]
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert [x["key"] for x in _watch_cards(root)] == [c["key"]]                              # same key across ticks
+    monkeypatch.undo()                                                                        # the escalation goes through now
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert _watch_cards(root) == [] and _needs_file(root)["needs"] == []
+
+
+def test_watch_need_card_is_acked_like_any_card(world, monkeypatch):
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)
+    _refuse_escalation(monkeypatch)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    [c] = _watch_cards(root)
+    sscr(root, "--quiet", "--actor", "omri", "ack", c["key"])
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert _watch_cards(root) == []
+
+
+def test_watch_help_need_is_the_help_card_only(world):
+    """DoD: a HELP line the tick raises as a need appears once in needs_cards: the help:<id>:<line> card."""
+    root, _, _ = world
+    _running(root)
+    log = Store(root).get("T-0001").dir / "log.md"
+    log.write_text(log.read_text(encoding="utf-8") + "- HELP: which lemma closes the goal?\n", encoding="utf-8")
+    res = Watcher(root, quiet=True).tick()
+    assert any("HELP" in n and n.startswith("T-0001") for n in res["needs"]), res["needs"]
+    assert any(n["key"].startswith("help:T-0001:") for n in _needs_file(root)["needs"])
+    cards = [c for c in ui_mod.needs_cards(root) if c["id"] == "T-0001"]
+    assert [c["type"] for c in cards] == ["help"] and "which lemma" in cards[0]["text"], cards
+
+
+def test_watch_land_failed_need_is_the_land_failed_card_only(world):
+    """DoD: the watcher's own land_failed path (need line + event) -> one card, the land_failed system card."""
+    root, _, _ = world
+    _accepted(root)
+    w = Watcher(root, quiet=True)
+    w.land_failed(Store(root).get("T-0001"), {"ok": False, "reason": "conflict", "out": ["FAILED (conflict): A.lean"], "tip": "abc123"}, set(), "0000")
+    w.publish_needs(datetime.now(timezone.utc))
+    assert [n["key"] for n in _needs_file(root)["needs"]] == ["land_failed:T-0001"]
+    cards = [c for c in ui_mod.needs_cards(root) if c["id"] == "T-0001"]
+    assert [(c["type"], c.get("name")) for c in cards] == [("system", "land_failed")], cards
+
+
+def test_watch_needs_file_is_written_empty_and_when_paused(world):
+    """DoD: a tick that finds nothing still writes the file (empty list), so a cleared condition clears its card;
+    the paused early return publishes too (its line is the page's paused banner, not a card)."""
+    root, _, _ = world
+    assert not (root / NEEDS_FILE).exists()
+    res = Watcher(root, quiet=True).tick()
+    doc = _needs_file(root)
+    assert res["needs"] == [] and doc["needs"] == [] and doc["ts"] and doc["interval_min"] > 0
+    (root / ".scr" / "paused").write_text("", encoding="utf-8")
+    res = Watcher(root, quiet=True).tick()
+    assert res["paused"] and res["needs"] == ["watcher paused"]
+    assert [n["key"] for n in _needs_file(root)["needs"]] == ["paused"] and _watch_cards(root) == []
+
+
+def test_watch_needs_older_than_two_ticks_show_nothing(world):
+    """A watcher that stopped ticking leaves no cards up: a list older than WATCH_STALE_TICKS intervals is ignored."""
+    root, _, _ = world
+    w = Watcher(root, quiet=True)
+    w.interval_min = 30
+    w.need("checkpoint_failed:T-0001", "T-0001 checkpoint commit failed: boom", "T-0001")
+    now = datetime.now(timezone.utc)
+    w.publish_needs(now - timedelta(minutes=61))
+    assert _watch_cards(root) == []
+    w.publish_needs(now - timedelta(minutes=59))                     # same key: `since` is carried over
+    assert _needs_file(root)["needs"][0]["since"] < _needs_file(root)["ts"]
+    assert len(_watch_cards(root)) == 1
+
+
+def test_watch_retire_refused_stands_while_the_worktree_does(world):
+    """A refused retire happens once (the task is merged after it); the line stays raised while the worktree exists."""
+    root, _, _ = world
+    w = Watcher(root, quiet=True)
+    t = Store(root).get("T-0001")
+    wt = task_worktree(workload_for(root, w.store, t), t)
+    w.retire_refused("T-0001", "dirty")
+    w.retire_refused_needs(w.store.load_all())
+    assert w.needs == [] and not any(k.startswith("retire_refused:") for k in w.flags)       # no worktree: nothing to say
+    wt.mkdir(parents=True)
+    w.retire_refused("T-0001", "dirty")
+    for _ in range(2):
+        w.needs, w.need_items = [], []
+        w.retire_refused_needs(w.store.load_all())
+        assert [n["key"] for n in w.need_items] == ["retire_refused:T-0001"] and "(dirty)" in w.needs[0]
+
+
+def test_ui_state_carries_watch_cards_and_nothing_else_changes(world):
+    """DoD: ui.state() returns the watcher-need cards in `needs`; the rest of its JSON is unchanged field for field."""
+    root, _, _ = world
+    (root / ".gitignore").write_text(".scr/\n", encoding="utf-8")      # as in the live root: the file is never a journal change
+    sgit(root, "add", ".gitignore"); sgit(root, "commit", "-q", "-m", "ignore .scr")
+    before = ui_mod.state(root)
+    w = Watcher(root, quiet=True)
+    w.need("decision_unapplied:T-0001", "T-0001 decision accepted from review.md could not be applied — see log", "T-0001")
+    w.publish_needs(datetime.now(timezone.utc))
+    after = ui_mod.state(root)
+    assert set(after) == set(before)
+    for k in before:
+        if k not in {"generated", "needs"}:
+            assert after[k] == before[k], k
+    added = [c for c in after["needs"] if c not in before["needs"]]
+    assert [(c["type"], c["id"], c["name"]) for c in added] == [("watch", "T-0001", "decision_unapplied")]
+    assert [c for c in after["needs"] if c["type"] != "watch"] == before["needs"]
+
+
+def test_every_watch_need_goes_through_the_keyed_helper():
+    """Every NEEDS-YOU line has a stable key: `self.needs.append` appears only inside Watcher.need."""
+    src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
+    assert src.count("self.needs.append(") == 1 and src.count("self.need(") >= 15
+
+
+# ---- T-0180: a half-written report.md is not a submission --------------------------------------------------
+# T-0172 was submitted with a literal FULL_SUITE_PLACEHOLDER where the full-suite result belonged. The text
+# below is T-0172's final report.md (the placeholder line already replaced by the real result).
+from scr.watch import report_unfinished  # noqa: E402
+
+T0172_REPORT = """# Report
+
+## Result
+The suite now runs the real WinRT toast script through powershell once, in **dry** mode: nothing is put on screen.
+
+- `scr/notify.py` `toast_argv(cards, exe="powershell", dry=False)`: new keyword `dry`. The script now binds
+  `$t = ...CreateToastNotifier(<app id>)` and `$n = [ToastNotification]::new($x)` and, only when not dry, ends with
+  `; $t.Show($n)`. So dry exercises everything the real toast does (both WinRT type loads, `New-Object XmlDocument`,
+  `LoadXml` of the escaped XML, `CreateToastNotifier` with `TOAST_APP_ID`, building the `ToastNotification`) except `.Show`.
+  The script also now starts with `$ErrorActionPreference = 'Stop'`, so any failing statement ends the script with rc 1
+  (before, a failed type load in the middle could be followed by statements that still "succeed"; the last statement's
+  status decided rc). This applies to the real toast too: `toast()` now reliably raises `powershell rc 1: ...` on such a break.
+- `tests/test_watch.py` `test_toast_smoke_runs_the_real_script_through_powershell`: `@pytest.mark.skipif(os.name != "nt" or not
+  shutil.which("powershell"))`; card titled `scr test suite: toast smoke (ignore)`; runs
+  `subprocess.run(notify.toast_argv([card], shutil.which("powershell"), dry=True), capture_output=True, text=True, timeout=60)`
+  (plus `CREATE_NO_WINDOW`) and asserts rc 0 and empty stderr; also asserts `.Show(` is absent from the dry script.
+  Deselect with `-k "not toast_smoke"`.
+
+done_when:
+- `pytest tests/test_watch.py -k toast_smoke -q` -> `1 passed, 102 deselected` (not skipped). PASS.
+- skipif on `os.name != "nt"` and `shutil.which("powershell")`. PASS.
+- `test_toast_argv_names_the_card_title_and_task_id` unchanged and passes (`-k toast` -> 2 passed); `toast()` and
+  `_under_pytest` untouched, `test_scr_notify_test_reports_every_channel` still sees `skipped (pytest)`. PASS.
+- full suite: see below.
+- Judgment, broken script: with `XmlDocument` misspelled as `XmlDocumnet` in the type-load line (and `::new` as `::nwe`),
+  the smoke test FAILED: `AssertionError: rc 1: Unable to find type [Windows.Data.Xml.Dom.XmlDocumnet,Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime].`
+  After reverting it passed again (`1 passed`).
+- Judgment, toasts on screen: dry, so running the suite puts **zero** toasts on screen.
+
+Full suite: `.venv/Scripts/python.exe -m pytest tests -q` in the worktree with the live-root `.venv` python ->
+`231 passed in 2611.58s (0:43:31)`, exit 0. PASS. Note that the suite has become slow (43.5 min on this box, up from about
+20 min in T-0090). A land gate with a shorter timeout will time out on it, as T-0170's land did with `exited 124`. The new
+smoke test adds about 2 s of that.
+
+## What I am unsure about
+- Dry mode does not prove `.Show` itself succeeds (for example Focus Assist, or the app id being unregistered at show
+  time). Everything before it is covered; `.Show` on a built `ToastNotification` with a valid notifier is the one
+  untested call.
+- `$ErrorActionPreference = 'Stop'` is a small behaviour change to the live toast: failures that were silently
+  swallowed now raise in `toast()` (and so become `notify FAILED: toast: ...` lines). I think that is the wanted
+  direction, but the Steward may want it noted.
+
+## Statement changes
+None. (`toast_argv` gained an optional keyword argument `dry=False`; existing callers are unchanged. This is Python, no
+Lean statements touched.)
+
+## Tokens and attempts
+Attempt 1 of 2; roughly 60k tokens.
+
+## unlocks
+```yaml
+on_success: []     # {title, kind, queue, scope, reason} — proposals, not tasks; Intake decides
+on_failure: []
+informs:
+  - {task: T-0171, weight: 0.2, reason: "toast_argv gained dry= and $ErrorActionPreference='Stop'; a failing toast now raises reliably, which feeds the T-0171 retry path"}
+```
+"""
+REPORT_TPL = (REPO / "templates" / "report.md").read_text(encoding="utf-8").strip()
+
+
+def test_report_unfinished_names_a_placeholder_an_empty_result_and_the_template_prompt():
+    assert report_unfinished(T0172_REPORT, REPORT_TPL) is None
+    submitted = T0172_REPORT.replace("Full suite: `.venv", "FULL_SUITE_PLACEHOLDER\n\nFull suite: `.venv")
+    assert submitted != T0172_REPORT and "FULL_SUITE_PLACEHOLDER" in report_unfinished(submitted, REPORT_TPL)
+    assert "FULL_SUITE_PLACEHOLDER" in report_unfinished("# Report\n\n## Result\nProved a.\n- full suite: FULL_SUITE_PLACEHOLDER\n", REPORT_TPL)
+    empty = REPORT_TPL.replace("What was proved / produced. Which done_when lines pass, in the Scriber's own assessment.", "")
+    assert empty != REPORT_TPL and "## Result is empty" in report_unfinished(empty + "\nfilled in elsewhere\n", REPORT_TPL)
+    assert "## Result is empty" in report_unfinished("# Report\n\n## Result\n\n## What I am unsure about\nnothing\n", REPORT_TPL)
+    prompt = REPORT_TPL + "\n\nfilled in elsewhere\n"                          # differs from the template, Result untouched
+    assert "template prompt" in report_unfinished(prompt, REPORT_TPL)
+    # lower-case or unanchored words are not placeholders; a report with no Result heading is not judged
+    for ok in ("# Report\n\n## Result\nThe _PLACEHOLDER rule in scr/review.py is untouched; a placeholder_x name too.\n",
+               "# report\n\n## Result\n\ndone\n\n## Statement changes\n\nnone\n", "done\n"):
+        assert report_unfinished(ok, REPORT_TPL) is None, ok
+
+
+def test_report_unfinished_ignores_tokens_in_a_fence_or_backticks():
+    """T-0181: a token quoted in a code fence or inline backticks is a mention (a report about T-0180 names
+    FULL_SUITE_PLACEHOLDER); a bare prose token is still caught, also next to a fenced one. An unclosed fence
+    hides the rest of the text, as `_unfenced` does for review.md Decision lines."""
+    fenced = "# Report\n\n## Result\nProved a.\n\n```\nFull suite: FULL_SUITE_PLACEHOLDER\n```\n\nFull suite: 3 passed\n"
+    assert report_unfinished(fenced, REPORT_TPL) is None
+    assert report_unfinished(fenced.replace("```", "~~~"), REPORT_TPL) is None
+    ticked = "# Report\n\n## Result\nT-0172 held a literal `FULL_SUITE_PLACEHOLDER`; now caught. Full suite: 3 passed\n"
+    assert report_unfinished(ticked, REPORT_TPL) is None
+    bare = "# Report\n\n## Result\nProved a.\n\nFull suite: FULL_SUITE_PLACEHOLDER\n"
+    assert "FULL_SUITE_PLACEHOLDER" in report_unfinished(bare, REPORT_TPL)
+    both = fenced + "\nAxioms: AXIOMS_PLACEHOLDER\n"
+    assert "AXIOMS_PLACEHOLDER" in report_unfinished(both, REPORT_TPL)
+    assert "FULL_SUITE_PLACEHOLDER" in report_unfinished("# Report\n\n## Result\n`x` FULL_SUITE_PLACEHOLDER `y`\n", REPORT_TPL)
+    unclosed = "# Report\n\n## Result\nProved a.\n\n```\nFull suite: FULL_SUITE_PLACEHOLDER\n"
+    assert report_unfinished(unclosed, REPORT_TPL) is None
+    # the Result checks still read the original text: a Result that is only a fenced block is not empty
+    assert report_unfinished("# Report\n\n## Result\n```\nlake build: ok\n```\n", REPORT_TPL) is None
+
+
+def test_tick_keeps_placeholder_report_in_progress(world, monkeypatch):
+    """DoD: an in_progress task whose report.md holds a placeholder stays in_progress, a needs line with key
+    report:<id> appears (logged once), and no `task set ... submitted` call is made; once the report is
+    finished the next tick submits it as before."""
+    root, _, _ = world
+    _running(root)
+    t = Store(root).get("T-0001")
+    (t.dir / "report.md").write_text("# report\n\n## Result\n\nProved a.\n\nFull suite: FULL_SUITE_PLACEHOLDER\n\n## Statement changes\n\nnone\n", encoding="utf-8")
+    calls = _spy_scr(monkeypatch)
+    for _ in range(2):
+        w = Watcher(root, quiet=True)
+        res = w.tick()
+        assert res["ok"], res
+        assert Store(root).get("T-0001").status == "in_progress"
+        items = [n for n in w.need_items if n["key"] == "report:T-0001"]
+        assert len(items) == 1 and items[0]["task"] == "T-0001" and "FULL_SUITE_PLACEHOLDER" in items[0]["text"], w.need_items
+        assert items[0]["text"].startswith("T-0001 report.md unfinished: ")
+        assert "REPORT-UNFINISHED" in res["rows"][0]["flags"]
+    assert not any("submitted" in args for _, args in calls), calls
+    log = (root / "reports" / "steward_watch.log").read_text(encoding="utf-8")
+    assert log.count("T-0001 report.md unfinished") == 1                                # logged once
+    assert "report_unfinished:T-0001" in _flags(root)
+    # finished: submitted exactly as today, and the flag is gone
+    (t.dir / "report.md").write_text("# report\n\n## Result\n\nProved a.\n\nFull suite: 3 passed\n\n## Statement changes\n\nnone\n", encoding="utf-8")
+    w = Watcher(root, quiet=True)
+    w.tick()
+    assert Store(root).get("T-0001").status == "submitted" and not any(n["key"] == "report:T-0001" for n in w.need_items)
+    assert "report_unfinished:T-0001" not in _flags(root)
+
+
+def test_tick_returns_a_dead_session_that_left_an_unfinished_report(world):
+    """A session that died with a placeholder still in report.md is not submitted: the existing dead-session
+    path returns it (one session_dead event), as it would a session that wrote no report."""
+    import subprocess as sp
+    from test_journal_ops import _named, _running_with_session
+    p = sp.Popen([sys.executable, "-c", "pass"]); p.wait()                  # a pid that existed and is gone
+    root, _, t = _running_with_session(world, p.pid)
+    (t.dir / "report.md").write_text("# report\n\n## Result\n\nFULL_SUITE_PLACEHOLDER\n", encoding="utf-8")
+    w = Watcher(root, quiet=True)
+    res = w.tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
+    assert len(_named(root, "session_dead")) == 1
+    assert any(n["key"] == "report:T-0001" for n in w.need_items) and any(n["key"] == "dead:T-0001" for n in w.need_items)
+
+
+# ---- T-0188: retire measures a workload branch against origin/<main>, not the local main ------------------------
+# quantum-insertion's local master sat 53 commits behind origin/master on 2026-09-24, so retire refused T-0115
+# (merged by PR #64) as `52 commit(s) ahead of master`.
+from test_journal_ops import git as jgit  # noqa: E402
+from scr.ops import checkpoint_commit, retire  # noqa: E402
+
+
+def _retire_world(world, merged: bool):
+    """T-0001 spawned with two commits; origin/master moves on by three commits of its own (plus the branch when
+    `merged`), pushed from another clone, so the workload's local master and its origin/master ref stay behind."""
+    root, repo, origin = world
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched")
+    spawn(root, ["T-0001"], lake=False)
+    wt = repo / ".worktrees" / "T-0001"
+    for i in (1, 2):
+        (wt / f"n{i}.txt").write_text(f"{i}\n"); checkpoint_commit(root, "T-0001")
+    jgit(wt, "push", "-q", "origin", "task/T-0001")
+    other = repo.parent / "other-clone"
+    jgit(repo.parent, "clone", "-q", str(origin), str(other))
+    jgit(other, "config", "user.email", "t@t"); jgit(other, "config", "user.name", "t")
+    for i in (1, 2, 3):
+        (other / f"o{i}.txt").write_text(f"{i}\n"); jgit(other, "add", "-A"); jgit(other, "commit", "-q", "-m", f"o{i}")
+    if merged:
+        jgit(other, "fetch", "-q", "origin", "task/T-0001")
+        jgit(other, "merge", "-q", "--no-edit", "FETCH_HEAD")
+    jgit(other, "push", "-q", "origin", "master")
+    return root, repo, wt
+
+
+def test_retire_takes_a_branch_merged_into_origin_main_only(world):
+    """DoD: local main behind origin/main, the branch merged into origin/main only -> retire proceeds (dry run shows
+    the move), no REFUSING line; the local master is left where it was."""
+    root, repo, wt = _retire_world(world, merged=True)
+    local = jgit(repo, "rev-parse", "master")
+    assert int(jgit(repo, "rev-list", "--count", "master..task/T-0001")) == 2          # the old measure: 2 ahead
+    res = retire(root, "T-0001")
+    assert res["ok"] and res["code"] == 0, res["out"]
+    assert not any("REFUSING" in l for l in res["out"])
+    assert "origin/master" in res["out"][0] and any("quarantine ->" in l for l in res["out"]) and res["out"][-1] == "DRY RUN — nothing moved"
+    assert wt.exists() and jgit(repo, "rev-parse", "master") == local                  # nothing moved, local master untouched
+    assert retire(root, "T-0001", execute=True)["ok"] and not wt.exists()
+
+
+def test_retire_still_refuses_a_branch_not_in_origin_main(world):
+    """DoD: a branch not merged into origin/main is refused, its ahead count measured against origin/main."""
+    root, repo, wt = _retire_world(world, merged=False)
+    res = retire(root, "T-0001", execute=True)
+    assert not res["ok"] and res["code"] == 2 and wt.exists(), res["out"]
+    assert res["out"][-1].startswith("REFUSING: task/T-0001 is 2 commit(s) ahead of origin/master")
+
+
+# ---- T-0187: out of usage credits is not a session death ---------------------------------------------------
+# 2026-09-23 09:47Z-13:56Z the account had no credits: each headless session printed one line and exited, the
+# watcher returned the task and spent its attempt, then dispatched the next two into the same wall (16 tasks).
+# Now a credit death is ready again with its attempt refunded, ONE credits_exhausted event pauses auto-dispatch,
+# and a death that did no work is set ready once. pid_alive is replaced in scr.watch; no real claude runs.
+from scr.watch import CREDITS_PAUSE_MINUTES, credits_line, credits_pause, did_work  # noqa: E402
+
+CREDIT_MSG = ("You're out of usage credits. Switch to another model, or manage usage credits at "
+              "claude.ai/settings/usage?from=cc_cli_limit_message, to continue.\n")
+TRANSCRIPT = "session-20260923-000000.txt"          # the name _launched records
+
+
+def _dying(root: Path, tid: str = "T-0001", pid: int = 4242, transcript: str = CREDIT_MSG, work: bool = False,
+           scriber_line: bool = False) -> None:
+    """A ready task dispatched, spawned (once), in_progress and launched as `pid`, whose session has exited leaving
+    `transcript` (and an empty .err, as on 2026-09-23). `work` edits the worktree (the tick checkpoints it);
+    `scriber_line` appends a [scriber] line to log.md."""
+    _dispatched(root, tid)
+    t = Store(root).get(tid)
+    wt = task_worktree(workload_for(root, Store(root), t), t)
+    if not wt.exists():
+        spawn(root, [tid], lake=False)
+    scr(root, "--quiet", "--actor", f"steward:{tid}", "task", "set", tid, "in_progress")
+    _launched(root, tid, pid)
+    (t.dir / TRANSCRIPT).write_text(transcript, encoding="utf-8")
+    (t.dir / (TRANSCRIPT + ".err")).write_text("", encoding="utf-8")
+    if scriber_line:
+        with (t.dir / "log.md").open("a", encoding="utf-8") as f:
+            f.write("- 2026-09-23T10:00:00 [scriber] read the spec; plan written\n")
+    if work:
+        (wt / "QuantumInsertion" / "A.lean").write_text("theorem a : True := by trivial\n", encoding="utf-8")
+
+
+def _dead_pids(monkeypatch) -> None:
+    import scr.watch as watch_mod
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: False)
+
+
+def _sys_events(root: Path, name: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "system" and e.get("name") == name]
+
+
+def _credit_needs(res: dict) -> list[str]:
+    return [n for n in res["needs"] if "usage credits" in n]
+
+
+def test_credits_line_reads_the_tail_and_not_a_quote(tmp_path: Path):
+    p = tmp_path / "s.txt"
+    p.write_text(CREDIT_MSG, encoding="utf-8")
+    assert credits_line(p).startswith("You're out of usage credits")
+    p.write_text("Done. The watcher now reads `You're out of usage credits` as a pause.\nreport written\n", encoding="utf-8")
+    assert credits_line(p) is None                       # a quote inside a sentence is not the message
+    p.write_text(CREDIT_MSG + "\n".join(f"line {i}" for i in range(5)), encoding="utf-8")
+    assert credits_line(p) is None                       # only the last lines count
+    assert credits_line(tmp_path / "missing.txt", p.with_name("e.err")) is None
+
+
+def test_credits_pause_is_a_pure_function_of_the_log_and_time():
+    t0 = datetime(2026, 9, 23, 9, 47, tzinfo=timezone.utc)
+    ev = lambda name, m: {"kind": "system", "name": name, "ts": (t0 + timedelta(minutes=m)).isoformat().replace("+00:00", "Z")}  # noqa: E731
+    assert credits_pause([], t0, 60) is None
+    p = credits_pause([ev("credits_exhausted", 0)], t0 + timedelta(minutes=10), 60)
+    assert p and p["since"] == t0 and p["until"] == t0 + timedelta(minutes=60)
+    assert credits_pause([ev("credits_exhausted", 0)], t0 + timedelta(minutes=61), 60) is None          # the probe
+    for resume in ("credits_resumed", "watcher_resumed"):
+        assert credits_pause([ev("credits_exhausted", 0), ev(resume, 5)], t0 + timedelta(minutes=10), 60) is None
+    assert credits_pause([ev("credits_resumed", 0), ev("credits_exhausted", 5)], t0 + timedelta(minutes=10), 60)
+
+
+def test_credit_death_is_ready_unspent_and_pauses_dispatch(world, monkeypatch):
+    """DoD 2: a dead session whose transcript holds the credit message -> one credits_exhausted event, the task
+    ready, attempts as before its dispatch, and neither that tick nor the next dispatches anything; a
+    credits_resumed event ends the pause and the next tick dispatches again."""
+    root, _, _ = world
+    before = int(Store(root).get("T-0001").rec.get("attempts", 0))
+    _dying(root)
+    assert int(Store(root).get("T-0001").rec["attempts"]) == before + 1
+    _dead_pids(monkeypatch)
+    launches = _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "ready" and int(t.rec["attempts"]) == before, res
+    assert [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["returned", "ready"]
+    assert len(_sys_events(root, "credits_exhausted")) == 1 and not _events(root, "session_dead", "T-0001")
+    assert len(_credit_needs(res)) == 1 and "credits_resumed" in _credit_needs(res)[0]
+    assert [n["key"] for n in _needs_file(root)["needs"]].count("credits") == 1
+    res2 = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert not [a for _, a in calls if a and a[0] == "dispatch"] and not launches, calls
+    assert Store(root).get("T-0001").status == "ready" and len(_credit_needs(res2)) == 1
+    assert len(_sys_events(root, "credits_exhausted")) == 1                       # the standing pause raises nothing more
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "credits_resumed")
+    res3 = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert not _credit_needs(res3) and [a for _, a in calls if a and a[0] == "dispatch"], calls
+    assert Store(root).get("T-0001").status == "in_progress" and len(launches) == 1
+
+
+def test_two_credit_deaths_in_one_tick_are_one_event_and_one_line(world, monkeypatch):
+    """DoD 3: two dead sessions with the message in one tick -> one event and one needs line, both tasks ready
+    with their attempts refunded."""
+    root, _, _ = world
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    _dying(root, "T-0001", 4242)
+    _dying(root, "T-0002", 4343)
+    _dead_pids(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert res["ok"], res
+    for tid in ("T-0001", "T-0002"):
+        t = Store(root).get(tid)
+        assert t.status == "ready" and int(t.rec["attempts"]) == 0, (tid, t.rec)
+    assert len(_sys_events(root, "credits_exhausted")) == 1
+    assert len(_credit_needs(res)) == 1 and [n["key"] for n in _needs_file(root)["needs"]].count("credits") == 1
+
+
+def test_no_work_death_is_ready_once_per_episode(world, monkeypatch):
+    """DoD 4: a returned-by-death task with no checkpoint and no [scriber] log line goes back to ready once
+    (attempt counted); the next death in the same episode, again without work, leaves it returned."""
+    root, _, _ = world
+    _dying(root, transcript="")
+    _dead_pids(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "ready" and int(t.rec["attempts"]) == 1, res
+    assert [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["returned", "ready"]
+    assert len(_events(root, "session_dead", "T-0001")) == 1 and not _sys_events(root, "credits_exhausted")
+    _dying(root, pid=4343, transcript="")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "returned" and int(t.rec["attempts"]) == 2, res
+    assert len(_events(root, "session_dead", "T-0001")) == 2
+
+
+@pytest.mark.parametrize("work", ["checkpoint", "scriber", "report", "no_transcript"])
+def test_death_with_real_work_is_unchanged(world, monkeypatch, work):
+    """DoD 5: a dead session that did real work (a checkpoint commit this tick, a [scriber] log line, a report.md
+    written) — or one with no transcript on disk, so no evidence it never ran — is returned as before, its attempt
+    counted, one session_dead event, no pause."""
+    root, _, _ = world
+    _dying(root, transcript="", work=work == "checkpoint", scriber_line=work == "scriber")
+    t = Store(root).get("T-0001")
+    if work == "report":
+        (t.dir / "report.md").write_text("# Report\n\n## Result\n\nFULL_SUITE_PLACEHOLDER\n", encoding="utf-8")   # unfinished: no submission
+    if work == "no_transcript":
+        (t.dir / TRANSCRIPT).unlink()
+    _dead_pids(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "returned" and int(t.rec["attempts"]) == 1, res
+    assert len(_events(root, "session_dead", "T-0001")) == 1 and not _sys_events(root, "credits_exhausted")
+    if work == "checkpoint":
+        assert _events(root, "checkpoint_commit", "T-0001")
+    assert not _credit_needs(res)
+
+
+def test_credit_review_session_pauses_and_is_relaunched_after(world, monkeypatch):
+    """A review transcript that holds the credit message opens the same pause (one event): no review starts while
+    it stands, and once it is resumed the review is launched afresh."""
+    root, _, _ = world
+    _dispatched(root)
+    spawn(root, ["T-0001"], lake=False)
+    for st in ("in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    launches = _record_launches(monkeypatch)
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 1 and "review:T-0001" in _flags(root)
+    t = Store(root).get("T-0001")
+    trs = sorted(t.dir.glob("review-session-*.txt"))
+    assert trs, "the review launch names its transcript"
+    trs[-1].write_text(CREDIT_MSG, encoding="utf-8")          # the review session exited on the credit wall
+    res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 1 and "review:T-0001" not in _flags(root), launches
+    assert len(_sys_events(root, "credits_exhausted")) == 1 and len(_credit_needs(res)) == 1
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 1 and len(_sys_events(root, "credits_exhausted")) == 1
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "credits_resumed")
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert len(launches) == 2 and Store(root).get("T-0001").status == "submitted"
+
+
+def test_did_work_counts_only_this_launch():
+    evs = [{"kind": "system", "name": "checkpoint_commit", "task": "T-1", "ts": "2026-09-23T09:00:00Z"}]
+    log = "- [launcher] pid 7, transcript x\n- [scriber] old run\n- [launcher] pid 8, transcript y\n"
+    assert not did_work(evs, "T-1", "2026-09-23T10:00:00Z", log, 8)
+    assert did_work(evs, "T-1", "2026-09-23T08:00:00Z", log, 8)
+    assert did_work([], "T-1", "2026-09-23T10:00:00Z", log, 7)
+
+
+def test_credits_pause_key_is_read_and_mirrored():
+    src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
+    limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    assert 'self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES)' in src
+    assert limits["credits_pause_minutes"] == CREDITS_PAUSE_MINUTES
+
+
+# ---- per-task background-wait ceiling (scr/bgwait.py) -------------------------------------------------------
+# Headless sessions were killed 600 s after their turn ended while LPs still ran in the background (T-0015,
+# T-0051, T-0226). budget.max_bg_wait_minutes sets CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS for that task's session;
+# over 12 h it needs Omri: `task field` refuses other actors, and the launcher parks a hand-edited request.
+from scr import bgwait  # noqa: E402
+
+
+def test_bgwait_parse_rejects_zero_negative_and_junk():
+    assert bgwait.parse(90) == 90 and bgwait.parse("90") == 90
+    for bad in (0, -5, "x", None, True, 1.5):
+        with pytest.raises(ValueError):
+            bgwait.parse(bad)
+
+
+def test_task_field_bg_wait_over_12h_is_omri_only(world):
+    root, _, _ = world
+    scr(root, "--quiet", "--actor", "steward:T-0001", "task", "field", "T-0001", bgwait.FIELD, "720")
+    assert Store(root).get("T-0001").rec["budget"]["max_bg_wait_minutes"] == 720
+    r = scr(root, "--quiet", "--actor", "intake", "task", "field", "T-0001", bgwait.FIELD, "721", check=False)
+    assert r.returncode != 0 and "only Omri" in (r.stdout + r.stderr)
+    assert Store(root).get("T-0001").rec["budget"]["max_bg_wait_minutes"] == 720
+    r = scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0001", bgwait.FIELD, "0", check=False)
+    assert r.returncode != 0
+    scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0001", bgwait.FIELD, "1440")
+    assert Store(root).get("T-0001").rec["budget"]["max_bg_wait_minutes"] == 1440
+
+
+def test_launch_sets_the_ceiling_env_only_when_asked(world, monkeypatch):
+    from scr.launch import launch
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    _dispatched(root)
+    launch(root, ["T-0001"], mode="headless")
+    assert calls[-1]["env"] is None                       # no field: Claude Code's default, env untouched
+    scr(root, "--quiet", "--actor", "steward:T-0001", "task", "field", "T-0001", bgwait.FIELD, "240")
+    launch(root, ["T-0001"], mode="headless", relaunch=True)
+    assert calls[-1]["env"][bgwait.ENV] == str(240 * 60_000)
+    assert _events(root, "launch", "T-0001")[-1]["data"]["bg_wait_minutes"] == 240
+    assert "background-wait ceiling 240 min" in (Store(root).get("T-0001").dir / "log.md").read_text(encoding="utf-8")
+
+
+def test_launch_honours_omri_authorized_long_ceiling(world, monkeypatch):
+    from scr.launch import launch
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0001", bgwait.FIELD, "1800")
+    _dispatched(root)
+    launch(root, ["T-0001"], mode="headless")
+    assert calls and calls[-1]["env"][bgwait.ENV] == str(1800 * 60_000)
+    assert Store(root).get("T-0001").status == "in_progress"
+
+
+def test_launch_parks_an_unauthorized_long_ceiling(world, monkeypatch):
+    """A record edited by hand past the field guard: no session starts, the task goes to Omri's queue."""
+    from scr.launch import launch
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    t = Store(root).get("T-0001")
+    t.rec.setdefault("budget", {})["max_bg_wait_minutes"] = 1800
+    t.save()
+    scr(root, "--quiet", "--actor", "steward:T-0001", "event", "system", "--name", "x")   # keep the log moving
+    _dispatched(root)
+    out = launch(root, ["T-0001"], mode="headless")
+    assert not calls, calls
+    assert any("NOT launched" in line for line in out), out
+    assert Store(root).get("T-0001").status == "omri_queue"
+    assert _events(root, "bg_wait_unauthorized", "T-0001")
+
+
+def test_brief_names_the_ceiling(world):
+    from scr.brief import brief_for
+    root, _, _ = world
+    st = Store(root)
+    assert "10 min (the default)" in brief_for(root, st, st.get("T-0001"))
+    scr(root, "--quiet", "--actor", "s", "task", "field", "T-0001", bgwait.FIELD, "300")
+    st = Store(root)
+    assert "300 min" in brief_for(root, st, st.get("T-0001"))

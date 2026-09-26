@@ -12,6 +12,41 @@ from .graph import Graph
 from .store import Store, STATES
 
 
+# T-0207: the numeric config/limits.yaml keys a code reader converts -> (its conversion, the default it falls
+# back to). Every such reader swallows a bad value into that default (or crashes on int("abc") later), so verify
+# names it instead. `int` keys also refuse a non-integral float (int(0.5) is a silent 0). Every other key in the
+# file is numeric too and read by an agent through its brief (the READERS allowlist in
+# tests/test_config.py), with no fallback; they are not named here, so this table does not count
+# as their reader for the T-0125 scanner. LIMITS_NOT_NUMERIC are the string keys (T-0135 validates the window).
+LIMITS_NUMERIC: dict[str, tuple[type, Any]] = {
+    "concurrency": (int, 3),                    # scr/cli.py:259, scr/queue.py:14, scr/watch.py:741, scr/ui.py:316
+    "default_max_attempts": (int, 3),           # scr/cli.py:68
+    "checkpoint_every_minutes": (int, 30),      # scr/cli.py:442, scr/watch.py:361
+    "land_test_timeout_seconds": (int, 3600),   # scr/ops.py:488 land_test_timeout (LAND_TEST_TIMEOUT_S)
+    "dispatch_timeout_minutes": (float, 30),    # scr/watch.py:881 (DISPATCH_TIMEOUT_MINUTES)
+    "review_stale_hours": (float, 2.0),         # scr/watch.py:917 (REVIEW_STALE_HOURS)
+    "help_stale_hours": (float, 3.0),           # scr/watch.py:918 (HELP_STALE_HOURS)
+    "credits_pause_minutes": (float, 60),       # scr/watch.py:785,793 (CREDITS_PAUSE_MINUTES)
+}
+LIMITS_NOT_NUMERIC = frozenset({"statement_window", "claude_permission_mode"})   # scr/cli.py:263, scr/run.py:68
+
+
+def limits_warnings(limits: dict) -> list[str]:
+    """One line per numeric key present in `limits` whose value is not a positive number (bools, strings and
+    null count as not numbers). Absent keys are not reported (T-0134)."""
+    out = []
+    for key, v in limits.items():
+        if key in LIMITS_NOT_NUMERIC:
+            continue
+        kind, default = LIMITS_NUMERIC.get(key, (float, None))
+        ok = (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+              and (kind is float or float(v).is_integer()))
+        if not ok:
+            fallback = default if default is not None else "nothing (an agent reads the raw value)"
+            out.append(f"limits.yaml {key}: {v!r} is not a positive number; readers fall back to {fallback}")
+    return out
+
+
 def git_head(root: Path) -> str | None:
     try:
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, timeout=10)
@@ -135,6 +170,19 @@ class State:
         ie, iw = g.check_invariants()
         errors += ie
         warnings += iw
+
+        # T-0157: ops.workload() resolves a missing or unregistered `workload:` to the first entry on
+        # purpose (a record may name a workload before it is registered); make that fallback visible.
+        wls = list(self.store.config("workloads") or {})
+        if wls:
+            for tid, t in sorted(g.tasks.items()):
+                key = t.rec.get("workload")
+                if t.is_open and (not key or key not in wls):
+                    warnings.append(f"{tid}: workload '{key or ''}' is not registered in config/workloads.yaml "
+                                    f"(resolves to the first entry, '{wls[0]}')")
+
+        limits = self.store.config("limits")
+        warnings += limits_warnings(limits if isinstance(limits, dict) else {})
 
         if self.graph_path.exists():
             try:

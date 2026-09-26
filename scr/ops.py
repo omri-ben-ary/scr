@@ -11,13 +11,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .events import EventLog, now_iso
 from .gitops import Git, GitError, NOISE, gh_available, pr_create, pr_merge, pr_url_for
-from .journal import _Lock as _JournalLock, journal
+from .journal import LOCK_STALE_S, SCR_DIR, _Lock as _JournalLock, journal
 from .review import acceptance_problem
 from .store import RepoError, Store, Task
 
@@ -476,10 +477,25 @@ def _record_merged(root: Path, store: Store, tid: str, note: str, report: str = 
     return [f"  unblocked {d} -> ready" for d in lifecycle.cascade(store, log, tid, "merged", actor=f"steward:{tid}")]
 
 
-def _run_tests(wl: Workload, cwd: Path, timeout: int = 1800) -> tuple[int, str]:
+LAND_TEST_TIMEOUT_KEY = "land_test_timeout_seconds"   # config/limits.yaml (T-0186)
+LAND_TEST_TIMEOUT_S = 3600      # its default: T-0170's landing hit the old hardcoded 1800 s on 2026-09-24
+
+
+def land_test_timeout(store: Store) -> int:
+    """The landing test timeout in seconds: limits.yaml land_test_timeout_seconds, LAND_TEST_TIMEOUT_S when
+    the key is absent or not a positive number."""
+    try:
+        v = int(store.config("limits").get(LAND_TEST_TIMEOUT_KEY) or 0)
+    except (TypeError, ValueError, AttributeError):
+        v = 0
+    return v if v > 0 else LAND_TEST_TIMEOUT_S
+
+
+def _run_tests(wl: Workload, cwd: Path, timeout: int = LAND_TEST_TIMEOUT_S) -> tuple[int, str]:
     """Run the workload's `tests:` command IN `cwd` (a worktree). Same resolution as scr.hotfix.run_tests,
     which is bound to the checkout: a relative interpreter path is taken relative to cwd (a spawned
-    scriptorium worktree links `.venv` to the checkout's), a missing python.exe falls back to this one."""
+    scriptorium worktree links `.venv` to the checkout's), a missing python.exe falls back to this one.
+    land_scriptorium passes `timeout` from limits.yaml land_test_timeout_seconds (land_test_timeout)."""
     cmd = wl.cfg.get("tests")
     if not cmd:
         cmd = ".venv/Scripts/python.exe -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q"
@@ -497,9 +513,93 @@ def _run_tests(wl: Workload, cwd: Path, timeout: int = 1800) -> tuple[int, str]:
         r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, encoding="utf-8", errors="replace")
         return r.returncode, (r.stdout + r.stderr)[-6000:]
     except subprocess.TimeoutExpired:
-        return 124, f"tests timed out after {timeout}s"
+        return 124, f"tests timed out after {timeout}s (raise {LAND_TEST_TIMEOUT_KEY} in config/limits.yaml)"
     except FileNotFoundError as e:
         return 127, f"test command not found: {e}"
+
+
+# The scriptorium's record paths (T-0120): on a task branch they are never authoritative — they exist there
+# only because a scriber ran `scr` with the worktree as root (T-0059's phantom [omri] journal commit and
+# hotfix T-0108), so land_scriptorium makes them follow the trunk. `.scr/` is not one: it is gitignored and
+# never tracked (`git ls-files .scr` is empty on main), so no branch can carry it.
+RECORD_ROOTS = ("tasks/", "events/", "state/", "queues/", "graph/")
+
+
+def is_record_path(path: str) -> bool:
+    return str(path).replace("\\", "/").startswith(RECORD_ROOTS)
+
+
+def _take_trunk(g: Git, ref: str, paths: list[str]) -> None:
+    """Make `paths` in the worktree (and its index) what `ref` has: checked out from `ref` where it has
+    them, removed where only the branch does. Works inside an unfinished merge and outside one."""
+    have = set(l.replace("\\", "/") for l in g.run("ls-tree", "-r", "--name-only", "-z", ref, "--", *paths).out.split("\0") if l.strip())
+    if [p for p in paths if p in have]:
+        g.run("checkout", ref, "--", *[p for p in paths if p in have])
+    if [p for p in paths if p not in have]:
+        g.run("rm", "-q", "-f", "--ignore-unmatch", "--", *[p for p in paths if p not in have])
+
+
+class _LandLock:
+    """One landing per task at a time (T-0120, from T-0119's review): `scr land <id>` and the watcher tick
+    both call land_scriptorium, and only step 5 holds the journal lock, so steps 1-4 could race in one
+    worktree. `.scr/land-<id>.lock` holds "<pid> <time>"; it is never waited on — a second caller gets
+    `busy`. A lock whose holder is dead, or older than the journal lock's LOCK_STALE_S, is taken over; the
+    holder touches it every LOCK_STALE_S / 3 s, since the tests of step 4 can run far longer than that."""
+
+    def __init__(self, root: Path, tid: str):
+        self.path = root / SCR_DIR / f"land-{tid}.lock"
+        self.fd: int | None = None
+        self._stop: threading.Event | None = None
+
+    def stale(self) -> bool:
+        try:
+            age = time.time() - self.path.stat().st_mtime
+            words = self.path.read_text(encoding="utf-8").split()
+        except OSError:
+            return True
+        if not words or not words[0].isdigit():
+            return age > 5                      # a holder between its create and its write, or garbage
+        pid = int(words[0])
+        from .run import pid_alive
+        return age > LOCK_STALE_S or not pid_alive(pid)
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, f"{os.getpid()} {time.time():.0f}\n".encode())
+                break
+            except FileExistsError:
+                if not self.stale():
+                    return False
+                try:
+                    self.path.unlink()          # stale: a crashed or dead holder
+                except OSError:
+                    return False
+        else:
+            return False
+        self._stop = threading.Event()
+        threading.Thread(target=self._beat, args=(self._stop,), daemon=True).start()
+        return True
+
+    def _beat(self, stop: threading.Event) -> None:
+        while not stop.wait(LOCK_STALE_S / 3):
+            try:
+                os.utime(self.path)
+            except OSError:
+                pass
+
+    def release(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
 
 
 def land_scriptorium(root: Path, tid: str) -> dict:
@@ -515,17 +615,42 @@ def land_scriptorium(root: Path, tid: str) -> dict:
       1. commit whatever the worktree still holds on task/<id> (a checkpoint the tooling path skipped);
       2. nothing to do if task/<id> is already contained in the trunk (landed by hand);
       3. merge the TRUNK INTO task/<id>, in the worktree: a conflict surfaces there and is aborted there,
-         the checkout never sees it;
-      4. run the workload's `tests:` command in the worktree — on exactly the tree the trunk will get;
+         the checkout never sees it — unless every conflicted path is under RECORD_ROOTS: those take the
+         trunk's version, path by path, and the merge is committed (`records follow the trunk: ...`);
+      3b. whatever still differs from the trunk under RECORD_ROOTS (added, modified, deleted) is reverted to
+         the trunk's side in one commit and listed — except the task's own report.md / log.md, which fail
+         the landing (`records`) by name: a scriber's words are moved to the live root, never dropped;
+      4. run the workload's `tests:` command in the worktree — on exactly the tree the trunk will get —
+         within limits.yaml land_test_timeout_seconds (default 3600; a timeout fails the landing: `tests`);
       5. journal the checkout, then under the journal lock merge task/<id> into the trunk: a fast-forward
          after step 3 unless the trunk moved meanwhile (journal commits: records, never the tooling under
          test), a merge commit then; a failure here is aborted and reported like the others;
       6. status merged, the state event and the task's log.md name the trunk commit.
     Testing on the task branch rather than on the trunk means a failing test never leaves the checkout —
     the tree every scr and the watcher itself run from — on a broken commit. Nothing is ever reset or
-    deleted; the trunk moves forward or not at all.
-    Returns {"ok", "reason" (conflict | tests | trunk | ...), "out" (lines), "sha" (trunk head on success),
-    "tip" (the task branch head after the attempt; the watcher keys its retry on it)}."""
+    deleted; the trunk moves forward or not at all. Record paths on task/<id> are resolved on task/<id>,
+    before the tests, so the tests still run on exactly the tree the trunk gets.
+    The whole landing holds `.scr/land-<id>.lock` (_LandLock); a second landing of the same task meanwhile
+    returns `busy` without touching the worktree.
+    Returns {"ok", "reason" (busy | scope | trunk | conflict | records | tests | ...), "out" (lines), "sha"
+    (trunk head on success), "tip" (the task branch head after the attempt; the watcher keys its retry on it)}."""
+    lock = _LandLock(root, tid)
+    if not lock.acquire():
+        store = Store(root)
+        t = store.get(tid)
+        wt = task_worktree(workload_for(root, store, t), t)
+        tip = Git(wt).head() if wt.exists() else None
+        return {"ok": False, "reason": "busy", "sha": None, "tip": tip,
+                "out": [f"=== {tid} [{t.status}] task/{tid} (scriptorium)",
+                        f"  FAILED (busy): another landing of {tid} holds {lock.path} — nothing touched"]}
+    try:
+        return _land_scriptorium(root, tid)
+    finally:
+        lock.release()
+
+
+def _land_scriptorium(root: Path, tid: str) -> dict:
+    """land_scriptorium's steps, under its lock."""
     store = Store(root)
     t = store.get(tid)
     wl = workload_for(root, store, t)
@@ -558,7 +683,8 @@ def land_scriptorium(root: Path, tid: str) -> dict:
     # 1b. T-0079: the branch must not carry paths outside the task's scope (a [checkpoint-drift] commit, or
     # anything else): the trunk never gets them. The Steward widens scope.files / scope.mission in the record
     # when the task may own them (the watcher retries on that), or reverts the commit (a new tip retries).
-    drift = branch_drift(root, wl, g, t)
+    # Record paths are not drift here: step 3b reverts them to the trunk's, so they never reach it either.
+    drift = [p for p in branch_drift(root, wl, g, t) if not is_record_path(p)]
     if drift:
         return fail("scope", f"{br} carries {len(drift)} path(s) outside {tid}'s scope: " + ", ".join(drift[:12])
                     + (f" (+{len(drift) - 12} more)" if len(drift) > 12 else "") + " — widen the record's scope or revert the [checkpoint-drift] commit")
@@ -571,16 +697,46 @@ def land_scriptorium(root: Path, tid: str) -> dict:
         out += _record_merged(root, store, tid, f"landed: {br} already contained in {trunk} @ {mg.head(short=True)}", report)
         _log_md(t, f"landed: {br} was already contained in {trunk} @ {mg.head(short=True)}")
         return {"ok": True, "reason": None, "out": out, "sha": mg.head(short=True), "tip": g.head()}
-    # 3. trunk -> branch, in the worktree (a conflict is aborted there and never reaches the checkout)
-    if not g.is_ancestor(trunk, br):
-        m = g.run("merge", "--no-edit", "-m", f"[land] {tid}: merge {trunk} into {br} before landing", trunk)
+    # 3. trunk -> branch, in the worktree (a conflict is aborted there and never reaches the checkout). One
+    # trunk commit for steps 3 and 3b: the checkout journals meanwhile, and 3b must not mistake that for the branch's.
+    tsha = g.run("rev-parse", trunk).out
+    own = {f"tasks/{t.dir.name}/report.md", f"tasks/{t.dir.name}/log.md"}
+    followed: list[str] = []
+    if not g.is_ancestor(tsha, br):
+        msg = f"[land] {tid}: merge {trunk} into {br} before landing"
+        m = g.run("merge", "--no-edit", "-m", msg, tsha)
         if not m.ok:
             conflicts = [l.strip() for l in g.run("diff", "--name-only", "--diff-filter=U").out.splitlines() if l.strip()]
-            g.run("merge", "--abort")
-            return fail("conflict", f"{trunk} does not merge into {br}: " + (", ".join(conflicts[:12]) if conflicts else m.out[-300:]))
-        out.append(f"  merged {trunk} into {br}: {g.head(short=True)}")
+            if not conflicts or not all(is_record_path(p) for p in conflicts):
+                g.run("merge", "--abort")
+                return fail("conflict", f"{trunk} does not merge into {br}: " + (", ".join(conflicts[:12]) if conflicts else m.out[-300:]))
+            mine = sorted(own & set(conflicts))
+            if mine:
+                g.run("merge", "--abort")
+                return fail("records", f"{mine[0]} was written in the worktree; move it to the live root (tasks/{t.dir.name}/) and retry")
+            _take_trunk(g, tsha, conflicts)
+            c = g.run("commit", "--no-edit", "-m", f"{msg}\n\nrecords follow the trunk: " + ", ".join(conflicts))
+            if not c.ok:
+                g.run("merge", "--abort")
+                return fail("conflict", f"{trunk} does not merge into {br}: taking the trunk's records failed: {c.out[-300:]}")
+            followed += conflicts
+            out.append(f"  merged {trunk} into {br}: {g.head(short=True)}; records follow the trunk: " + ", ".join(conflicts))
+        else:
+            out.append(f"  merged {trunk} into {br}: {g.head(short=True)}")
+    # 3b. record paths follow the trunk — also when step 3 had nothing to merge
+    rec = [l.replace("\\", "/") for l in g.run("diff", "--name-only", "-z", tsha, "HEAD", "--", *[r.rstrip("/") for r in RECORD_ROOTS]).out.split("\0") if l.strip()]
+    mine = sorted(own & set(rec))
+    if mine:
+        return fail("records", f"{mine[0]} was written in the worktree; move it to the live root (tasks/{t.dir.name}/) and retry")
+    if rec:
+        _take_trunk(g, tsha, rec)
+        c = g.run("commit", "-q", "-m", f"[land] {tid}: record paths follow the trunk ({len(rec)} file(s))\n\n" + "\n".join(rec))
+        if not c.ok or g.run("diff", "--name-only", tsha, "HEAD", "--", *[r.rstrip("/") for r in RECORD_ROOTS]).out:
+            return fail("records", f"reverting {len(rec)} record path(s) on {br} to {trunk}'s failed: {c.out[-300:]}")
+        followed += [p for p in rec if p not in followed]
+        out.append(f"  records follow the trunk: {len(rec)} path(s) reverted on {br}: " + ", ".join(rec))
     # 4. the tests, on the tree the trunk will get
-    rc, txt = _run_tests(wl, wt)
+    rc, txt = _run_tests(wl, wt, land_test_timeout(store))
     if rc != 0:
         tail = " | ".join(l.strip() for l in txt.splitlines() if l.strip())[-400:]
         return fail("tests", f"`{wl.cfg.get('tests') or 'pytest tests -q'}` exited {rc} in {wt}: {tail}")
@@ -601,7 +757,8 @@ def land_scriptorium(root: Path, tid: str) -> dict:
     # 6. the record
     _log(root).append("system", name="landed", task=tid, actor=f"steward:{tid}", note=f"{br} -> {trunk} @ {head} ({how}); tests pass")
     out += _record_merged(root, store, tid, f"landed: {br} -> {trunk} @ {head} ({how}); tests pass", report)
-    _log_md(t, f"landed: {br} -> {trunk} @ {head} ({how}); tests pass")
+    _log_md(t, f"landed: {br} -> {trunk} @ {head} ({how}); tests pass"
+            + (f"; records follow the trunk: {', '.join(followed)}" if followed else ""))
     out.append(f"  {tid} marked merged")
     return {"ok": True, "reason": None, "out": out, "sha": head, "tip": g.head()}
 
@@ -614,48 +771,282 @@ def _log_md(t: Task, line: str) -> None:
         pass
 
 
-# ---- sweep -------------------------------------------------------------------------------
-def sweep(root: Path, merge: bool = False, dry_run: bool = False, wl_name: str | None = None) -> list[dict]:
-    """Every non-task worktree (missions like qi-mission-24) with uncommitted work: commit on its
-    branch, push, and with merge=True PR + merge into <main>. Returns one row per worktree."""
-    wl = workload(root, None, wl_name)
-    rows: list[dict] = []
-    if not wl.wt_root.exists():
-        return rows
-    for d in sorted(p for p in wl.wt_root.iterdir() if p.is_dir() and not re.match(r"^T-\d+$", p.name)):
-        g = Git(d)
-        if not g.is_repo():
-            continue
+def is_scriptorium_task(root: Path, store: Store | None, t: Task) -> bool:
+    """True when the task's workload IS this checkout (`repo: .`): the repo identity, the same test
+    land_scriptorium makes — not the task id or the `workload:` string. A record naming an unregistered
+    workload resolves as workload_for does (the first entry)."""
+    return workload_for(root, store, t).repo == root.resolve()
+
+
+# What the operator does after a hand-path landing failure, per land_scriptorium reason (the watcher's
+# land_failed note names the same reasons).
+_LAND_NEXT = {
+    "conflict": "merge {trunk} into {br} in {wt}, resolve, commit, then `scr land {tid}` again",
+    "tests": "fix {br} in {wt} (committed or not), then `scr land {tid}` again",
+    "trunk": "`scr ensure-main` in the checkout, then `scr land {tid}` again",
+    "scope": "widen the record's scope or revert the [checkpoint-drift] commit on {br}, then `scr land {tid}` again",
+    "records": "move the named file's text from {wt} into the live root, `git checkout {trunk} -- <file>` in {wt}, then `scr land {tid}` again",
+    "busy": "another landing of {tid} is running; wait for it, then `scr land {tid}` again",
+    "lost_worktree": "recreate the worktree (git worktree add {wt} {br}) or merge {br} into {trunk} by hand, then `scr land {tid}` again",
+}
+
+# The merged note of a checkout hotfix (an accepted scriptorium task with no worktree): the journal already
+# put its commits on the trunk. Written only by land_no_worktree, for `scr land` and the watcher alike (T-0158).
+HOTFIX_MERGED_NOTE = "tooling task: change already on main (journal)"
+
+
+def land_no_worktree(root: Path, store: Store, t: Task, wl: Workload, dry_run: bool = False) -> dict:
+    """The one landing of an accepted scriptorium task with no worktree (T-0154, T-0158), for land_any and
+    Watcher.land_scriptorium_task. A checkout hotfix — no task/<id> branch, or one already contained in the
+    trunk — is recorded merged with HOTFIX_MERGED_NOTE and nothing else: no merge, no landed event. A task/<id>
+    that carries commits NOT on the trunk is a spawned task whose worktree was lost (removed by hand, a failed
+    retire): recording it merged would drop its work, so it is refused with reason `lost_worktree`, tip = the
+    branch tip, and the task stays accepted."""
+    tid = t.id
+    wt, br, trunk = task_worktree(wl, t), f"task/{tid}", wl.main
+    mg = Git(root)
+    head = f"=== {tid} [{t.status}] no worktree ({wt}) -> {trunk} (scriptorium"
+    if mg.branch_exists(br) and not mg.is_ancestor(br, trunk):
+        tip = mg.run("rev-parse", br).out.strip() or None
+        why = f"FAILED (lost_worktree): worktree missing, branch {br} not on {trunk}: {br} carries commits that are not on {trunk}"
+        return {"ok": False, "reason": "lost_worktree", "sha": None, "tip": tip, "url": None,
+                "out": [head + (", dry run: nothing changed)" if dry_run else ")"), ("  would refuse — " if dry_run else "  ") + why]}
+    if dry_run:
+        return {"ok": True, "reason": None, "sha": None, "tip": None, "url": None,
+                "out": [head + ", dry run: nothing changed)", f"  no worktree: record merged only (change already on {trunk} via the journal)"]}
+    out = [head + ")"] + _record_merged(root, store, tid, HOTFIX_MERGED_NOTE) + [f"  {tid} marked merged ({HOTFIX_MERGED_NOTE})"]
+    return {"ok": True, "reason": None, "out": out, "sha": None, "tip": None, "url": None}
+
+
+def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False) -> dict:
+    """The one place that decides which landing a task gets (T-0119): a scriptorium task (is_scriptorium_task)
+    goes through land_scriptorium — commit, trunk merged in, tests, merge into the trunk, merged — exactly the
+    watcher's land step; every other workload goes through the quantum-insertion land() with the QI flags.
+    The QI flags do not apply to the scriptorium path; dry_run there reports the plan and changes nothing.
+    land_scriptorium is the post-acceptance step, so a scriptorium task must be `accepted` (land() accepts a
+    reviewed `submitted` task because the PR merge implies the review; here the Decision comes first).
+    An accepted scriptorium task with no worktree goes through land_no_worktree (T-0158): merged with
+    HOTFIX_MERGED_NOTE when it is a checkout hotfix, refused (lost_worktree) when task/<id> is not on the trunk.
+    A failure returns ok False with one closing line naming the reason and what to do next."""
+    store = Store(root)
+    t = store.get(tid)
+    if not is_scriptorium_task(root, store, t):
+        return land(root, tid, no_pr=no_pr, draft=draft, dry_run=dry_run, merge=merge)
+    if t.status == "submitted":
+        raise RepoError(f"{tid} is submitted, not accepted — write the Decision first (T-0081)")
+    if t.status != "accepted":
+        raise RepoError(f"{tid} is {t.status}, not accepted — only an accepted scriptorium task lands")
+    wl = workload_for(root, store, t)
+    wt, br, trunk = task_worktree(wl, t), f"task/{tid}", wl.main
+    if not wt.exists():
+        r = land_no_worktree(root, store, t, wl, dry_run=dry_run)
+        if not r["ok"]:
+            r["out"].append(f"{tid}: NOT landed ({r['reason']}) — next: " + _LAND_NEXT[r["reason"]].format(trunk=trunk, br=br, wt=wt, tid=tid))
+        return r
+    if dry_run:
+        g, mg = Git(wt), Git(root)
         dirty = g.dirty()
-        if not dirty:
+        out = [f"=== {tid} [{t.status}] {br} -> {trunk} (scriptorium, dry run: nothing changed)",
+               f"  worktree {wt} on '{g.branch()}'; {len(dirty)} uncommitted file(s) to commit on {br}",
+               f"  checkout on '{mg.branch()}'" + ("" if mg.branch() == trunk else f" — not {trunk}: `scr ensure-main` first"),
+               f"  {br} already contained in {trunk}: record merged only" if not dirty and mg.is_ancestor(br, trunk)
+               else f"  would merge {trunk} into {br}, run `{wl.cfg.get('tests') or 'pytest tests -q'}` in the worktree, merge {br} into {trunk}"]
+        return {"ok": True, "reason": None, "out": out, "sha": None, "tip": g.head(), "url": None}
+    r = land_scriptorium(root, tid)
+    if not r["ok"]:
+        nxt = _LAND_NEXT.get(r["reason"], "see the FAILED line above, then `scr land {tid}` again").format(trunk=trunk, br=br, wt=wt, tid=tid)
+        r["out"].append(f"{tid}: NOT landed ({r['reason']}) — next: {nxt}")
+    else:
+        r["out"].append(f"  next: `scr retire {tid} --execute` quarantines the worktree (the watcher does this itself)")
+    return {**r, "url": None}
+
+
+# ---- sweep: the hygiene audit pass (docs/hygiene-protocols.md §3, §10, §11 F1) ------------------
+HYGIENE_KINDS = ("dirty-mission", "finished", "phantom", "orphan", "locked", "live")
+FINISHED_STATUSES = {"merged", "closed", "rejected"}
+TASK_DIR = re.compile(r"^T-\d+$")
+
+
+def _norm(p: str | Path) -> str:
+    return os.path.normcase(str(Path(p).resolve()))
+
+
+def registered_worktrees(repo: Path) -> list[dict]:
+    """`git worktree list --porcelain` of a repo minus its main checkout: [{path, branch, locked, reason}]."""
+    r = Git(repo).run("worktree", "list", "--porcelain")
+    if not r.ok:
+        return []
+    out: list[dict] = []
+    for block in r.out.replace("\r\n", "\n").split("\n\n"):
+        cur: dict = {}
+        for line in block.splitlines():
+            key, _, val = line.partition(" ")
+            if key == "worktree":
+                cur = {"path": val, "branch": None, "locked": False, "reason": ""}
+            elif key == "branch" and cur:
+                cur["branch"] = val.removeprefix("refs/heads/")
+            elif key == "detached" and cur:
+                cur["branch"] = "HEAD"
+            elif key == "locked" and cur:
+                cur["locked"], cur["reason"] = True, val
+        if cur:
+            out.append(cur)
+    return out[1:]                      # the first entry is the repo's own checkout
+
+
+def audit_workload(root: Path, wl: Workload, store: Store | None = None, fetch: bool = False) -> list[dict]:
+    """Protocol A's detector for one workload: one typed row per worktree the repo registers or the
+    worktree root holds, kind in HYGIENE_KINDS. Read-only apart from `fetch` (the daily pass fetches
+    origin first; `--dry-run` never does, so it leaves the repo's refs as they were). Classification only:
+    the repairs (retire, prune, quarantine, leftover commits) are F2."""
+    store = store or Store(root)
+    if not Git(wl.repo).is_repo():
+        return []
+    mg = Git(wl.repo)
+    if fetch and wl.repo != root.resolve():
+        mg.fetch()
+    base = branch_base(root, wl, mg)
+    records = store.load_all()
+    reg = {_norm(w["path"]): w for w in registered_worktrees(wl.repo)}
+    rows: list[dict] = []
+
+    def row(name: str, path: Path | str, kind: str, branch: str | None = None, **kw) -> dict:
+        r = {"workload": wl.name, "worktree": name, "path": str(path), "branch": branch, "kind": kind,
+             "files": 0, "sample": [], "sha": None, "url": None, "ok": True, "note": ""}
+        r.update(kw)
+        rows.append(r)
+        return r
+
+    for key, w in sorted(reg.items()):
+        if not Path(w["path"]).exists():                                    # A2 phantom
+            row(Path(w["path"]).name, w["path"], "phantom", w["branch"], note="registered, directory gone")
+    dirs = sorted(p for p in wl.wt_root.iterdir() if p.is_dir()) if wl.wt_root.is_dir() else []
+    for d in dirs:
+        w = reg.get(_norm(d))
+        if w is None:                                                       # A3 orphan: not a worktree of wl.repo
+            row(d.name, d, "orphan", note="not registered in git worktree list")
             continue
-        br = g.branch()
-        row = {"worktree": d.name, "branch": br, "files": len(dirty), "sample": dirty[:25], "sha": None, "url": None, "ok": True, "note": ""}
-        rows.append(row)
-        if dry_run:
+        g = Git(d)
+        br = w["branch"] or (g.run("rev-parse", "--abbrev-ref", "HEAD").out or None)
+        is_task = bool(TASK_DIR.match(d.name))
+        dirty = [] if is_task else g.dirty()
+        if dirty:                                                           # D3: what `scr sweep` commits
+            row(d.name, d, "dirty-mission", br, files=len(dirty), sample=dirty[:25])
             continue
-        try:
-            row["sha"] = g.commit_all(f"[sweep] uncommitted work found in .worktrees/{d.name} on {br} ({now_iso()})\n\nSwept by `scr sweep` so it exists in git history; content unreviewed.")
-        except GitError as e:
-            row["ok"] = False; row["note"] = str(e)[-300:]; continue
-        r = g.push(br)
-        if not r.ok:
-            row["ok"] = False; row["note"] = "push failed: " + r.out[-300:]; continue
-        if merge:
-            if not gh_available():
-                row["note"] = f"gh missing; PR by hand: {br} -> {wl.main}"; continue
-            url = pr_url_for(br, d)
-            if not url:
-                bf = root / ".scr" / f"sweep-{d.name}.md"; bf.parent.mkdir(exist_ok=True)
-                bf.write_text(f"Swept by `scr sweep`; see the commit message. Merging keeps the agents' {wl.main} a complete record.\n", encoding="utf-8")
-                url = pr_create(wl.main, br, f"[sweep] {d.name}: land uncommitted mission work", bf, d)
-            row["url"] = url
-            if url:
-                m = pr_merge(url, d)
-                if not m.ok:
-                    row["ok"] = False; row["note"] = "merge failed: " + m.out[-300:]
-        _log(root).append("system", name="sweep", actor="steward-watch", note=f"{d.name} ({br}): {len(dirty)} file(s) -> {row['sha']}" + (f" PR {row['url']}" if row["url"] else ""))
+        if w["locked"]:                                                     # A4: a deliberate human act
+            row(d.name, d, "locked", br, note=w["reason"] or "locked")
+            continue
+        status = records[d.name].status if is_task and d.name in records else None
+        sha = g.head()
+        clean = not g.run("status", "--porcelain", "--untracked-files=no").out.strip()
+        merged = bool(sha) and mg.is_ancestor(sha, base)
+        if is_task:
+            done = status in FINISHED_STATUSES
+        else:
+            done = bool(br) and (mg.remote_contains(f"origin/{br}", sha or br) or mg.remote_contains(f"origin/{wl.main}", sha or br))
+        extra = {"status": status} if is_task else {}
+        if merged and clean and done:                                       # A1 finished
+            row(d.name, d, "finished", br, note=f"ancestor of {base}", **extra)
+        else:
+            why = [] if clean else ["uncommitted tracked changes"]
+            if not merged:
+                why.append(f"not in {base}")
+            if is_task and not done:
+                why.append(f"record {status or 'missing'}")
+            row(d.name, d, "live", br, note="; ".join(why), **extra)
     return rows
+
+
+def _sweep_commit(root: Path, wl: Workload, row: dict, merge: bool) -> None:
+    """Commit + push one dirty mission worktree (and with merge=True, PR + merge into <main>)."""
+    d, br = Path(row["path"]), row["branch"]
+    g = Git(d)
+    try:
+        row["sha"] = g.commit_all(f"[sweep] uncommitted work found in .worktrees/{d.name} on {br} ({now_iso()})\n\nSwept by `scr sweep` so it exists in git history; content unreviewed.")
+    except GitError as e:
+        row["ok"] = False; row["note"] = str(e)[-300:]; return
+    r = g.push(br)
+    if not r.ok:
+        row["ok"] = False; row["note"] = "push failed: " + r.out[-300:]; return
+    if merge:
+        if not gh_available():
+            row["note"] = f"gh missing; PR by hand: {br} -> {wl.main}"; return
+        url = pr_url_for(br, d)
+        if not url:
+            bf = root / ".scr" / f"sweep-{d.name}.md"; bf.parent.mkdir(exist_ok=True)
+            bf.write_text(f"Swept by `scr sweep`; see the commit message. Merging keeps the agents' {wl.main} a complete record.\n", encoding="utf-8")
+            url = pr_create(wl.main, br, f"[sweep] {d.name}: land uncommitted mission work", bf, d)
+        row["url"] = url
+        if url:
+            m = pr_merge(url, d)
+            if not m.ok:
+                row["ok"] = False; row["note"] = "merge failed: " + m.out[-300:]
+    _log(root).append("system", name="sweep", actor="steward-watch", note=f"{d.name} ({br}): {row['files']} file(s) -> {row['sha']}" + (f" PR {row['url']}" if row["url"] else ""))
+
+
+def sweep(root: Path, merge: bool = False, dry_run: bool = False, wl_name: str | None = None,
+          all_workloads: bool = False, fetch: bool = False) -> list[dict]:
+    """Every non-task worktree (missions like qi-mission-24) with uncommitted work: commit on its
+    branch, push, and with merge=True PR + merge into <main>. Returns one row per such worktree
+    (kind `dirty-mission`) of one workload — `scr/chores.py` `no_dirty_worktrees` reads exactly that.
+
+    all_workloads=True (`scr sweep --all`, T-0202) is the hygiene audit: every workload in
+    config/workloads.yaml, one typed row per worktree (HYGIENE_KINDS); only `dirty-mission` rows are
+    ever committed, so a `T-*` worktree is listed but never swept. dry_run never commits or pushes."""
+    store = Store(root)
+    names = list(store.config("workloads") or {}) if all_workloads else [wl_name]
+    rows: list[dict] = []
+    for name in names:
+        wl = workload(root, store, name)
+        for r in audit_workload(root, wl, store, fetch=fetch):
+            if not all_workloads and r["kind"] != "dirty-mission":
+                continue
+            rows.append(r)
+            if r["kind"] == "dirty-mission" and not dry_run:
+                _sweep_commit(root, wl, r, merge)
+    return rows
+
+
+def repo_position(wl: Workload) -> dict:
+    """The checkout's branch and <main> vs origin/<main> as (ahead, behind), for the digest; no fetch."""
+    g = Git(wl.repo)
+    br = g.run("rev-parse", "--abbrev-ref", "HEAD")
+    lr = g.run("rev-list", "--left-right", "--count", f"{wl.main}...origin/{wl.main}")
+    ahead, behind = (lr.out.split() + ["?", "?"])[:2] if lr.ok else ("?", "?")
+    return {"branch": br.out if br.ok else "?", "ahead": ahead, "behind": behind}
+
+
+def hygiene_digest(root: Path, rows: list[dict], day: str) -> Path:
+    """Write reports/hygiene/<day>.md from the audit rows (§10). Informational: nothing in it is a task,
+    a chore or a card."""
+    store = Store(root)
+    lines = [f"# Hygiene digest {day}", "",
+             "Written by the watcher's daily pass (`scr sweep --all`, classification only). Nothing here is an "
+             "Omri-queue item (docs/hygiene-protocols.md §9).", ""]
+    for name in (store.config("workloads") or {}):
+        wl = workload(root, store, name)
+        mine = [r for r in rows if r["workload"] == name]
+        pos = repo_position(wl) if Git(wl.repo).is_repo() else None
+        lines.append(f"## {name}")
+        lines.append("")
+        lines.append(f"- repo `{wl.repo}`: " + (f"checkout on `{pos['branch']}`, `{wl.main}` {pos['ahead']} ahead / {pos['behind']} behind `origin/{wl.main}`" if pos else "not a git repo"))
+        lines.append("- worktrees: " + ", ".join(f"{k} {sum(1 for r in mine if r['kind'] == k)}" for k in HYGIENE_KINDS))
+        shown = [r for r in mine if r["kind"] != "live"]
+        if shown:
+            lines += ["", "| worktree | branch | kind | detail |", "|---|---|---|---|"]
+            for r in shown:
+                detail = f"{r['files']} file(s)" if r["kind"] == "dirty-mission" else r.get("note", "")
+                lines.append(f"| {r['worktree']} | {r['branch'] or ''} | {r['kind']} | {detail} |")
+        lines.append("")
+    counts = {n: 0 for n in ("journal_failed", "push_failed", "fetch_failed")}
+    for e in _log(root).read():
+        if e.get("kind") == "system" and e.get("name") in counts and str(e.get("ts", "")).startswith(day):
+            counts[e["name"]] += 1
+    lines += ["## Failures today", "", ", ".join(f"{k} {v}" for k, v in counts.items()), ""]
+    p = root / "reports" / "hygiene" / f"{day}.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
 
 
 # ---- retire (quarantine, never delete) ---------------------------------------------------
@@ -674,10 +1065,17 @@ def retire(root: Path, name: str, execute: bool = False, wl_name: str | None = N
         raise RepoError(f"refusing: {name} resolves outside {wl.wt_root}")
     g, mg = Git(wt), Git(wl.repo)
     br = g.branch()
-    out = [f"=== retire {name} (branch {br}, main {wl.main}) [{'execute' if execute else 'dry-run'}]"]
-    if not mg.is_ancestor(br, wl.main):
-        ahead = mg.run("rev-list", "--count", f"{wl.main}..{br}").out
-        return {"ok": False, "code": 2, "out": out + [f"REFUSING: {br} is {ahead} commit(s) ahead of {wl.main} — land it first"]}
+    # T-0188: merged means merged into origin/<main> (fetched first) for a workload with its own checkout — its
+    # local main can sit far behind (quantum-insertion's master, 53 commits on 2026-09-24, refused merged T-0115
+    # as 52 ahead); the scriptorium's own workload keeps its checkout trunk (branch_base). A failed fetch
+    # (offline) measures against the last fetched origin ref.
+    if wl.repo != root.resolve():
+        mg.fetch()
+    base = branch_base(root, wl, mg)
+    out = [f"=== retire {name} (branch {br}, main {base}) [{'execute' if execute else 'dry-run'}]"]
+    if not mg.is_ancestor(br, base):
+        ahead = mg.run("rev-list", "--count", f"{base}..{br}").out
+        return {"ok": False, "code": 2, "out": out + [f"REFUSING: {br} is {ahead} commit(s) ahead of {base} — land it first"]}
     if g.run("diff", "--stat", "HEAD").out.strip():
         return {"ok": False, "code": 3, "out": out + ["REFUSING: uncommitted changes to tracked files (checkpoint commit first)"]}
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -725,7 +1123,8 @@ def park(root: Path, tid: str, note: str, actor: str | None = None) -> list[str]
 # ---- chore helpers -------------------------------------------------------------------------
 def land_all_submitted(root: Path) -> list[str]:
     """Land + merge every submitted/accepted task, one after the other; failures are reported, not fatal.
-    A submitted task whose review.md does not support `accepted` (T-0081) is skipped with the reason."""
+    A submitted task whose review.md does not support `accepted` (T-0081) is skipped with the reason.
+    Each task is routed by land_any: a scriptorium task lands through land_scriptorium (T-0119)."""
     out: list[str] = []
     for t in sorted(Store(root).load_all().values(), key=lambda t: t.id):
         if t.status not in {"submitted", "accepted"}:
@@ -736,7 +1135,7 @@ def land_all_submitted(root: Path) -> list[str]:
                 out.append(f"{t.id}: skipped, not landed — {problem}")
                 continue
         try:
-            r = land(root, t.id, merge=True)
+            r = land_any(root, t.id, merge=True)
             out += r["out"]
             if not r["ok"]:
                 out.append(f"{t.id}: NOT landed")

@@ -9,9 +9,14 @@ Per tick:
     scope drift  -> scope_drift events (once per file)
     HELP: lines  -> help events (once per line)
     wall budget  -> budget_wall (once)
-    submission   report.md != template -> submitted
+    submission   report.md != template -> submitted, unless report_unfinished (a *_PLACEHOLDER token, an empty
+                    or template-prompt `## Result`; T-0180): then one needs line, and the status stays
     dead session -> the launched pid is gone or the transcript .err says claude terminated it: returned
-                    + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15)
+                    + session_dead (once; T-0015 heartbeated 5 h on a session killed at 20:15); a session that did
+                    no work (no checkpoint since its launch, no [scriber] line) is then set ready, once per episode;
+                    one whose transcript ends in the credit-exhaustion line is no death at all (T-0187): ready with
+                    its attempt refunded, and ONE credits_exhausted event pauses auto-dispatch and reviews (one
+                    `credits` needs line) for credits_pause_minutes or until a credits_resumed / watcher_resumed event
     heartbeat    checkpoint -> in_progress
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
@@ -25,7 +30,8 @@ Per tick:
                    escalated, never held — submitted > review_stale_hours with no Decision written, or
                    in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours; the
                    escalated task no longer counts against the cap, so auto-dispatch below fills the slot
-                   on the same tick
+                   on the same tick. A running task's launched session is checkpointed, then stopped
+                   (T-0124), so the refill never makes cap + 1 sessions
   dispatched    -> ready after dispatch_timeout_minutes with no `launch` event (auto-decide; T-0122): a launch
                    that failed after `scr dispatch` never holds a slot; one dispatch_timeout event, and the slot
                    goes to the next ready task on the same tick (a dispatched task WITH a launch event is the
@@ -33,6 +39,12 @@ Per tick:
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
+  needs list    -> written to .scr/watch.needs.json at the end of every tick, empty or not, paused or not (T-0173):
+                   one entry per NEEDS-YOU line with a stable key (`<kind>:<task>`, the flags' scheme), the task, the
+                   text and the tick it was first raised; scr/ui.py needs_cards shows each as a card while it stands
+  needs-you     -> every card the page shows (scr/ui.py needs_cards) that no earlier tick pushed goes out on
+                   the channels of config/notify.yaml (toast, email; T-0090), once per card key (`notified:<key>`
+                   in the flags file); an acked key is never sent; a failure is a `notify FAILED:` log line
 Never deletes anything; never edits Lean; never answers a HELP: line itself.
 """
 from __future__ import annotations
@@ -47,13 +59,16 @@ from pathlib import Path
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
-from .ops import LOG_PATHS, checkpoint, land, land_scriptorium, retire, scope_drift, self_workload, task_worktree, workload, workload_for
-from .run import pid_alive, scr_cmd, start_claude
+from .lifecycle import requeue
+from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
+                  scope_drift, self_workload, sweep, task_worktree, workload, workload_for)
+from .run import kill, pid_alive, process_created, scr_cmd, start_claude
 from .state import State
 from .store import Store
 
 STATE_FILE = ".scr/watch.state.txt"
 LOG_FILE = "reports/steward_watch.log"
+NEEDS_FILE = ".scr/watch.needs.json"      # the tick's NEEDS-YOU list, read by scr/ui.py needs_cards (T-0173)
 # claude -p writes this to stderr when it kills the session at its background-task ceiling (T-0067 owns the ceiling)
 DEAD_LINE = "Background tasks still running after"
 # Only a task whose session should be running is ever declared dead. `dispatched` has no session yet and
@@ -65,6 +80,13 @@ DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}
 REVIEW_STALE_HOURS, HELP_STALE_HOURS = 2.0, 3.0      # limits.yaml: review_stale_hours / help_stale_hours
 DISPATCH_TIMEOUT_MINUTES = 30                        # limits.yaml: dispatch_timeout_minutes (T-0122)
+CREDITS_PAUSE_MINUTES = 60                           # limits.yaml: credits_pause_minutes (T-0187)
+# What a headless claude prints, alone, when the account has no usage credits left (T-0121's transcript,
+# 2026-09-23): the session never ran. Anchored at a line start and read only in a transcript's last lines, so
+# a report or log that merely quotes it is not a credit death.
+CREDITS_LINE = re.compile(r"^\W{0,4}(You['’]re|You are) out of usage credits|^\W{0,4}Credit balance is too low", re.I)
+# The events that end a credit pause before its clock does: Omri's own, or the page's Resume button.
+CREDITS_RESUME_EVENTS = {"credits_resumed", "watcher_resumed"}
 # A HELP line the scriber cannot proceed past: plain `HELP:` or `HELP[blocks: …]:`. `HELP[proceeding: …]:`
 # (T-0068) is a question asked while working, never a block.
 _HELP_BLOCKING = re.compile(r"^\s*(-\s*)?HELP(\[blocks:[^\]]*\])?:")
@@ -76,6 +98,48 @@ _LINE_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\
 # `scr task set` read it the same way this watcher does; re-exported here so callers and tests keep working.
 from .review import (DECISION_NOTE, VERDICTS, _ANY_HEADING, _DECISION_HEADING, _DECISION_LINE, _DECISION_VERDICT, _FENCE,  # noqa: E402,F401
                      _PLACEHOLDER, _SECTION_VERDICT, _unfenced, _verdict, acceptance_problem, decision_of, read_decision, review_digest)
+
+
+# ---- a half-written report.md is not a submission (T-0180) ---------------------------------------------------
+# T-0172 was submitted with a literal FULL_SUITE_<PLACEHOLDER> token where the full-suite result belonged.
+_REPORT_PLACEHOLDER = re.compile(r"\b[A-Z][A-Z0-9_]*_PLACEHOLDER\b")
+_REPORT_HEADING = re.compile(r"^##\s")
+_RESULT_HEADING = re.compile(r"^##\s+Result\s*$")
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+
+def _result_body(text: str) -> list[str] | None:
+    """The non-blank lines under `## Result` up to the next `## ` heading; None when there is no such heading."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if _RESULT_HEADING.match(line.strip()):
+            body = []
+            for nxt in lines[i + 1:]:
+                if _REPORT_HEADING.match(nxt):
+                    break
+                if nxt.strip():
+                    body.append(nxt.strip())
+            return body
+    return None
+
+
+def report_unfinished(text: str, tpl: str) -> str | None:
+    """A short reason when report.md is not finished yet, else None: it still holds an ALL-CAPS `*_PLACEHOLDER`
+    token, or its `## Result` section is empty or only the template's prompt line. A report with no
+    `## Result` heading at all is not judged here (None). A token quoted inside a code fence or inline backticks
+    is a mention, not a placeholder (T-0181); the Result checks still read the whole text."""
+    m = _REPORT_PLACEHOLDER.search(_INLINE_CODE.sub("", "\n".join(_unfenced(text))))
+    if m:
+        return f"placeholder {m.group(0)} is still in it; replace it with the real text"
+    body = _result_body(text)
+    if body is None:
+        return None
+    if not body:
+        return "## Result is empty; write what was produced and which done_when lines pass"
+    prompt = set(_result_body(tpl) or [])
+    if prompt and all(line in prompt for line in body):
+        return "## Result is still the template prompt; replace it with what was produced and which done_when lines pass"
+    return None
 
 
 # ---- a stuck task leaves the slot (T-0092): pure functions of (record, review.md, log.md, events, now) -------
@@ -176,6 +240,54 @@ def help_stale(log_md: str, hours: float, now: datetime, seen: dict[str, datetim
     return {"line": i + 1, "text": text, "since": since, "age_h": round(age_h, 1)}
 
 
+# ---- out of usage credits is not a session death (T-0187) ----------------------------------------------------
+def credits_line(*paths: Path) -> str | None:
+    """The credit-exhaustion line when one of the last three non-blank lines of any of the files matches
+    CREDITS_LINE (a session's transcript and its .err), else None. Unreadable or missing files are skipped."""
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        except OSError:
+            continue
+        for line in [l.strip() for l in text.splitlines() if l.strip()][-3:]:
+            if CREDITS_LINE.search(line):
+                return line[:200]
+    return None
+
+
+def credits_pause(events: list[dict], now: datetime, minutes: float) -> dict | None:
+    """{since, until} while auto-dispatch is paused for exhausted credits: the newest `credits_exhausted` system
+    event has no `credits_resumed` / `watcher_resumed` event after it and is younger than `minutes`. When the
+    clock runs out the next tick's dispatch is the probe: a session that dies of credits again opens a new pause."""
+    since = None
+    for e in events:
+        if e.get("kind") != "system":
+            continue
+        if e.get("name") == "credits_exhausted":
+            since = _event_ts(e) or since
+        elif e.get("name") in CREDITS_RESUME_EVENTS and since is not None:
+            since = None
+    if since is None:
+        return None
+    until = since + timedelta(minutes=minutes)
+    return {"since": since, "until": until} if now < until else None
+
+
+def did_work(events: list[dict], tid: str, since: str | None, log_md: str, pid: int) -> bool:
+    """A launched session did work: a `checkpoint_commit` event for the task at or after its launch (`since`, the
+    launch event's ts), or a `[scriber]` line in log.md after the launcher's line for `pid` (the whole log when
+    that line is missing). An undatable launch counts every checkpoint of the task (never a false 'no work')."""
+    start = _parse_ts(since) if since else None
+    for e in events:
+        if e.get("kind") == "system" and e.get("name") == "checkpoint_commit" and e.get("task") == tid:
+            ts = _event_ts(e)
+            if start is None or ts is None or ts >= start:
+                return True
+    lines = log_md.splitlines()
+    at = max((i for i, l in enumerate(lines) if re.search(rf"\[launcher\] pid {int(pid)}\b", l)), default=-1)
+    return any("[scriber]" in l for l in lines[at + 1:])
+
+
 class Watcher:
     def __init__(self, root: Path, *, stale_minutes: int = 45, auto_review=False, auto_decide=False, auto_dispatch=False,
                  allow_statements=False, auto_land=False, auto_intake=False, permission_mode=None, push=False,
@@ -202,10 +314,13 @@ class Watcher:
         tpl = root / "templates" / "report.md"
         self.report_tpl = tpl.read_text(encoding="utf-8").strip() if tpl.exists() else ""
         self.needs: list[str] = []
+        self.need_items: list[dict] = []           # the same lines with their stable keys, published each tick (T-0173)
+        self.interval_min: int | None = None       # set by loop(); published so the page can tell a stopped watcher
         self.rows: list[dict] = []
         self.escalated: list[dict] = []            # the stuck tasks this tick moved to `escalated` (T-0092)
         self.timed_out: list[dict] = []            # the dispatches this tick moved back to `ready` (T-0122)
         self.events: list[dict] | None = None      # events.jsonl, read once per tick
+        self.credit_hits: list[str] = []           # the sessions this tick found dead of exhausted credits (T-0187)
 
     # ---- helpers ------------------------------------------------------------------
     def log(self, msg: str) -> None:
@@ -226,6 +341,32 @@ class Watcher:
 
     def unflag(self, key: str) -> None:
         self.flags.discard(key)
+
+    def need(self, key: str, text: str, task: str | None = None) -> None:
+        """One NEEDS-YOU line. `key` is `<kind>:<task>[:<detail>]` (the flags' scheme: stale:<id>, help:<id>:<line>):
+        stable across ticks for as long as the condition stands, so the card, `scr ack` and `notified:<key>` hold."""
+        self.needs.append(text)
+        if not any(n["key"] == key for n in self.need_items):
+            self.need_items.append({"key": key, "task": task, "text": text})
+
+    def publish_needs(self, now: datetime) -> None:
+        """Write this tick's needs list to NEEDS_FILE, always (an empty list clears the cards). `since` is carried
+        over from the previous file for a key that is still raised, so a card keeps its key across ticks."""
+        p = self.root / NEEDS_FILE
+        try:
+            prev = {n["key"]: n.get("since") for n in (json.loads(p.read_text(encoding="utf-8")).get("needs") or [])} if p.exists() else {}
+        except (OSError, ValueError, AttributeError, KeyError, TypeError):
+            prev = {}
+        ts = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = {"ts": ts, "interval_min": self.interval_min or int(self.limits.get("checkpoint_every_minutes", 30)),
+                "needs": [{**n, "since": prev.get(n["key"]) or ts} for n in self.need_items]}
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(body, indent=1) + "\n", encoding="utf-8")
+            tmp.replace(p)
+        except OSError as e:
+            self.log(f"needs file FAILED: {e}")
 
     def save_flags(self) -> None:
         p = self.root / STATE_FILE
@@ -260,7 +401,9 @@ class Watcher:
         the last `launch` event since the last dispatched -> in_progress transition (the launcher sets
         in_progress first, then launches). None for an interactive tab (no pid) or a run launched before
         the pid was recorded; the pid comes from the event's data or its `headless pid N` note, the
-        transcript from the data or the launcher's line in log.md."""
+        transcript from the data or the launcher's line in log.md. `created` (the process creation time the
+        launcher read right after starting it, T-0147) is added when the event recorded one; `sess.get("created")`
+        is None for older events and for a process that died before it could be read."""
         launch = None
         for e in self.read_events():
             if e.get("task") != t.id:
@@ -286,13 +429,28 @@ class Watcher:
                 if m:
                     transcript = Path(m.group(1).strip()).name
                     break
-        return {"pid": int(pid), "transcript": transcript, "ts": launch.get("ts")}
+        sess = {"pid": int(pid), "transcript": transcript, "ts": launch.get("ts")}
+        if data.get("created") is not None:
+            sess["created"] = data["created"]
+        return sess
+
+    @staticmethod
+    def pid_reused(sess: dict) -> bool:
+        """The session's pid now belongs to another process: the launch recorded a creation time and the live
+        process with that pid has a different one (T-0147). False whenever either side is unknown (an old
+        launch event, a process whose times cannot be read): then the pid is trusted exactly as before."""
+        recorded = sess.get("created")
+        if recorded is None:
+            return False
+        live = process_created(sess["pid"])
+        return live is not None and live != recorded
 
     @staticmethod
     def session_dead(t, sess: dict) -> str | None:
-        """Why the session is dead, or None: the transcript's .err carries claude's termination line, or the
-        launched pid no longer exists. A pid Windows has reused still counts as alive (the .err covers the
-        common case); an alive-but-silent session is STALE, never dead."""
+        """Why the session is dead, or None: the transcript's .err carries claude's termination line, the
+        launched pid no longer exists, or it was reused by another process (its creation time differs from the
+        one the launch recorded, T-0147; without a recorded one a reused pid still counts as alive). An
+        alive-but-silent session is STALE, never dead."""
         if sess.get("transcript"):
             err = t.dir / (sess["transcript"] + ".err")
             try:
@@ -304,6 +462,8 @@ class Watcher:
                     return f"claude terminated it: {line.strip()[:160]}"
         if not pid_alive(sess["pid"]):
             return f"pid {sess['pid']} no longer exists"
+        if Watcher.pid_reused(sess):
+            return f"pid {sess['pid']} was reused by another process"
         return None
 
     @staticmethod
@@ -325,10 +485,13 @@ class Watcher:
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
-        self.needs, self.rows, self.escalated, self.timed_out, self.events = [], [], [], [], None
+        self.needs, self.need_items, self.rows, self.escalated, self.timed_out, self.events = [], [], [], [], [], None
+        self.credit_hits = []
         if (self.root / ".scr" / "paused").exists():
             self.log("paused (resume from the UI)")
-            return {"ok": True, "rows": [], "review": [], "needs": ["watcher paused"], "paused": True}
+            self.need("paused", "watcher paused")
+            self.publish_needs(now)
+            return {"ok": True, "rows": [], "review": [], "needs": self.needs, "paused": True}
         self.touch_log()
         try:
             from .hotfix import poll_requests
@@ -354,6 +517,7 @@ class Watcher:
             newest = max([x for x in (self.newest_change(wt), datetime.fromtimestamp(log_md.stat().st_mtime, tz=timezone.utc) if log_md.exists() else None) if x], default=None)
             idle = int((now - newest).total_seconds() // 60) if newest else -1
             flags: list[str] = []
+            ckpt_now = False                                # this tick's checkpoint committed something (T-0187)
 
             # A spawned worktree is checkpointed whatever its workload: until T-0078 (2026-09-21) a scriptorium
             # task was assumed to live in the checkout ("tooling") and its worktree was never committed, so
@@ -365,13 +529,14 @@ class Watcher:
                         c = checkpoint(self.root, t.id, push=self.push)
                         if c and c.head:
                             flags.append(f"ckpt:{c.head}")
+                            ckpt_now = True
                         # T-0079: the checkpoint put these in a [checkpoint-drift] commit and raised the ONE
                         # scope_drift event for them; the drift block below must not raise a second one
                         for p in (c.drift if c else []):
                             self.flag(f"drift:{t.id}:{p}")
                     except Exception as e:  # noqa: BLE001 — a checkpoint failure must not stop the tick
                         self.log(f"{t.id} checkpoint commit failed: {e}")
-                        self.needs.append(f"{t.id} checkpoint commit failed: {str(e)[-200:]}")
+                        self.need(f"checkpoint_failed:{t.id}", f"{t.id} checkpoint commit failed: {str(e)[-200:]}", t.id)
                 g = Git(wt)
                 changed = [p for p in g.dirty() if not p.startswith(LOG_PATHS)]
                 # After a checkpoint commit the tree is clean, so drift is the branch's OWN commits: its diff to
@@ -396,7 +561,7 @@ class Watcher:
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "scope_drift", "--task", t.id, "--note", note[:900], "--quiet")
                 if drift:
                     flags.append(f"drift:{len(drift)}")
-            elif t.rec.get("workload") == "scriptorium":
+            elif is_scriptorium_task(self.root, self.store, t):
                 flags.append("tooling")          # a hotfix in the checkout; the journal records its commits
             else:
                 flags.append("no-worktree")
@@ -412,7 +577,7 @@ class Watcher:
                             if re.match(r"^\s*(-\s*)?HELP:", nxt):
                                 break
                         if not answered:
-                            self.needs.append(f"{t.id} HELP (log.md:{i + 1}): {line.strip()}")
+                            self.need(f"help:{t.id}:{i + 1}", f"{t.id} HELP (log.md:{i + 1}): {line.strip()}", t.id)
                             if self.flag(f"help:{t.id}:{i + 1}"):
                                 self.scr(f"steward:{t.id}", "event", "system", "--name", "help", "--task", t.id, "--note", line.strip()[:300], "--quiet")
 
@@ -424,10 +589,22 @@ class Watcher:
                 if self.flag(f"wall:{t.id}"):
                     self.log(f"{t.id} wall budget exhausted: {wall} h > {hours} h")
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "budget_wall", "--task", t.id, "--note", f"{wall} h", "--quiet")
-                self.needs.append(f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend")
+                self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
 
             rep = t.dir / "report.md"
-            submitted = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl and self.report_tpl
+            rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
+            submitted = rep.exists() and rep_text != self.report_tpl and self.report_tpl
+            # A report still holding a *_PLACEHOLDER token or no Result is not a submission (T-0180): the task
+            # keeps its status, so the dead-session and wall-budget paths below still route it.
+            unfinished = report_unfinished(rep_text, self.report_tpl) if submitted and t.status != "submitted" else None
+            if unfinished:
+                submitted = False
+                flags.append("REPORT-UNFINISHED")
+                self.need(f"report:{t.id}", f"{t.id} report.md unfinished: {unfinished}", t.id)
+                if self.flag(f"report_unfinished:{t.id}"):
+                    self.log(f"{t.id} report.md unfinished, not submitted: {unfinished}")
+            else:
+                self.unflag(f"report_unfinished:{t.id}")
             # A finished session with a report is a submission, never a death; a session that is gone
             # without one has nothing left to submit -> returned (dispatch relaunches it when ready).
             sess = self.session_of(t) if t.status in DEAD_CHECK_STATUSES else None
@@ -440,15 +617,27 @@ class Watcher:
                 self.scr(f"steward:{t.id}", "task", "set", t.id, "submitted", "--note", "report.md written (watcher)", "--quiet")
                 self.log(f"{t.id} -> submitted (report.md written)")
                 flags.append("SUBMITTED")
+                self.unflag(f"nowork:{t.id}")                         # a submission ends the no-work episode (T-0187)
             elif ok and dead:
                 flags.append(f"DEAD pid {sess['pid']}")
                 key = f"dead:{t.id}:{sess['pid']}"
-                if self.flag(key):
-                    self.log(f"{t.id} session dead: {dead} -> returned")
-                    self.scr(f"steward:{t.id}", "event", "system", "--name", "session_dead", "--task", t.id, "--note", f"pid {sess['pid']}: {dead}"[:300], "--quiet")
-                    if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
+                # T-0187: a session that printed the credit-exhaustion line never ran — not a death, not an attempt
+                credit = credits_line(t.dir / sess["transcript"], t.dir / (sess["transcript"] + ".err")) if sess.get("transcript") else None
+                if credit:
+                    flags.append("CREDITS")
+                    if self.flag(key) and not self.credit_death(t, sess, credit, now):
                         self.unflag(key)                                  # retried next tick
-                self.needs.append(f"{t.id} session died ({dead}) — returned; no relaunch from here")
+                else:
+                    requeued = False
+                    if self.flag(key):
+                        self.log(f"{t.id} session dead: {dead} -> returned")
+                        self.scr(f"steward:{t.id}", "event", "system", "--name", "session_dead", "--task", t.id, "--note", f"pid {sess['pid']}: {dead}"[:300], "--quiet")
+                        if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", f"session died: {dead}"[:300], "--quiet") is None:
+                            self.unflag(key)                              # retried next tick
+                        else:
+                            requeued = self.requeue_no_work(t, sess, ckpt_now, dead)
+                    self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — " + ("it did no work: set back to ready once (T-0187)" if requeued
+                              else "returned; no relaunch from here"), t.id)
             elif ok and t.status in {"in_progress", "checkpoint"}:
                 if t.status == "in_progress":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "checkpoint", "--quiet")
@@ -456,7 +645,7 @@ class Watcher:
             if idle >= self.stale and not dead:
                 flags.append(f"STALE {idle}m")
                 alive = f"pid {sess['pid']} is alive" if sess else "no recorded pid to check"
-                self.needs.append(f"{t.id} silent for {idle} min ({alive}) — is its session hung?")
+                self.need(f"stale:{t.id}", f"{t.id} silent for {idle} min ({alive}) — is its session hung?", t.id)
                 if self.flag(f"stale:{t.id}"):                             # once per idle episode (see below)
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "stale", "--task", t.id, "--note",
                              f"silent for {idle} min (threshold {self.stale}); {alive}", "--quiet")
@@ -475,7 +664,15 @@ class Watcher:
             # is applied here; a task whose decision is applied needs no review session.
             if self.auto_decide and ok and self.apply_decision(t, decided):
                 continue
-            if self.auto_review and ok and self.flag(f"review:{t.id}"):
+            # T-0187: a review session that printed the credit-exhaustion line never reviewed; its flag goes, so a
+            # fresh review starts once the credit pause is over (never while it stands)
+            tr = self.newest_review_transcript(t)
+            if ok and tr and f"review:{t.id}" in self.flags and (line := credits_line(tr, tr.with_name(tr.name + ".err"))):
+                if self.flag(f"credits_review:{t.id}:{tr.name}"):
+                    self.log(f"{t.id} review session out of usage credits ({tr.name}): review relaunched after the pause")
+                    self.unflag(f"review:{t.id}")
+                    self.credits_seen(t.id, line, now)
+            if self.auto_review and ok and not self.credits_paused(now) and self.flag(f"review:{t.id}"):
                 self.start_review(t)
         if decided:
             tasks = self.store.load_all()                   # auto-land below sees an `accepted` applied this tick
@@ -497,7 +694,7 @@ class Watcher:
             for t in [t for t in tasks.values() if t.status == "accepted"]:
                 if not self.flag(f"land:{t.id}"):
                     continue
-                if t.rec.get("workload") == "scriptorium":
+                if is_scriptorium_task(self.root, self.store, t):
                     if self.land_scriptorium_task(t):
                         merged_now += 1
                     continue
@@ -509,7 +706,7 @@ class Watcher:
                 for line in res["out"]:
                     self.log(f"  land: {line}")
                 if not res["ok"]:
-                    self.needs.append(f"{t.id} auto-land failed — see reports/steward_watch.log")
+                    self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed — see reports/steward_watch.log", t.id)
                     self.unflag(f"land:{t.id}")
                     continue
                 merged_now += 1
@@ -517,7 +714,11 @@ class Watcher:
                 for line in r["out"]:
                     self.log(f"  retire: {line}")
                 if not r["ok"]:
-                    self.needs.append(f"{t.id} merged; worktree retire refused ({r['code']}) — see log")
+                    self.retire_refused(t.id, r["code"])
+        self.retire_refused_needs(tasks)
+
+        if ok:
+            self.hygiene_pass()
 
         if self.auto_intake and ok:
             nightly = datetime.now().hour == 22 and self.flag(f"intake:{datetime.now():%Y-%m-%d}")
@@ -527,7 +728,16 @@ class Watcher:
                 for line in intake(self.root):
                     self.log(f"  intake: {line}")
 
-        if self.auto_dispatch and ok:
+        pause = self.credits_paused(now)
+        if pause:
+            self.need("credits", f"Out of usage credits (since {pause['since']:%Y-%m-%d %H:%M}Z): auto-dispatch and reviews are paused; "
+                      "the sessions that hit it went back to ready without spending an attempt. Resumes by itself at "
+                      f"{pause['until']:%H:%M}Z (that tick's dispatch is the probe; another credit death pauses again), or now: "
+                      "top up at claude.ai/settings/usage, then Pause + Resume on the page, or "
+                      "`scr --actor omri event system --name credits_resumed`")
+        if self.auto_dispatch and ok and pause:
+            self.log("auto-dispatch held: out of usage credits")
+        elif self.auto_dispatch and ok:
             cap = int(self.limits.get("concurrency", 3))
             tasks = self.store.load_all()
             n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES)   # escalated / returned never count (T-0092)
@@ -540,10 +750,118 @@ class Watcher:
                     for line in launch(self.root, mode="headless", permission_mode=self.permission_mode):
                         self.log(f"  launcher: {line}")
 
+        self.publish_needs(datetime.now(timezone.utc))      # before the push, so it carries the watcher's own lines too
+        self.notify_cards()
         self.save_flags()
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
                 "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- the daily hygiene pass (docs/hygiene-protocols.md §3, §10; T-0202) ------------------------------------------
+    def hygiene_pass(self) -> Path | None:
+        """Once per local date (flag `hygiene:<date>`, like `intake:<date>`): `sweep --all` as a classification
+        (fetch, no commit), `reports/hygiene/<date>.md`, and one `hygiene_digest` event. Informational only: no
+        needs line, chore or task comes from it. A failure leaves the flag unset, so the next tick retries."""
+        day = f"{datetime.now():%Y-%m-%d}"
+        key = f"hygiene:{day}"
+        if key in self.flags:
+            return None
+        try:
+            rows = sweep(self.root, dry_run=True, all_workloads=True, fetch=True)
+            path = hygiene_digest(self.root, rows, day)
+        except Exception as e:  # noqa: BLE001 — a hygiene failure is a log line, never a tick crash
+            self.log(f"hygiene pass FAILED: {e}")
+            return None
+        self.flags.add(key)
+        rel = path.relative_to(self.root).as_posix()
+        counts = ", ".join(f"{k} {n}" for k in HYGIENE_KINDS if (n := sum(1 for r in rows if r["kind"] == k)))
+        EventLog(self.root / "events" / "events.jsonl").append("system", name="hygiene_digest", actor="steward-watch",
+                                                                note=f"{rel}: {counts or 'no worktrees'}")
+        self.log(f"hygiene digest {rel}: {counts or 'no worktrees'}")
+        return path
+
+    # ---- out of usage credits is not a session death (T-0187) ------------------------------------------
+    def credits_paused(self, now: datetime) -> dict | None:
+        return credits_pause(self.read_events(), now, float(self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES)))
+
+    def credits_seen(self, tid: str, line: str, now: datetime) -> None:
+        """A session (scriber or review) printed the credit-exhaustion line: ONE `credits_exhausted` event opens the
+        pause; a hit while the pause stands (the same tick's second session, a later one) raises nothing more."""
+        self.credit_hits.append(tid)
+        if self.credits_paused(now):
+            return
+        mins = float(self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES))
+        self.log(f"OUT OF USAGE CREDITS ({tid}: {line}) — auto-dispatch and reviews paused for {mins:g} min or until resumed")
+        self.scr("steward-watch", "event", "system", "--name", "credits_exhausted", "--note",
+                 f"{tid}: {line}; auto-dispatch paused (credits_pause_minutes {mins:g}); resume: credits_resumed event or the page's Resume"[:300],
+                 "--data", json.dumps({"task": tid}), "--quiet")
+        self.events = None
+
+    def credit_death(self, t, sess: dict, line: str, now: datetime) -> bool:
+        """A running task whose session printed the credit-exhaustion line goes back to `ready` with its attempt
+        refunded (lifecycle.requeue), and the pause opens (credits_seen). No session_dead event, no relaunch from
+        here: dispatch stays the normal path. False when the record could not be changed (retried next tick)."""
+        note = f"out of usage credits (pid {sess['pid']}): not an attempt; ready again"
+        try:
+            done = requeue(self.store, EventLog(self.root / "events" / "events.jsonl"), t.id, note, actor=f"steward:{t.id}", refund=True)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} credit death: requeue FAILED: {e}")
+            return False
+        self.events = None
+        from .cli import refresh            # local import: cli imports this module
+        refresh(self.root, quiet=True)
+        self.log(f"{t.id} session out of usage credits (pid {sess['pid']}) -> ready, attempt refunded")
+        self.credits_seen(t.id, line, now)
+        return done
+
+    def requeue_no_work(self, t, sess: dict, ckpt_now: bool, dead: str) -> bool:
+        """A task just returned by a session death that did no work (no checkpoint commit since its launch, not this
+        tick's either, and no `[scriber]` line after the launcher's) goes back to `ready` — once per episode: the flag
+        `nowork:<id>` stays until the task is submitted or a session of it does work, so a second no-work death
+        leaves it `returned` for Omri. The attempt stays counted (max_attempts still bounds it). Only on evidence:
+        the session's transcript must exist (the launcher always creates it; without it nothing says the session
+        never ran), and a session claude killed at its background-task ceiling (DEAD_LINE) or one that wrote
+        report.md did work."""
+        key = f"nowork:{t.id}"
+        log_md = t.dir / "log.md"
+        text = log_md.read_text(encoding="utf-8", errors="replace") if log_md.exists() else ""
+        rep = t.dir / "report.md"
+        reported = rep.exists() and rep.read_text(encoding="utf-8", errors="replace").strip() != self.report_tpl
+        unseen = not sess.get("transcript") or not (t.dir / sess["transcript"]).exists()
+        if unseen or reported or DEAD_LINE in dead or ckpt_now or did_work(self.read_events(), t.id, sess.get("ts"), text, sess["pid"]):
+            self.unflag(key)
+            return False
+        if not self.flag(key):
+            self.log(f"{t.id} died again without doing any work: stays returned")
+            return False
+        try:
+            done = requeue(self.store, EventLog(self.root / "events" / "events.jsonl"), t.id,
+                           f"session pid {sess['pid']} did no work (no checkpoint, no [scriber] line): ready again, once", actor=f"steward:{t.id}")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} no-work requeue FAILED: {e}")
+            self.unflag(key)
+            return False
+        self.events = None
+        from .cli import refresh
+        refresh(self.root, quiet=True)
+        self.log(f"{t.id} returned session did no work -> ready (once)")
+        return done
+
+    @staticmethod
+    def newest_review_transcript(t) -> Path | None:
+        trs = sorted(t.dir.glob("review-session-*.txt"))
+        return trs[-1] if trs else None
+
+    # ---- out-of-band push of NEW needs-you cards (T-0090) -------------------------------------------
+    def notify_cards(self) -> list[dict]:
+        """Push the cards the page shows (scr/ui.py needs_cards) that no earlier tick pushed; the dedup state is
+        `notified:<key>` in the flags file. Any failure is a `notify FAILED:` log line, never a tick crash."""
+        try:
+            from . import notify, ui
+            return notify.push(self.root, ui.needs_cards(self.root), self.flags, ui.acked_keys(self.root), self.log)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"notify FAILED: {type(e).__name__}: {e}")
+            return []
 
     # ---- a failed dispatch leaves the slot (T-0122) ---------------------------------------------------
     def dispatch_checks(self, now: datetime, tasks: dict) -> int:
@@ -572,7 +890,7 @@ class Watcher:
             note = (f"waited {row['age_min']} min in dispatched (dispatch_timeout_minutes {minutes:g}); "
                     "no launch event; redispatch is automatic")
             if self.scr(f"steward:{t.id}", "task", "set", t.id, "ready", "--note", f"dispatch timed out: {note}", "--quiet") is None:
-                self.needs.append(f"{t.id} dispatch timed out ({note}) but could not be set ready — see reports/steward_watch.log")
+                self.need(f"dispatch_timeout_unset:{t.id}", f"{t.id} dispatch timed out ({note}) but could not be set ready — see reports/steward_watch.log", t.id)
                 continue
             self.scr(f"steward:{t.id}", "event", "system", "--name", "dispatch_timeout", "--task", t.id, "--note", note, "--quiet")
             self.log(f"{t.id} dispatch timed out -> ready ({note})")
@@ -593,8 +911,9 @@ class Watcher:
         `waiting` is T-0069's transition and is not made here). Returns how many tasks were escalated. One
         escalation per episode: the persisted flag `slot_freed:<id>:<since>` names the episode (the submission
         time, the HELP line's first sighting), and only SLOT_STATUSES are looked at, so a task already
-        `escalated` never gets a second event. Nothing is stopped or deleted: the worktree, the branch and a
-        still-running session stay, and the note says where the work is."""
+        `escalated` never gets a second event. Nothing is deleted: the worktree and the branch stay, and the note
+        says where the work is; an in_progress/checkpoint task's launched session is stopped by `_escalate`
+        after a checkpoint commit (T-0124)."""
         review_h = float(self.limits.get("review_stale_hours", REVIEW_STALE_HOURS))
         help_h = float(self.limits.get("help_stale_hours", HELP_STALE_HOURS))
         self.events = None                                     # the help events raised earlier this tick date the lines
@@ -607,6 +926,9 @@ class Watcher:
                 row = submitted_stale(t.status, text, submitted_since(events, t.id), review_h, now)
                 if not row:
                     continue
+                tr = self.newest_review_transcript(t)
+                if tr and credits_line(tr, tr.with_name(tr.name + ".err")):
+                    continue                # the review never ran (T-0187): relaunched after the credit pause, not escalated
                 transcripts = sorted(p.name for p in t.dir.glob("review-session-*.txt"))
                 reason = (f"submitted for {row['age_h']} h with no Decision written in review.md "
                           f"(review_stale_hours {review_h:g}); the review did not finish")
@@ -629,7 +951,7 @@ class Watcher:
                 sess = self.session_of(t)
                 transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
                 reason = (f"HELP line unanswered for {row['age_h']} h (log.md:{row['line']}: {row['text'][:160]}; "
-                          f"help_stale_hours {help_h:g})" + (f"; its session pid {sess['pid']} is left running" if sess else ""))
+                          f"help_stale_hours {help_h:g})")
                 action = (f"answer log.md:{row['line']} in the record as [omri] and `scr task set {t.id} returned` + `ready` so it is "
                           "redispatched with the answer, or decide in the gate card")
             else:
@@ -640,18 +962,27 @@ class Watcher:
 
     def _escalate(self, t, since: datetime, reason: str, action: str, transcripts: list[str]) -> bool:
         """submitted / in_progress / checkpoint -> escalated as steward:<id>, then ONE `slot_freed` event whose note
-        is the needs-you card: the one action for Omri, the reason, where the work is, the transcript(s)."""
+        is the needs-you card: the one action for Omri, the reason, where the work is, the transcript(s).
+        An in_progress / checkpoint task whose launched session is alive is first checkpoint-committed HERE (not
+        by the tick's earlier pass, so nothing written since is lost), then that pid is stopped with run.kill:
+        otherwise auto-dispatch fills the freed slot and cap + 1 sessions run, and the old session's
+        `task set submitted` is refused unexplained (T-0124, T-0092 review item 3). Only the pid session_of
+        returns is ever stopped, and never once another process has reused it (T-0147); a `submitted` task has no scriber session (its review is T-0075's). The
+        escalation never depends on the stop: a failed checkpoint or kill is said in the note, not fatal."""
         key = f"slot_freed:{t.id}:{since.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
         if key in self.flags:
             return False
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        where = f"work: {wt} on {t.rec.get('branch') or 'task/' + t.id}" + ("" if wt.exists() else " (worktree missing)")
+        branch = t.rec.get("branch") or "task/" + t.id
+        where = f"work: {wt} on {branch}" + ("" if wt.exists() else " (worktree missing)")
+        if t.status in DEAD_CHECK_STATUSES and (sess := self.session_of(t)):
+            where = f"{self.stop_session(t, sess['pid'], wt, branch, created=sess.get('created'))}; {where}"
         tr = ", ".join(f"tasks/{t.dir.name}/{x}" for x in transcripts) if transcripts else "no transcript recorded"
         note = (f"stuck: {reason}; escalated by the watcher — a task that cannot progress is escalated, never held "
                 f"(agents/_common.md); {where}; transcript(s): {tr}")
         if self.scr(f"steward:{t.id}", "task", "set", t.id, "escalated", "--note", note[:900], "--quiet") is None:
-            self.needs.append(f"{t.id} is stuck ({reason}) but could not be escalated — see reports/steward_watch.log")
+            self.need(f"escalate_failed:{t.id}", f"{t.id} is stuck ({reason}) but could not be escalated — see reports/steward_watch.log", t.id)
             return False
         self.flags.add(key)
         self.unflag(f"review:{t.id}")          # it left `submitted`: a later re-submission gets a fresh review
@@ -664,6 +995,34 @@ class Watcher:
             if r["task"] == t.id:
                 r["flags"] = (r["flags"] + " ESCALATED").strip()
         return True
+
+    def stop_session(self, t, pid: int, wt: Path, branch: str, created: int | None = None) -> str:
+        """Checkpoint-commit the worktree, then stop the launched session `pid` (T-0124). Returns the clause for
+        the escalation note; never raises. `created` is the creation time the launch recorded: a live process
+        with that pid but another creation time is not the session, and is never killed (T-0147)."""
+        if not pid_alive(pid):
+            return f"session pid {pid} was already gone"
+        if self.pid_reused({"pid": pid, "created": created}):
+            self.log(f"{t.id} session pid {pid} was reused by another process: not stopped")
+            return f"session pid {pid} was already gone (pid reused by another process)"
+        sha = None
+        try:
+            c = checkpoint(self.root, t.id, push=self.push) if wt.exists() else None
+            sha = (c.head if c else None) or (Git(wt).head(short=True) if wt.exists() else None)
+            ckpt = f"checkpoint {sha}" if sha else "checkpoint (no commit: no worktree)"
+        except Exception as e:  # noqa: BLE001 — the uncommitted files stay in the worktree; the stop still happens
+            self.log(f"{t.id} checkpoint before stopping pid {pid} failed: {e}")
+            ckpt = f"a FAILED checkpoint ({str(e)[-120:]}; uncommitted files stay in the worktree)"
+        try:
+            stopped = kill(pid)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} stopping session pid {pid} raised: {e}")
+            stopped = False
+        if not stopped:
+            self.log(f"{t.id} stopping session pid {pid} FAILED")
+            return f"stopping session pid {pid} FAILED after {ckpt}: it may still be running, stop it by hand; the work is on {branch}"
+        self.log(f"{t.id} session pid {pid} stopped after {ckpt}")
+        return f"session pid {pid} stopped after {ckpt}; the work is on {branch}"
 
     def apply_decision(self, t, decided: list[dict]) -> bool:
         """A `submitted` task whose review.md states a verdict: apply it as steward:<id> (T-0091). True when
@@ -679,8 +1038,8 @@ class Watcher:
         verdict, problem = read_decision(text)
         if problem:
             self.log(f"{t.id} decision NOT applied: {problem}")
-            self.needs.append(f"{t.id} review.md has a Decision the watcher cannot read ({problem}) — apply it by hand: "
-                              f"scr --actor omri task set {t.id} accepted|returned|escalated")
+            self.need(f"decision_unreadable:{t.id}", f"{t.id} review.md has a Decision the watcher cannot read ({problem}) — apply it by hand: "
+                      f"scr --actor omri task set {t.id} accepted|returned|escalated", t.id)
             return False
         if not verdict:
             return False
@@ -689,19 +1048,20 @@ class Watcher:
         prior = next((e for e in self.read_events() if e.get("kind") == "state" and e.get("task") == t.id
                       and f"[review.md {digest}]" in (e.get("note") or "")), None)
         if prior:
-            self.needs.append(f"{t.id} is submitted again but review.md is the review already applied "
-                              f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed")
+            self.need(f"decision_stale:{t.id}", f"{t.id} is submitted again but review.md is the review already applied "
+                      f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed", t.id)
             return False
         if self.scr(f"steward:{t.id}", "task", "set", t.id, verdict, "--note", note, "--quiet") is None:
-            self.needs.append(f"{t.id} decision {verdict} from review.md could not be applied — see reports/steward_watch.log")
+            self.need(f"decision_unapplied:{t.id}", f"{t.id} decision {verdict} from review.md could not be applied — see reports/steward_watch.log", t.id)
             return False
         self.log(f"{t.id} decision applied: {verdict}")
         decided.append({"task": t.id, "decision": verdict})
         return True
 
     def land_scriptorium_task(self, t) -> bool:
-        """accepted scriptorium task -> merged (T-0078). No worktree: a hotfix made in the checkout, whose
-        commits the journal already put on the trunk — merged without a merge, as before. A spawned
+        """accepted scriptorium task -> merged (T-0078). No worktree: ops.land_any decides, as for `scr land`
+        (T-0158) — a hotfix made in the checkout, whose commits the journal already put on the trunk, is merged
+        without a merge; a task/<id> with commits not on the trunk is a lost worktree, a landing failure. A spawned
         worktree: ops.land_scriptorium (commit, merge the trunk in, tests, merge into the trunk), then
         retire, like any other workload. A failure (conflict, failing tests, checkout off the trunk) leaves
         the task accepted, logs the reason, raises ONE land_failed event per task-branch tip and a NEEDS-YOU
@@ -709,19 +1069,32 @@ class Watcher:
         tip would fail the same way — or when the branch reached the trunk by hand, which is then recorded."""
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        if not wt.exists():
-            self.scr(f"steward:{t.id}", "task", "set", t.id, "merged", "--note", "tooling task: change already on main (journal)", "--quiet")
-            self.log(f"{t.id} tooling task (no worktree) -> merged")
-            return True
-        g, mg = Git(wt), Git(self.root)
         # The retry key is the branch tip PLUS the record's scope (T-0079): a landing refused for out-of-scope
         # paths is retried when the Steward widens scope.files / scope.mission, not only on a new commit.
         sc = t.rec.get("scope") or {}
         scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
-        tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
+        if not wt.exists():
+            # T-0158: ops.land_any owns the no-worktree landing (note, actor, cascade, events): a checkout hotfix
+            # is recorded merged, a task/<id> with commits not on the trunk is refused (lost_worktree).
+            try:
+                res = land_any(self.root, t.id)
+            except Exception as e:  # noqa: BLE001
+                res = {"ok": False, "reason": "error", "out": [f"FAILED (error): {e}"], "sha": None, "tip": None}
+            for line in res["out"]:
+                self.log(f"  land: {line}")
+            if not res["ok"]:
+                return self.land_failed(t, res, failed, scope_sig)
+            for k in failed:
+                self.unflag(k)
+            from .cli import refresh            # local import: cli imports this module
+            refresh(self.root, quiet=True)      # the queues/STATE.json refresh the old `scr task set` subprocess did
+            self.log(f"{t.id} tooling task (no worktree) -> merged")
+            return True
+        g, mg = Git(wt), Git(self.root)
+        tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
-            self.needs.append(f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand")
+            self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
             self.unflag(f"land:{t.id}")
             return False
         self.log(f"{t.id} auto-land (scriptorium worktree): commit, merge {wl.main} in, tests, merge into {wl.main}")
@@ -732,15 +1105,7 @@ class Watcher:
         for line in res["out"]:
             self.log(f"  land: {line}")
         if not res["ok"]:
-            why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
-            self.needs.append(f"{t.id} landing failed ({res['reason']}) — {why[:200]}; see reports/steward_watch.log")
-            key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
-            for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
-                self.unflag(k)
-            if self.flag(key):
-                self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
-            self.unflag(f"land:{t.id}")
-            return False
+            return self.land_failed(t, res, failed, scope_sig)
         for k in failed:
             self.unflag(k)
         try:
@@ -750,13 +1115,43 @@ class Watcher:
         for line in r["out"]:
             self.log(f"  retire: {line}")
         if not r["ok"]:
-            self.needs.append(f"{t.id} merged; worktree retire refused ({r['code']}) — see log")
+            self.retire_refused(t.id, r["code"])
         return True
+
+    def retire_refused(self, tid: str, code: str) -> None:
+        """A merged task whose worktree retire was refused: its landing never runs again, so the line would stand for
+        one tick only; the flag `retire_refused:<id>:<code>` keeps it raised while the worktree exists (T-0173)."""
+        for k in [k for k in self.flags if k.startswith(f"retire_refused:{tid}:")]:
+            self.unflag(k)
+        self.flags.add(f"retire_refused:{tid}:{code}")
+
+    def retire_refused_needs(self, tasks: dict) -> None:
+        for k in sorted(k for k in self.flags if k.startswith("retire_refused:")):
+            _, tid, code = k.split(":", 2)
+            t = tasks.get(tid)
+            if t is None or not task_worktree(workload_for(self.root, self.store, t), t).exists():
+                self.unflag(k)
+                continue
+            self.need(f"retire_refused:{tid}", f"{tid} merged; worktree retire refused ({code}) — see log", tid)
+
+    def land_failed(self, t, res: dict, failed: set, scope_sig: str) -> bool:
+        """A refused landing (land_scriptorium or the no-worktree land_any): the task stays accepted, a NEEDS-YOU
+        line every tick, ONE land_failed event per branch tip (+ scope). Returns False."""
+        why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
+        nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
+        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
+        key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
+        for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
+            self.unflag(k)
+        if self.flag(key):
+            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
+        self.unflag(f"land:{t.id}")
+        return False
 
     def start_review(self, t) -> None:
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        if t.rec.get("workload") == "scriptorium":
+        if is_scriptorium_task(self.root, self.store, t):
             return self.start_tooling_review(t)
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): accepted only if the statement diff is EMPTY and every "
                   "mechanical check passes; otherwise returned or escalated. Never merge a branch yourself; never edit Lean."
@@ -764,7 +1159,9 @@ class Watcher:
         brief = (f"You are the Steward for Scriptorium task {t.id} (see {self.root / 'agents' / 'steward.md'} — follow its \"On submission\" section exactly).\n"
                  f"Record: {t.dir}  (spec.md, report.md, log.md; write review.md there).\n"
                  f"Worktree: {wt}   Workload config: {self.root / 'config' / 'workloads.yaml'} (done_when_checker, statement_diff, allowed_axioms, main_branch).\n"
-                 f"Run the mechanical checks from the worktree, run statement_diff against {wl.main}, fill review.md completely, and end with a "
+                 f"Run the mechanical checks from the worktree, run check_done.py and statement_diff.py with --fetch and their default base (the merge-base of "
+                 f"origin/{wl.main} and HEAD; never pass a bare {wl.main}: the stale local ref names every file merged since the branch point as out of scope), "
+                 f"fill review.md completely, and end with a "
                  f"Decision line: accepted | returned (feedback) | escalated (Gate N, reason).\n{decide}\n"
                  f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; never run git in the scriptorium folder (it journals itself).\n")
         bf = t.dir / "review-brief.txt"
@@ -827,6 +1224,7 @@ class Watcher:
     def loop(self, interval_min: int, once: bool = False) -> None:
         from .ui import _code_signature
         sig = _code_signature()
+        self.interval_min = interval_min
         while True:
             try:
                 res = self.tick()

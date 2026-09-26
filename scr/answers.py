@@ -28,10 +28,18 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
     ts = now_iso()
     msgs: list[str] = []
     ok = True
+
+    def _run(who: str, *args: str) -> bool:
+        # T-0139: one scr call; its text goes to `log`, and a non-zero rc is a False the caller keeps in `ok`.
+        rc, text = scr_cmd(root, who, *args, "--quiet")
+        if text:
+            msgs.append(text)
+        return rc == 0
+
     if kind == "help":
         with open(d / "log.md", "a", encoding="utf-8") as f:
             f.write(f"\n- {ts} [steward] ({actor}, via UI) {answer}\n")
-        msgs.append(scr_cmd(root, actor, "event", "system", "--name", "help_answered", "--task", tid, "--note", answer[:500], "--quiet")[1])
+        ok = _run(actor, "event", "system", "--name", "help_answered", "--task", tid, "--note", answer[:500])
     elif kind == "decision":
         q = root / "queues" / "omri.md"
         txt = _read(q)
@@ -40,8 +48,9 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
             q.write_text(pat.sub(lambda m: m.group(1) + f" {answer}\n", txt, count=1), encoding="utf-8")
         with open(d / "log.md", "a", encoding="utf-8") as f:
             f.write(f"\n- {ts} [{actor}] answer: {answer}\n")
-        msgs.append(scr_cmd(root, actor, "event", "system", "--name", "answer", "--task", tid, "--note", answer[:500], "--quiet")[1])
-        msgs.append(scr_cmd(root, "concierge", "task", "set", tid, "closed", "--note", f"answered via UI: {answer[:200]}", "--quiet")[1])
+        # Omri's words are on the record before the close is tried; a refused close stops here with ok False.
+        ok = (_run(actor, "event", "system", "--name", "answer", "--task", tid, "--note", answer[:500])
+              and _run("concierge", "task", "set", tid, "closed", "--note", f"answered via UI: {answer[:200]}"))
     elif kind == "gate":
         target = GATE_TARGETS.get(answer.split()[0].lower()) if answer.strip() else None
         if target:
@@ -60,16 +69,13 @@ def apply(root: Path, tid: str, answer: str, kind: str, actor: str = "omri", con
             if target == "triaged":
                 steps.append(("ready", "--note", f"returned by Omri: {answer[:200]}"))
             for step in steps:
-                rc, text = scr_cmd(root, actor, "task", "set", tid, *step, "--quiet")
-                if text:
-                    msgs.append(text)
-                if rc != 0:
+                if not _run(actor, "task", "set", tid, *step):
                     ok = False
                     break
         else:
             with open(d / "log.md", "a", encoding="utf-8") as f:
                 f.write(f"\n- {ts} [{actor}] gate note: {answer}\n")
-            msgs.append(scr_cmd(root, actor, "event", "system", "--name", "gate_note", "--task", tid, "--note", answer[:500], "--quiet")[1])
+            ok = _run(actor, "event", "system", "--name", "gate_note", "--task", tid, "--note", answer[:500])
     else:
         raise RepoError(f"unknown answer kind {kind}")
     if ok and concierge and kind != "help":

@@ -116,18 +116,22 @@ def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | Non
 
 
 def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode: str | None = None,
-                 model: str | None = None, extra: list[str] | None = None, root: Path | None = None) -> int | None:
+                 model: str | None = None, extra: list[str] | None = None, root: Path | None = None,
+                 env_extra: dict[str, str] | None = None) -> int | None:
     """Detached `claude -p` reading the brief from stdin; stdout/stderr to the transcript. Returns the pid.
-    Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv)."""
+    Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv).
+    `env_extra` is added to the inherited environment (the launcher's per-task background-wait ceiling,
+    scr/bgwait.py); None leaves the environment as it is."""
     args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra)
     if not args:
         return None
     flags = 0
     if os.name == "nt":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]  (+ CREATE_NO_WINDOW from scr/__init__)
+    env = {**os.environ, **env_extra} if env_extra else None
     p = subprocess.Popen(args, cwd=cwd, stdin=brief_file.open("rb"), stdout=transcript.open("ab"),
                          stderr=transcript.with_suffix(transcript.suffix + ".err").open("ab"),
-                         creationflags=flags, start_new_session=(os.name != "nt"))
+                         creationflags=flags, start_new_session=(os.name != "nt"), env=env)
     return p.pid
 
 
@@ -197,12 +201,49 @@ def pid_alive(pid: int | None) -> bool:
         return True
 
 
+def process_created(pid: int | None) -> int | None:
+    """The creation time of the process with this pid, as a value only compared with `==`, or None when it
+    cannot be read (no such process, access denied, no /proc). Win32: GetProcessTimes' creation FILETIME as
+    an int, via ctypes; POSIX: the start time field of /proc/<pid>/stat. The launcher records it with the
+    pid, and the watcher compares it before trusting a pid again (T-0147): a pid Windows has reused for
+    another process has a different creation time."""
+    if not pid or int(pid) <= 0:
+        return None
+    pid = int(pid)
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32                                 # type: ignore[attr-defined]
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k32.OpenProcess.restype = wintypes.HANDLE
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return None
+            try:
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                if not k32.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)):
+                    return None
+                value = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                return value or None
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rpartition(")")[2].split()[19])                  # field 22 (starttime); comm may hold spaces
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def kill(pid: int) -> bool:
+    """Stop a process and, on Windows, its children (`taskkill /T /F`). True when the stop was made; False
+    when taskkill refused it (no such pid, access denied) or raised (T-0124: the escalation note says so)."""
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
-        else:
-            os.kill(pid, 9)
+            return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True).returncode == 0
+        os.kill(pid, 9)
         return True
     except Exception:
         return False

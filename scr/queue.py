@@ -7,6 +7,44 @@ from .graph import Graph
 from .score import rank_ready
 
 INBOX_MARK = "## Inbox"
+ESCALATED_MARK = "## Escalated by the Steward — your hand is needed"
+# A task in one of these statuses waits on Omri whatever its `queue` field says: the Steward has stopped
+# (escalated) or handed over (omri_queue). Before T-0109 only `queue: omri` items were listed, so the
+# hand merges of T-0076/T-0059/T-0058 (2026-09-21) were invisible in queues/omri.md.
+ESCALATED_STATUSES = {"escalated", "omri_queue"}
+NO_REVIEW = "no review.md"
+NO_DECISION = "no Decision line in review.md"
+TEMPLATE_DECISION = "accepted | returned (feedback below) | escalated (Gate N, reason)"   # templates/review.md:13, unfilled
+UNFILLED_DECISION = "review.md Decision not written (still the template line)"
+
+
+def decision_line(task_dir: Path) -> str:
+    """The Steward's verdict as written: the first paragraph after `## Decision` in review.md, joined into one
+    line (a Decision wrapped over several lines, as T-0067's, must not be cut mid-sentence). `no review.md` when
+    the file is absent; `no Decision line in review.md` when the heading is missing or empty; a template line
+    left unfilled is named as such rather than shown as if it were a verdict."""
+    p = task_dir / "review.md"
+    if not p.is_file():
+        return NO_REVIEW
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip().lower() == "## decision":
+            para: list[str] = []
+            for nxt in lines[i + 1:]:
+                if nxt.startswith("#") or (para and not nxt.strip()):
+                    break
+                if nxt.strip():
+                    para.append(nxt.strip())
+            text = " ".join(para)
+            if not text:
+                return NO_DECISION
+            return UNFILLED_DECISION if text == TEMPLATE_DECISION else text
+    return NO_DECISION
+
+
+def escalated_tasks(g: Graph) -> list:
+    """Open tasks that wait on Omri's hand by status, excluding `queue: omri` items (listed as decisions already)."""
+    return sorted((t for t in g.tasks.values() if t.status in ESCALATED_STATUSES and t.rec.get("queue") != "omri"), key=lambda t: t.id)
 
 
 def render_scribers(g: Graph, weights: dict, limits: dict) -> str:
@@ -48,6 +86,21 @@ def render_omri(g: Graph, existing: str | None) -> str:
         lines.append("")
         lines.append("Answer:")
         lines.append("")
+    # Escalated scriber tasks: a to-do list for Omri's hand. What to do is the review's Decision line, on the
+    # line itself; no `Answer:` slot (the Concierge applies answers only to queue: omri items, answers.py:37).
+    esc = escalated_tasks(g)
+    if esc:
+        lines += [ESCALATED_MARK, "",
+                  "Each of these stopped at the Steward and waits on you (status `escalated` or `omri_queue`); the Decision line is what to do. "
+                  "They stay here until the task leaves those statuses.", ""]
+        for t in esc:
+            lines.append(f"### {t.id} · {t.rec.get('kind')} · {t.rec.get('title','')}")
+            lines.append(f"Decision: {decision_line(t.dir)}")
+            wt = t.rec.get("worktree")
+            if wt:
+                lines.append(f"Worktree: `{wt}`")
+            lines.append(f"Status `{t.status}`. Review: `{t.dir.name}/review.md`")
+            lines.append("")
     # preserve the human inbox verbatim
     inbox = ""
     if existing and INBOX_MARK in existing:

@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
-from . import lifecycle
+from . import bgwait, lifecycle
 from .canon import ZERO
 from .events import EventLog, now_iso
 from .journal import journal
@@ -141,6 +141,14 @@ def cmd_task_field(args):
     root, store, log = _ctx(args)
     t = store.get(args.id)
     val = yaml.safe_load(args.value)
+    if args.field == bgwait.FIELD:
+        try:
+            val = bgwait.parse(val)
+        except ValueError as e:
+            raise RepoError(str(e)) from None
+        if bgwait.needs_omri(val) and args.actor != "omri":
+            raise RepoError(f"{args.id}: {bgwait.FIELD} = {val} min is over {bgwait.AUTH_LIMIT_MINUTES // 60} h; "
+                            "only Omri can authorize that (scr --actor omri task field ...)")
     cur = t.rec
     parts = args.field.split(".")
     for p in parts[:-1]:
@@ -357,9 +365,13 @@ def _print(lines):
 
 
 def cmd_land(args):
-    root, _, _ = _ctx(args)
-    from .ops import land
-    r = land(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
+    """One command for both landings (T-0119): ops.land_any routes a scriptorium task to land_scriptorium
+    (the watcher's land step), every other workload to the QI push/PR land()."""
+    root, store, _ = _ctx(args)
+    from .ops import is_scriptorium_task, land_any
+    if is_scriptorium_task(root, store, store.get(args.id)) and (args.no_pr or args.draft or args.merge):
+        print("scriptorium task: --merge is implied, --no-pr/--draft do not apply")
+    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
     _print(r["out"])
     if not r["ok"]:
         sys.exit(1)
@@ -368,16 +380,26 @@ def cmd_land(args):
 def cmd_sweep(args):
     root, _, _ = _ctx(args)
     from .ops import sweep
-    rows = sweep(root, merge=args.merge, dry_run=args.dry_run)
+    # --all (T-0202): the hygiene audit, one typed row per worktree of every workload; it fetches origin first
+    # unless --dry-run, which leaves every repo's git state as it found it
+    rows = sweep(root, merge=args.merge, dry_run=args.dry_run, wl_name=args.workload, all_workloads=args.all,
+                 fetch=args.all and not args.dry_run)
     if args.json:
         _out(rows, True); return
     for r in rows:
+        if r["kind"] != "dirty-mission":
+            print(f"--- {r['workload']}/{r['worktree']} ({r['branch']}): {r['kind']}" + (f" — {r['note']}" if r["note"] else ""))
+            continue
         print(f"=== {r['worktree']} ({r['branch']}): {r['files']} uncommitted file(s)" + (f" -> {r['sha']}" if r["sha"] else "") + (f" PR {r['url']}" if r["url"] else ""))
         for f in r["sample"]:
             print(f"  {f}")
         if r["note"]:
             print(f"  {r['note']}")
-    print("sweep: nothing to do" if not rows else f"sweep: {len(rows)} worktree(s)" + (" (dry run)" if args.dry_run else ""))
+    if args.all:
+        from .ops import HYGIENE_KINDS
+        print("sweep --all: " + ", ".join(f"{k} {sum(1 for r in rows if r['kind'] == k)}" for k in HYGIENE_KINDS) + (" (dry run)" if args.dry_run else ""))
+    else:
+        print("sweep: nothing to do" if not rows else f"sweep: {len(rows)} worktree(s)" + (" (dry run)" if args.dry_run else ""))
     if any(not r["ok"] for r in rows):
         sys.exit(1)
 
@@ -479,9 +501,11 @@ def cmd_ensure_main(args):
 
 def cmd_up(args):
     root, _, _ = _ctx(args)
-    from .admin import up, stop
+    from .admin import up, stop, stop_failed
     if args.stop:
-        _print(stop(root, "ui") + stop(root, "watch")); return
+        lines = stop(root, "ui") + stop(root, "watch")
+        _print(lines)
+        sys.exit(1 if stop_failed(lines) else 0)      # T-0156: a surviving process must not read as a made stop
     lines = up(root, ui_only=args.ui_only, restart=args.restart, register_logon=args.register, port=args.port, open_browser=not args.no_browser)
     _print(lines)
     (root / "reports").mkdir(exist_ok=True)      # `up` also runs windowless from the Desktop shortcut: keep a trace
@@ -560,6 +584,27 @@ def cmd_ack(args):
         f.write(args.key + "\n")
     EventLog(root / "events" / "events.jsonl").append("system", name="ack", actor=args.actor, note=args.key)
     print(f"acknowledged {args.key}")
+
+
+def cmd_notify(args):
+    """--test: one test message on every enabled channel of config/notify.yaml. Without it: the cards that stand
+    and whether the watcher has pushed each (T-0090)."""
+    root, _, _ = _ctx(args)
+    from . import notify
+    if args.test:
+        lines = notify.send_test(root)
+        print("\n".join(lines))
+        if any("FAILED" in ln for ln in lines):
+            sys.exit(1)
+        return
+    from .ui import acked_keys, needs_cards
+    sf = root / ".scr" / "watch.state.txt"
+    flags = set(sf.read_text(encoding="utf-8").split()) if sf.exists() else set()
+    cards = needs_cards(root)
+    new = {c["key"] for c in notify.pending(cards, flags, acked_keys(root))}
+    print(f"channels on: {', '.join(notify.enabled(notify.load(root))) or 'none'}; {len(cards)} card(s) stand, {len(new)} not yet pushed")
+    for c in cards:
+        print(f"  {'new   ' if c['key'] in new else 'pushed'}  {c['key']}  {c.get('title', '')[:80]}")
 
 
 def cmd_journal(args):
@@ -645,10 +690,15 @@ def build_parser() -> argparse.ArgumentParser:
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)
     j = sub.add_parser("journal", parents=[common], help="commit the scriptorium tree if dirty (journal mode; every mutating command does this itself)")
     j.add_argument("--note", default="journal"); j.add_argument("--push", action="store_true"); j.set_defaults(fn=cmd_journal)
-    ld = sub.add_parser("land", parents=[common], help="commit + push a task's worktree, open its PR (--merge: merge and mark merged)")
+    land_help = ("land a task: a scriptorium task via land_scriptorium (commit, merge the trunk in, tests, merge into the trunk, merged; "
+                 "--dry-run prints the plan, --no-pr/--draft/--merge do not apply); any other workload via the PR path "
+                 "(commit + push, open its PR; --merge: merge and mark merged)")
+    ld = sub.add_parser("land", parents=[common], help=land_help, description=land_help)
     ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true"); ld.set_defaults(fn=cmd_land)
     sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
-    sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true"); sw.set_defaults(fn=cmd_sweep)
+    sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true")
+    sw.add_argument("--all", action="store_true", help="hygiene audit: every workload, one typed row per worktree (dirty-mission/finished/phantom/orphan/locked/live); only dirty missions are committed")
+    sw.add_argument("--workload", help="the workload to sweep (default: the first in config/workloads.yaml)"); sw.set_defaults(fn=cmd_sweep)
     pk = sub.add_parser("park", parents=[common], help="returned -> escalated -> omri_queue"); pk.add_argument("id"); pk.add_argument("--note"); pk.set_defaults(fn=cmd_park)
     rt = sub.add_parser("retire", parents=[common], help="quarantine a merged worktree (move, never delete)"); rt.add_argument("name"); rt.add_argument("--execute", action="store_true"); rt.set_defaults(fn=cmd_retire)
     sp = sub.add_parser("spawn", parents=[common], help="worktree per dispatched task from origin/<main>"); sp.add_argument("--tasks", nargs="*"); sp.add_argument("--no-lake", action="store_true"); sp.set_defaults(fn=cmd_spawn)
@@ -676,6 +726,8 @@ def build_parser() -> argparse.ArgumentParser:
     an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
     ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
+    nt = sub.add_parser("notify", parents=[common], help="push channel for needs-you cards (config/notify.yaml): --test sends one test message per enabled channel")
+    nt.add_argument("--test", action="store_true"); nt.set_defaults(fn=cmd_notify)
     hx = sub.add_parser("hotfix", parents=[common], help="fix the tooling in place, as a recorded task: open <symptom> | close [id] --summary | test | status")
     hx.add_argument("op", choices=["open", "close", "test", "status"]); hx.add_argument("id", nargs="?"); hx.add_argument("text", nargs="?")
     hx.add_argument("--summary"); hx.add_argument("--unlock", action="append", help='"<title> | <why>" (repeatable)'); hx.add_argument("--discuss", action="store_true", help="open the Toolsmith session too")

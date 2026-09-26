@@ -1,0 +1,3 @@
+# T-0100: LF in the repo and in every checkout, whatever core.autocrlf says.
+# scr hashes docs/config with CRLF normalised to LF anyway (scr/store.py file_hash).
+* text=auto eol=lf

@@ -171,6 +171,7 @@ async function refresh() {
   $('#jDot').parentElement.title = j.last_failure ? 'last journal failure: ' + j.last_failure : 'the scriptorium repo journals itself; pending files are committed by the next command or watcher tick';
   $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency; $('#runN').textContent = STATE.running.length; $('#readyN').textContent = STATE.ready.length;
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
+  document.title = STATE.needs.length ? `(${STATE.needs.length}) Scriptorium` : 'Scriptorium';   // a pinned tab shows the count (T-0090)
   $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
   $('#pauseBtn').textContent = STATE.paused ? 'Resume' : 'Pause';
   renderNeeds(); renderLists(); renderTabs();
@@ -212,12 +213,16 @@ function renderNeeds() {
     const c = document.createElement('article'); c.className = 'card' + (running ? ' running' : '') + (CURRENT === n.id ? ' selected' : ''); c.dataset.type = n.type; if (n.name) c.dataset.name = n.name; c.tabIndex = 0;
     c.setAttribute('aria-label', `${n.type} ${n.id}: ${n.title}`);
     const top = document.createElement('div'); top.className = 'top';
-    const badge = n.type === 'system' && n.name ? n.name : n.type;   // system alarms wear their kind: scope_drift, session_dead, stale
+    const badge = (n.type === 'system' || n.type === 'gate') && n.name ? n.name : n.type;   // system alarms wear their kind (scope_drift, session_dead, stale); escalated tasks say escalated / slot_freed
     top.innerHTML = `<span class="badge ${n.type} ${esc(badge)}">${esc(badge)}</span> <span>${esc(n.id)}</span>` + (n.age_h ? `<span>· ${n.age_h} h</span>` : '') + (n.ts ? `<span>· ${fmtTs(n.ts)}</span>` : '') + (n.waiting && n.waiting.length ? `<span>· ${n.waiting.length} waiting</span>` : '');
     const title = document.createElement('div'); title.className = 'title'; title.textContent = n.title;
     c.append(top, title);
     if (n.text) { const t = document.createElement('div'); t.className = 'text'; t.textContent = n.text; c.append(t); }
     if (n.link) { const a = document.createElement('a'); a.href = n.link; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Open the page this needs ↗'; c.append(a); }
+    if (n.review) {   // escalated by the Steward (T-0109): the Decision line is n.text; the record's review is one click away
+      const a = document.createElement('a'); a.href = '#' + n.id; a.textContent = 'Open the review (' + n.review + ')'; a.onclick = e => { e.preventDefault(); TAB = 'review'; select(n.id); }; c.append(a);
+      if (n.worktree) { const w = document.createElement('div'); w.className = 'text'; w.style.fontFamily = 'var(--mono)'; w.style.fontSize = '12px'; w.textContent = 'worktree: ' + n.worktree; c.append(w); }
+    }
     const act = document.createElement('div'); act.className = 'actions';
     if (running) {
       const s = document.createElement('span'); s.className = 'status'; s.textContent = `in progress since ${fmtTs(job.started)}…`; act.append(s);
@@ -232,6 +237,7 @@ function renderNeeds() {
       } else {
         for (const o of (n.options || [])) act.append(actionButton(o, 'primary', () => answer(n, o)));
         act.append(actionButton('Answer…', '', () => { select(n.id); setTimeout(() => $('#answerText') && $('#answerText').focus(), 50); }));
+        if (n.type === 'gate' && n.h) act.append(actionButton('Dismiss', '', () => start({ kind: 'ack', key: n.h }, n.key)));   // silences an escalated card until its status changes again
       }
       const discussItem = n.type === 'chore' ? 'chore:' + n.id : (n.type === 'system' ? 'event:' + n.h : (n.type === 'hotfix' ? 'hotfix:' + n.id : n.id));
       act.append(actionButton('Discuss', '', () => start({ kind: 'discuss', item: discussItem }, 'discuss:' + discussItem)));
@@ -297,7 +303,35 @@ $('#discussGeneral').onclick = () => start({ kind: 'discuss', item: 'general' },
 $('#planTasks').onclick = () => start({ kind: 'discuss', item: 'plan' }, 'discuss:plan');
 $('#fixBug').onclick = () => { const sm = prompt('What is broken? (one line; the Toolsmith session opens with it)'); if (sm !== null && sm.trim()) start({ kind: 'hotfix_open', symptom: sm.trim() }, 'hotfix:new'); };
 $('#pauseBtn').onclick = () => start({ kind: STATE && STATE.paused ? 'resume' : 'pause' }, 'system:pause');
-$('#quitBtn').onclick = async () => { await start({ kind: 'quit' }, 'system:quit'); setTimeout(() => { document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; }, 1500); };
+// T-0155: poll /api/jobs for the job start() stored under key; the job once it is no longer running,
+// null if it still runs after ~15 s; throws when the server stops answering (a successful quit exits the UI).
+async function waitJob(key) {
+  const id = LOCAL.jobs[key];
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 750));
+    const job = (await api('/api/jobs')).find(x => x.id === id);
+    if (job && job.state !== 'running') return job;
+  }
+  return null;
+}
+$('#quitBtn').onclick = async () => {
+  const btn = $('#quitBtn'), shutDown = () => { if (POLL) { clearInterval(POLL); POLL = null; } document.body.innerHTML = '<div class="empty" style="padding:40px;font-size:18px">Scriptorium is shut down. Start it again from the Scriptorium shortcut on your Desktop.</div>'; };
+  document.querySelectorAll('.quitFail').forEach(e => e.remove());
+  delete LOCAL.jobs['system:quit'];               // a retry must not read the previous attempt's job
+  await start({ kind: 'quit' }, 'system:quit');
+  if (!LOCAL.jobs['system:quit']) return;         // start() already toasted the error
+  btn.disabled = true;
+  let job;
+  try { job = await waitJob('system:quit'); } catch (e) { shutDown(); return; }   // server gone: the quit went through
+  btn.disabled = false;
+  if (job && job.state === 'failed') {            // the watcher survived: the UI stays up, show why and let Quit be retried
+    const o = document.createElement('div'); o.className = 'out err quitFail';
+    o.textContent = '✖ Quit failed — the page stays up; press Quit to retry.\n' + (job.output || '(no output)');
+    o.title = 'click to dismiss'; o.onclick = () => o.remove();
+    $('#needs').before(o);
+  } else if (job) shutDown();                     // done: the server exits a second later
+  else toast('Quit is still running; press Quit again or check the watcher');
+};
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (e.key === 'r') refresh();
