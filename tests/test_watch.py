@@ -2316,6 +2316,7 @@ def test_watch_retire_refused_stands_while_the_worktree_does(world):
     root, _, _ = world
     w = Watcher(root, quiet=True)
     t = Store(root).get("T-0001")
+    t.rec["status"] = "merged"; t.save()                     # T-0209: the line (and the retry) are for a merged task only
     wt = task_worktree(workload_for(root, w.store, t), t)
     w.retire_refused("T-0001", "dirty")
     w.retire_refused_needs(w.store.load_all())
@@ -2548,6 +2549,90 @@ def test_retire_still_refuses_a_branch_not_in_origin_main(world):
     res = retire(root, "T-0001", execute=True)
     assert not res["ok"] and res["code"] == 2 and wt.exists(), res["out"]
     assert res["out"][-1].startswith("REFUSING: task/T-0001 is 2 commit(s) ahead of origin/master")
+
+
+# ---- T-0209: the watcher retries a refused retire of a merged task, at most hourly ------------------------------
+# 2026-09-25: seven retire_refused:<id>:2 flags (T-0115 among them) stood as NEEDS-YOU cards after T-0188 had fixed
+# the cause, because nothing ever called retire again.
+import scr.watch as watch_mod  # noqa: E402
+from scr.watch import LOG_FILE, STATE_FILE  # noqa: E402
+
+
+def _set_status(root: Path, tid: str, status: str) -> None:
+    t = Store(root).get(tid)
+    t.rec["status"] = status; t.save()
+
+
+def _counting_retire(monkeypatch) -> list:
+    calls, real = [], watch_mod.retire
+    monkeypatch.setattr(watch_mod, "retire", lambda root, tid, execute=False: calls.append(tid) or real(root, tid, execute=execute))
+    return calls
+
+
+def _retire_flags(w, tid: str = "T-0001") -> list[str]:
+    return sorted(k for k in w.flags if k.startswith((f"retire_refused:{tid}:", f"retire_retry:{tid}:")))
+
+
+def test_watch_retries_a_refused_retire_once_the_branch_is_merged(world):
+    """DoD: merged task, leftover worktree whose branch is in origin/master, a retire_refused:<id>:2 flag -> after one
+    tick the worktree is under <repo>-RETIRED/, no retire_refused flag remains and no need is raised."""
+    root, repo, wt = _retire_world(world, merged=True)
+    _set_status(root, "T-0001", "merged")
+    w = Watcher(root, quiet=True)
+    w.flags.add("retire_refused:T-0001:2")
+    res = w.tick()
+    assert not wt.exists() and list((repo.parent / f"{repo.name}-RETIRED").glob("*-T-0001/worktree/n1.txt"))
+    assert _retire_flags(w) == [] and "retire_refused:T-0001" not in [n["key"] for n in w.need_items], res["needs"]
+    assert not any("retire_refused:" in l for l in (root / STATE_FILE).read_text(encoding="utf-8").splitlines())
+    assert "T-0001 retire retry: worktree retired" in (root / LOG_FILE).read_text(encoding="utf-8")
+
+
+def test_watch_retire_retry_is_hourly_and_quiet_while_refused(world, monkeypatch):
+    """DoD: the branch still ahead -> flag and need stay; a second tick within the hour does not call retire, a tick
+    after the hour does. A repeat refusal with the same code adds no log line."""
+    root, repo, wt = _retire_world(world, merged=False)
+    _set_status(root, "T-0001", "merged")
+    calls = _counting_retire(monkeypatch)
+    w = Watcher(root, quiet=True)
+    w.flags.add("retire_refused:T-0001:2")
+    log = root / LOG_FILE
+
+    def tick() -> list[str]:
+        w.tick()
+        return [l for l in log.read_text(encoding="utf-8").splitlines() if "retire retry" in l or " retire: " in l] if log.exists() else []
+
+    lines = tick()
+    assert calls == ["T-0001"] and wt.exists() and lines == []
+    assert "retire_refused:T-0001:2" in w.flags and [n["key"] for n in w.need_items if n["task"] == "T-0001"] == ["retire_refused:T-0001"]
+    assert tick() == [] and calls == ["T-0001"]                               # within the hour: no second attempt
+    assert "retire_refused:T-0001" in [n["key"] for n in w.need_items]
+    old = f"retire_retry:T-0001:{datetime.now() - timedelta(minutes=61):%Y%m%dT%H%M%S}"
+    w.flags -= {k for k in w.flags if k.startswith("retire_retry:T-0001:")}
+    w.flags.add(old)
+    assert tick() == [] and calls == ["T-0001", "T-0001"]                     # after the hour: one more, still refused, still quiet
+    assert "retire_refused:T-0001:2" in w.flags and old not in w.flags
+    assert "retire_refused:T-0001" in [n["key"] for n in w.need_items]
+
+
+def test_watch_retire_retry_never_runs_off_merged_or_without_a_worktree(world, monkeypatch):
+    """DoD: a task that is no longer merged, or whose worktree is gone -> no retire call, the flag is dropped."""
+    root, _, _ = world
+    calls = _counting_retire(monkeypatch)
+    t = Store(root).get("T-0001")
+    wt = task_worktree(workload_for(root, Store(root), t), t)
+    wt.mkdir(parents=True)
+    for st in ("returned", "accepted", "in_progress"):
+        _set_status(root, "T-0001", st)
+        w = Watcher(root, quiet=True)
+        w.flags |= {"retire_refused:T-0001:2", "retire_retry:T-0001:20000101T000000"}
+        w.retire_refused_needs(w.store.load_all())
+        assert calls == [] and _retire_flags(w) == [] and w.need_items == [], st
+    shutil.rmtree(wt)
+    _set_status(root, "T-0001", "merged")
+    w = Watcher(root, quiet=True)
+    w.flags |= {"retire_refused:T-0001:2", "retire_retry:T-0001:20000101T000000"}
+    w.retire_refused_needs(w.store.load_all())
+    assert calls == [] and _retire_flags(w) == [] and w.need_items == []
 
 
 # ---- T-0187: out of usage credits is not a session death ---------------------------------------------------

@@ -1159,18 +1159,53 @@ class Watcher:
     def retire_refused(self, tid: str, code: str) -> None:
         """A merged task whose worktree retire was refused: its landing never runs again, so the line would stand for
         one tick only; the flag `retire_refused:<id>:<code>` keeps it raised while the worktree exists (T-0173)."""
-        for k in [k for k in self.flags if k.startswith(f"retire_refused:{tid}:")]:
+        for k in [k for k in self.flags if k.startswith((f"retire_refused:{tid}:", f"retire_retry:{tid}:"))]:
             self.unflag(k)
         self.flags.add(f"retire_refused:{tid}:{code}")
+        self.flags.add(f"retire_retry:{tid}:{datetime.now():%Y%m%dT%H%M%S}")   # the attempt just made (T-0209)
 
     def retire_refused_needs(self, tasks: dict) -> None:
+        """Each flagged task that is still `merged` with its worktree present gets its retire retried at most hourly
+        (T-0209); a success clears flag and line, a refusal keeps both. Anything else drops the flag."""
         for k in sorted(k for k in self.flags if k.startswith("retire_refused:")):
             _, tid, code = k.split(":", 2)
             t = tasks.get(tid)
-            if t is None or not task_worktree(workload_for(self.root, self.store, t), t).exists():
+            if t is None or t.status != "merged" or not task_worktree(workload_for(self.root, self.store, t), t).exists():
                 self.unflag(k)
+                for r in [r for r in self.flags if r.startswith(f"retire_retry:{tid}:")]:
+                    self.unflag(r)
+                continue
+            code = self._retry_retire(tid, code)
+            if code is None:
                 continue
             self.need(f"retire_refused:{tid}", f"{tid} merged; worktree retire refused ({code}) — see log", tid)
+
+    def _retry_retire(self, tid: str, code: str) -> str | None:
+        """Re-run a refused retire once the last attempt (flag `retire_retry:<id>:<stamp>`, kept across restarts) is an
+        hour old. Returns the standing refusal code, or None once the worktree is retired. The retire's lines are
+        logged only when the outcome differs from the flagged code: a repeat refusal leaves no hourly trace."""
+        last = [r for r in self.flags if r.startswith(f"retire_retry:{tid}:")]
+        try:
+            stamp = datetime.strptime(max(last).split(":", 2)[2], "%Y%m%dT%H%M%S") if last else None
+        except ValueError:
+            stamp = None
+        if stamp is not None and datetime.now() - stamp < timedelta(hours=1):
+            return code
+        try:
+            r = retire(self.root, tid, execute=True)
+        except Exception as e:  # noqa: BLE001
+            r = {"ok": False, "code": "error", "out": [str(e)]}
+        new = None if r["ok"] else str(r["code"])
+        if new != code:
+            self.log(f"{tid} retire retry: " + ("worktree retired" if new is None else f"refused ({code} -> {new})"))
+            for line in r["out"]:
+                self.log(f"  retire: {line}")
+        if new is None:
+            for k in [k for k in self.flags if k.startswith((f"retire_refused:{tid}:", f"retire_retry:{tid}:"))]:
+                self.unflag(k)
+            return None
+        self.retire_refused(tid, new)
+        return new
 
     def land_failed(self, t, res: dict, failed: set, scope_sig: str) -> bool:
         """A refused landing (land_scriptorium or the no-worktree land_any): the task stays accepted, a NEEDS-YOU
