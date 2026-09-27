@@ -253,10 +253,29 @@ function renderNeeds() {
 
 function renderLists() {
   const mk = (rows, fmt) => rows.length ? rows.map(fmt).join('') : '<div class="empty">—</div>';
-  $('#running').innerHTML = mk(STATE.running, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.status}${r.started ? ' · since ' + fmtTs(r.started) : ''}</span></div>`);
+  $('#running').innerHTML = mk(STATE.running, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.status}${r.started ? ' · since ' + fmtTs(r.started) : ''}</span>${takeoverBtn(r)}</div>`);
   $('#ready').innerHTML = mk(STATE.ready, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.kind}</span></div>`);
-  $('#recent').innerHTML = mk(STATE.recent, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.to} · ${fmtTs(r.ts)}</span></div>`);
+  $('#recent').innerHTML = mk(STATE.recent, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.to} · ${fmtTs(r.ts)}</span>${takeoverBtn(r)}</div>`);
   document.querySelectorAll('.row .id').forEach(el => el.onclick = () => select(el.dataset.id));
+  const sess = Object.fromEntries([...STATE.running, ...STATE.recent].filter(r => r.session).map(r => [r.id, r.session]));
+  document.querySelectorAll('.row button.takeover').forEach(el => el.onclick = () => takeOver(el.dataset.id, sess[el.dataset.id], false));
+}
+
+// T-0247: resume a headless session interactively (claude --resume in its own folder). A session still running is
+// stopped first, and only after Omri confirms; the watcher then leaves the task to him until he submits it.
+function takeoverBtn(r) {
+  const s = r.session;
+  return s ? `<button class="small takeover" data-id="${r.id}" title="${esc(s.kind)} session ${esc(s.session_id)}${s.alive ? ' (running: asks before stopping it)' : ''}${s.taken_over ? ' (already taken over)' : ''}">Take over</button>` : '';
+}
+
+function takeOver(id, s, phone) {
+  if (!s) { toast(id + ': no recorded session id'); return; }
+  let stop = false;
+  if (s.alive) {
+    if (!confirm(`${id}: its headless ${s.kind} session (pid ${s.pid}) is still running.\n\nStop it and resume it in a terminal${phone ? ' with Remote Control' : ''}? Anything it was doing mid-step may need to be re-run.`)) return;
+    stop = true;
+  }
+  start({ kind: 'takeover', task: id, stop, phone }, 'takeover:' + id);
 }
 
 async function select(id) {
@@ -273,6 +292,10 @@ async function select(id) {
     (d.worktree ? `<span class="status" title="${esc(d.worktree)}">worktree</span>` : '');
   const db = document.createElement('button'); db.className = 'small'; db.textContent = 'Discuss this ticket'; db.onclick = () => start({ kind: 'discuss', item: d.id }, 'discuss:' + d.id);
   hd.append(db);
+  if (d.session) {
+    hd.append(actionButton('Take over', '', () => takeOver(d.id, d.session, false)));
+    hd.append(actionButton('Take over (phone)', '', () => takeOver(d.id, d.session, true)));
+  }
   body.append(hd);
   if (need) {
     const ab = document.createElement('div'); ab.className = 'answerbox';

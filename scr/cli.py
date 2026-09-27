@@ -519,6 +519,14 @@ def cmd_discuss(args):
     _print(discuss(root, args.item, open_terminal=not args.print_only))
 
 
+def cmd_takeover(args):
+    root, _, _ = _ctx(args)
+    from .discuss import takeover
+    if not args.id and not args.session:
+        raise RepoError("name a task or --session <id>")
+    _print(takeover(root, args.id, session=args.session, stop=args.stop, phone=args.phone, open_terminal=not args.no_terminal))
+
+
 def cmd_config(args):
     root, store, log = _ctx(args)
     p = root / "config" / f"{args.file}.yaml"
@@ -734,6 +742,9 @@ def build_parser() -> argparse.ArgumentParser:
     hx.set_defaults(fn=cmd_hotfix)
     pl = sub.add_parser("plan", parents=[common], help="open a planning session (Intake + Prioritizer) to turn a conversation into tasks"); pl.add_argument("--print-only", action="store_true"); pl.set_defaults(fn=cmd_discuss, item="plan")
     dc = sub.add_parser("discuss", parents=[common], help="open a Claude Code session preloaded with a ticket's context"); dc.add_argument("item"); dc.add_argument("--print-only", action="store_true"); dc.set_defaults(fn=cmd_discuss)
+    to = sub.add_parser("takeover", parents=[common], help="resume a headless session interactively (claude --resume in its folder); --stop stops it first if it still runs")
+    to.add_argument("id", nargs="?"); to.add_argument("--session"); to.add_argument("--stop", action="store_true"); to.add_argument("--phone", action="store_true", help="with Remote Control")
+    to.add_argument("--no-terminal", action="store_true", help="record + stop as usual, print the resume command instead of opening it"); to.set_defaults(fn=cmd_takeover)
     ui = sub.add_parser("ui", parents=[common], help="serve the Scriptorium UI on localhost (Omri's entry point)")
     ui.add_argument("--port", type=int, default=8765); ui.add_argument("--no-browser", action="store_true"); ui.add_argument("--child", action="store_true", help=argparse.SUPPRESS); ui.set_defaults(fn=cmd_ui)
     return p
