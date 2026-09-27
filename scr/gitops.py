@@ -10,6 +10,7 @@ Everything here is a thin, testable wrapper around the git CLI. Two rules:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -144,7 +145,21 @@ class Git:
         return r.ok and any(l.strip() == remote_branch for l in r.out.splitlines())
 
     def branch_exists(self, name: str) -> bool:
-        return bool(self.run("branch", "--list", name).out.strip())
+        """rc-based and exact: `run` folds stderr into `.out`, so the old `bool(branch --list <name>)` read git's
+        `warning: ignoring ref with broken name refs/heads/main (1)` as a hit, and every spawn of a new branch
+        ran `worktree add` without -b -> `invalid reference: task/<id>` (2026-09-25 06:08 on, T-0244)."""
+        return self.ok("show-ref", "--verify", "--quiet", f"refs/heads/{name}")
+
+    def broken_refs(self) -> list[str]:
+        """The refs under refs/heads that git ignores with a warning (a broken name such as `main (1)`, left by a
+        file-sync conflict copy, or unreadable contents), e.g. ["refs/heads/main (1)"]. Git only reports them."""
+        r = self.run("for-each-ref", "--format=%(refname)", "refs/heads")
+        found: list[str] = []
+        for line in r.out.splitlines():
+            m = re.match(r"warning: ignoring (?:ref with broken name|broken ref) (refs/heads/.+?)\s*$", line)
+            if m and m.group(1) not in found:
+                found.append(m.group(1))
+        return found
 
     def remote_url(self) -> str:
         return self.run("remote", "get-url", "origin").out

@@ -294,7 +294,9 @@ def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, w
         if not wt.exists():
             r = g.worktree_add(wt, br, base)
             if not r.ok:
-                out.append(f"  worktree add failed: {r.out}"); continue
+                broken = g.broken_refs()
+                out.append(f"  worktree add failed: {r.out}" + (f" (broken ref(s) in {wl.repo.name}: {', '.join(broken)})" if broken else ""))
+                continue
             label = f"checkout HEAD ({g.branch()})" if base == "HEAD" else base
             out.append(f"  based on {label} @ {g.run('rev-parse', '--short', base).out}")
         else:

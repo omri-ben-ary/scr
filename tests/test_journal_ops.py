@@ -400,6 +400,66 @@ def test_paused_watcher_does_nothing(world):
     assert not Watcher(root, quiet=True).tick().get("paused")
 
 
+# ---- a broken ref under refs/heads never breaks spawn (T-0244) -----------------------------------------------
+def _repo_with_broken_ref(tmp_path: Path) -> tuple[Path, list[list[str]]]:
+    """A repo on `main` with one commit and a file `refs/heads/main (1)` (the sync conflict copy seen on
+    2026-09-25), plus a list that records every git argv the Git wrapper runs."""
+    repo = tmp_path / "r"; repo.mkdir()
+    git(repo, "init", "-q", "-b", "main"); git(repo, "commit", "-q", "--allow-empty", "-m", "x")
+    shutil.copy(repo / ".git" / "refs" / "heads" / "main", repo / ".git" / "refs" / "heads" / "main (1)")
+    return repo, []
+
+
+def _spy(g: Git, calls: list[list[str]]) -> Git:
+    run = g.run
+    g.run = lambda *a, **kw: (calls.append(list(a)), run(*a, **kw))[1]
+    return g
+
+
+def test_branch_exists_ignores_broken_ref_warning(tmp_path):
+    repo, calls = _repo_with_broken_ref(tmp_path)
+    assert "broken name" in subprocess.run(["git", "branch", "--list", "task/T-9999"], cwd=repo, capture_output=True, text=True).stderr
+    g = _spy(Git(repo), calls)
+    assert g.broken_refs() == ["refs/heads/main (1)"]
+    assert not g.branch_exists("task/T-9999")
+    assert g.branch_exists("main")
+    r = g.worktree_add(tmp_path / "wt", "task/T-9999", "HEAD")
+    assert r.ok, r.out
+    assert ["worktree", "add", "-b", "task/T-9999", str(tmp_path / "wt"), "HEAD"] in calls
+    assert Git(tmp_path / "wt").branch() == "task/T-9999"
+
+
+def test_worktree_add_reuses_existing_branch_despite_broken_ref(tmp_path):
+    repo, calls = _repo_with_broken_ref(tmp_path)
+    git(repo, "branch", "task/T-9998")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "y")               # main moves on; the branch stays behind
+    g = _spy(Git(repo), calls)
+    assert g.branch_exists("task/T-9998")
+    r = g.worktree_add(tmp_path / "wt", "task/T-9998", "HEAD")
+    assert r.ok, r.out
+    assert ["worktree", "add", str(tmp_path / "wt"), "task/T-9998"] in calls
+    assert not any("-b" in c for c in calls if c[:2] == ["worktree", "add"])
+    assert git(tmp_path / "wt", "rev-parse", "HEAD") == git(repo, "rev-parse", "task/T-9998")
+
+
+def test_watch_reports_broken_ref_once(world):
+    from scr.watch import Watcher
+    root, _, _ = world
+    heads = root / ".git" / "refs" / "heads"
+    shutil.copy(heads / "main", heads / "main (1)")
+    res = Watcher(root, quiet=True).tick()
+    lines = [n for n in res["needs"] if "main (1)" in n]
+    assert len(lines) == 1 and "_to_delete" in lines[0] and "never delete" in lines[0], res["needs"]
+    res2 = Watcher(root, quiet=True).tick()
+    assert len([n for n in res2["needs"] if "main (1)" in n]) == 1              # the line stands while the ref does
+    assert len(_named(root, "broken_ref", task=None)) == 1                      # ...but one event, not one per tick
+    (root / ".git" / "_to_delete").mkdir()
+    shutil.move(str(heads / "main (1)"), str(root / ".git" / "_to_delete" / "main (1)"))
+    res3 = Watcher(root, quiet=True).tick()
+    assert not any("main (1)" in n for n in res3["needs"])
+    assert not any(k.startswith("broken_ref:") for k in Watcher(root, quiet=True).flags)
+
+
 # ---- multi-workload dispatch (T-0036) + the unblock cascade on the land path (T-0040) ---------------
 def test_spawn_honours_task_workload(world):
     root, repo, _ = world

@@ -719,6 +719,7 @@ class Watcher:
 
         if ok:
             self.hygiene_pass()
+        self.broken_ref_check()
 
         if self.auto_intake and ok:
             nightly = datetime.now().hour == 22 and self.flag(f"intake:{datetime.now():%Y-%m-%d}")
@@ -779,6 +780,43 @@ class Watcher:
                                                                 note=f"{rel}: {counts or 'no worktrees'}")
         self.log(f"hygiene digest {rel}: {counts or 'no worktrees'}")
         return path
+
+    # ---- a broken ref under refs/heads (T-0244) -----------------------------------------------------------------------
+    def broken_ref_check(self) -> list[str]:
+        """Every tick: the refs git ignores under refs/heads in the checkout and each workload repo. A file like
+        `.git/refs/heads/main (1)` (a sync conflict copy) made git warn on every branch listing and, until T-0244,
+        broke every spawn of a new branch. Each one is ONE standing needs line (key `broken_ref:<repo>:<ref>`, so
+        the card and its push are deduped) naming the file and the hand step, and ONE `broken_ref` system event
+        the first time it is seen (flag); the flag is dropped when the ref is gone. Never removes anything."""
+        repos = {self.root.resolve()}
+        for name in (self.store.config("workloads") or {}):
+            try:
+                repos.add(workload(self.root, self.store, name).repo)
+            except Exception:  # noqa: BLE001 — a bad workload entry is someone else's needs line
+                pass
+        seen: list[str] = []
+        for repo in sorted(repos):
+            if not (repo / ".git").exists():
+                continue
+            g = Git(repo)
+            refs = g.broken_refs()
+            if not refs:
+                continue
+            gd = g.common_dir()
+            for ref in refs:
+                key = f"broken_ref:{repo.name}:{ref}"
+                seen.append(key)
+                loose = gd / ref
+                where = str(loose) if loose.exists() else f"{gd / 'packed-refs'} (line `{ref}`)"
+                text = (f"Broken git ref `{ref}` in {repo.name}: git ignores it and warns on every branch listing. "
+                        f"By hand: move {where} aside under {gd / '_to_delete'}/ (never delete it)")
+                self.need(key, text)
+                if self.flag(key):
+                    EventLog(self.root / "events" / "events.jsonl").append("system", name="broken_ref", actor="steward-watch", note=text)
+                    self.log(f"broken ref: {repo.name} {ref}")
+        for k in [k for k in self.flags if k.startswith("broken_ref:") and k not in seen]:
+            self.unflag(k)
+        return seen
 
     # ---- out of usage credits is not a session death (T-0187) ------------------------------------------
     def credits_paused(self, now: datetime) -> dict | None:
