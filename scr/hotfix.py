@@ -28,13 +28,16 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 from .events import EventLog, now_iso
 from .gitops import Git
+from .ops import LAND_TEST_TIMEOUT_KEY, land_test_timeout
 from .store import Store
 
 TOOLING = ("scr/", "ui/", "tests/", "agents/", "templates/", "config/", "hooks/", "pyproject.toml", "README.md", ".gitignore")
@@ -150,25 +153,34 @@ Rules:
 """
 
 
-def run_tests(root: Path, timeout: int = 1800) -> tuple[int, str]:
+def run_tests(root: Path, timeout: int | None = None) -> tuple[int, str]:
     store = Store(root)
+    if timeout is None:     # the landing's limit (limits.yaml land_test_timeout_seconds): same suite, same budget (T-0186 fold)
+        timeout = land_test_timeout(store)
     cmd = ((store.config("workloads") or {}).get(WORKLOAD) or {}).get("tests")
     if not cmd:
         cmd = f"{root / '.venv' / 'Scripts' / 'python.exe'} -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q"
     argv = shlex.split(cmd, posix=(os.name != "nt"))
     if os.name == "nt":
         argv = [a.strip('"') for a in argv]
-    if not Path(argv[0]).exists() and argv[0].endswith("python.exe"):
-        import sys
-        argv[0] = sys.executable
+    # Resolve the program against the root, not the process cwd: `.venv/Scripts/python.exe` in workloads.yaml
+    # is relative to the checkout, and on Windows CreateProcess does not resolve a relative forward-slash
+    # program name even when cwd=root (T-0131: WinError 2 from any directory). An absolute, native path
+    # launches everywhere; a bare name (`python`, `pytest`) stays a PATH lookup.
+    exe = Path(argv[0])
+    if not exe.is_absolute() and (len(exe.parts) > 1 or not shutil.which(argv[0])):
+        if (root / exe).exists():
+            argv[0] = os.path.abspath(root / exe)        # absolute + native separators; abspath keeps a linked .venv under root (resolve would follow the junction)
+        elif exe.name.lower().startswith("python"):      # a missing python.exe: this interpreter (same venv on a linked worktree)
+            argv[0] = sys.executable
     env = {**os.environ, "SCR_NO_JOURNAL": "1"}
     try:
         r = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=timeout, env=env, encoding="utf-8", errors="replace")
         return r.returncode, (r.stdout + r.stderr)[-6000:]
     except subprocess.TimeoutExpired:
-        return 124, "tests timed out"
+        return 124, f"tests timed out after {timeout}s (raise {LAND_TEST_TIMEOUT_KEY} in config/limits.yaml)"
     except FileNotFoundError as e:
-        return 127, f"test command not found: {e}"
+        return 127, f"test command not found: {argv[0]} (from `tests: {cmd}` in config/workloads.yaml, resolved against {root}): {e}"
 
 
 PENDING = ".scr/hotfix/pending.json"    # {"who": ..., "symptom": ...} dropped by an external agent BEFORE it edits files

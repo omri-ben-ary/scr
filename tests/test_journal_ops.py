@@ -565,6 +565,76 @@ def test_hotfix_lifecycle(world, monkeypatch):
     assert r.returncode == 1 and Store(root).get(tid2).status == "omri_queue"
 
 
+def _set_tests_cmd(root: Path, cmd: str) -> None:
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "tests": cmd}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+
+
+def test_hotfix_run_tests_resolves_relative_command_against_root(world, monkeypatch, tmp_path):
+    """T-0131: `tests: .venv/Scripts/python.exe -m pytest tests -q` is relative to the checkout. Windows'
+    CreateProcess does not resolve a relative forward-slash program name even with cwd=root, so run_tests
+    hands subprocess an absolute native path; the process cwd is irrelevant."""
+    from scr import hotfix
+    root, _, _ = world
+    (root / "tools").mkdir(); (root / "tools" / "fake-python.exe").write_bytes(b"")
+    _set_tests_cmd(root, "tools/fake-python.exe -m pytest tests -q")
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv); seen["cwd"] = kw.get("cwd"); seen["env"] = kw.get("env")
+        return subprocess.CompletedProcess(argv, 0, "3 passed", "")
+    monkeypatch.setattr(hotfix.subprocess, "run", fake_run)
+    monkeypatch.chdir(tmp_path)                                   # somewhere that is NOT the root
+    rc, out = hotfix.run_tests(root)
+    assert rc == 0 and "3 passed" in out
+    exe = Path(seen["argv"][0])
+    assert exe.is_absolute() and exe.exists() and exe.resolve() == (root / "tools" / "fake-python.exe").resolve(), seen
+    assert seen["argv"][1:] == ["-m", "pytest", "tests", "-q"] and Path(seen["cwd"]) == root
+    assert seen["env"]["SCR_NO_JOURNAL"] == "1"
+    # a bare name is left to the PATH lookup, untouched
+    _set_tests_cmd(root, "pytest tests -q")
+    hotfix.run_tests(root)
+    assert seen["argv"][0] == "pytest"
+
+
+def test_hotfix_run_tests_missing_command_fails_loudly(world, monkeypatch, tmp_path):
+    """A test command whose program exists nowhere is a non-zero rc naming that program, from run_tests
+    and from `scr hotfix test` alike, never a silent 'tests ran'."""
+    from scr import hotfix
+    root, _, _ = world
+    _set_tests_cmd(root, "tools/no-such-runner.exe tests -q")
+    monkeypatch.chdir(tmp_path)
+    rc, out = hotfix.run_tests(root)
+    assert rc != 0 and "no-such-runner.exe" in out and "not found" in out, (rc, out)
+    r = scr(root, "--actor", "hotfix:agent", "hotfix", "test", check=False)
+    assert r.returncode == rc and "no-such-runner.exe" in r.stdout, (r.returncode, r.stdout, r.stderr)
+
+
+def test_hotfix_run_tests_timeout_follows_land_test_timeout(world, monkeypatch):
+    """T-0131 (T-0186 fold): hotfix test/close run the same suite as the landing, so they share its limit,
+    limits.yaml land_test_timeout_seconds, instead of a hardcoded 1800 s; an explicit timeout still wins."""
+    from scr import hotfix
+    root, _, _ = world
+    _set_tests_cmd(root, "pytest tests -q")
+    lim = root / "config" / "limits.yaml"
+    cfg = yaml.safe_load(lim.read_text()) if lim.exists() else {}
+    lim.write_text(yaml.safe_dump({**(cfg or {}), "land_test_timeout_seconds": 4321}))
+    seen: list = []
+
+    def fake_run(argv, **kw):
+        seen.append(kw.get("timeout"))
+        if len(seen) == 3:
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        return subprocess.CompletedProcess(argv, 0, "1 passed", "")
+    monkeypatch.setattr(hotfix.subprocess, "run", fake_run)
+    hotfix.run_tests(root)
+    hotfix.run_tests(root, timeout=7)
+    rc, out = hotfix.run_tests(root)
+    assert seen == [4321, 7, 4321]
+    assert rc == 124 and "4321" in out and "land_test_timeout_seconds" in out, out
+
+
 def test_discuss_hotfix_is_toolsmith_in_root(world):
     from scr.discuss import build
     root, _, _ = world
