@@ -93,6 +93,25 @@ def _events(root: Path, task: str | None = None, n: int = 200) -> list[dict]:
     return rows[-n:]
 
 
+def session_cards(root: Path, tids: set[str]) -> dict[str, dict]:
+    """task -> the newest headless session recorded for it (T-0247), for the cards `tids` the page shows:
+    {session_id, kind, pid, alive, taken_over}. The Take over button reads it; `alive` means the button asks
+    before it stops that pid. A task launched before T-0247 has no recorded id and no entry."""
+    from .discuss import session_alive
+    from .watch import takeover_of
+    events = EventLog(root / "events" / "events.jsonl").read()
+    out: dict[str, dict] = {}
+    for e in events:
+        d = e.get("data") or {}
+        if e.get("kind") == "system" and e.get("name") == "launch" and e.get("task") in tids and d.get("session_id"):
+            out[e["task"]] = {**d, "task": e["task"]}
+    for tid, rec in out.items():
+        tk = takeover_of(events, tid)
+        out[tid] = {"session_id": rec["session_id"], "kind": rec.get("kind") or "scriber", "pid": rec.get("pid"),
+                    "alive": session_alive(rec), "taken_over": bool(tk and not tk["ended"])}
+    return out
+
+
 def _age_h(ts: str | None) -> float | None:
     if not ts:
         return None
@@ -341,6 +360,12 @@ def state(root: Path) -> dict:
             recent.append({"id": e["task"], "to": e["to"], "ts": e.get("ts"), "title": tasks[e["task"]].rec.get("title", "")})
         if len(recent) >= 12:
             break
+    try:
+        sessions = session_cards(root, {r["id"] for r in running + recent})
+    except Exception:  # noqa: BLE001 — the Take over buttons are optional; the page must render
+        sessions = {}
+    for r in running + recent:
+        r["session"] = sessions.get(r["id"])
     watch_log = root / "reports" / "steward_watch.log"
     last_tick = datetime.fromtimestamp(watch_log.stat().st_mtime, tz=timezone.utc).isoformat() if watch_log.exists() else None
     from .cli import refresh
@@ -378,7 +403,8 @@ def task_detail(root: Path, tid: str) -> dict:
     return {"id": t.id, "rec": t.rec, "docs": docs, "events": _events(root, tid, 300),
             "options": _options(docs["spec"]), "help": _help_lines(docs["log"]),
             "blocks": sorted(g.succ(g.blocks).get(tid, [])), "blocked_by": t.rec.get("blocked_by") or [],
-            "worktree": str((root / (t.rec.get("worktree") or "")).resolve()) if t.rec.get("worktree") else None}
+            "worktree": str((root / (t.rec.get("worktree") or "")).resolve()) if t.rec.get("worktree") else None,
+            "session": session_cards(root, {tid}).get(tid)}
 
 
 def read_file(root: Path, rel: str) -> dict:
@@ -501,6 +527,12 @@ def run_action(root: Path, data: dict) -> dict:
         item = data["item"]
         from .discuss import discuss
         return JOBS.start("discuss", f"discuss:{item}", f"discuss {item}", lambda: {"ok": True, "output": "\n".join(discuss(root, item))})
+    if kind == "takeover":
+        # T-0247: the page asked Omri before sending stop=true for a live session; without it a live one is refused
+        tid, stop, phone = data["task"], bool(data.get("stop")), bool(data.get("phone"))
+        from .discuss import takeover
+        return JOBS.start("takeover", f"takeover:{tid}", f"take over {tid}" + (" (phone)" if phone else ""),
+                          lambda: {"ok": True, "output": "\n".join(takeover(root, tid, stop=stop, phone=phone))})
     if kind == "inbox":
         from .answers import add_inbox
         return JOBS.start("inbox", "inbox", data["text"][:60], lambda: add_inbox(root, data["text"]))

@@ -17,6 +17,8 @@ Per tick:
                     one whose transcript ends in the credit-exhaustion line is no death at all (T-0187): ready with
                     its attempt refunded, and ONE credits_exhausted event pauses auto-dispatch and reviews (one
                     `credits` needs line) for credits_pause_minutes or until a credits_resumed / watcher_resumed event
+    takeover     a `takeover` event (scr takeover, T-0247) makes the run Omri's: no dead check, no stale, no HELP
+                    escalation, no dispatch timeout, no relaunch; one needs line once its terminal closed unsubmitted
     heartbeat    checkpoint -> in_progress
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
@@ -62,7 +64,7 @@ from .journal import journal
 from .lifecycle import requeue
 from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
                   scope_drift, self_workload, sweep, task_worktree, workload, workload_for)
-from .run import kill, pid_alive, process_created, scr_cmd, start_claude
+from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, session_argv, start_claude
 from .state import State
 from .store import Store
 
@@ -168,6 +170,37 @@ def submitted_since(events: list[dict], tid: str) -> datetime | None:
     return since
 
 
+def is_scriber_launch(e: dict) -> bool:
+    """A `launch` event of a task's SCRIBER session. Since T-0247 every headless session records one (`data.kind`
+    review / tooling-review / concierge / intake too); only `scriber`, or no kind at all (the events recorded
+    before T-0247), is the run the dead check, the dispatch timeout and the escalation stop are about."""
+    return (e.get("kind") == "system" and e.get("name") == "launch"
+            and (e.get("data") or {}).get("kind") in (None, "scriber"))
+
+
+def takeover_of(events: list[dict], tid: str) -> dict | None:
+    """The takeover standing on the task's current run, or None (T-0247): {ts, session_id, ended} from the newest
+    `takeover` event, `ended` the ts of a later `takeover_ended` (the resumed terminal closed) or None. A new run
+    (dispatched -> in_progress), a new scriber launch or a `takeover_aborted` (the headless pid could not be
+    stopped, so nothing was resumed) ends it. While one stands the task is Omri's: its headless session ending is
+    no death, it is not relaunched, costs no attempt, is never stale and never escalated for a HELP line."""
+    cur: dict | None = None
+    for e in events:
+        if e.get("task") != tid:
+            continue
+        if e.get("kind") == "state" and e.get("to") == "in_progress" and e.get("from") == "dispatched":
+            cur = None
+        elif is_scriber_launch(e):
+            cur = None
+        elif e.get("kind") == "system" and e.get("name") == "takeover":
+            cur = {"ts": e.get("ts"), "session_id": (e.get("data") or {}).get("session_id"), "ended": None}
+        elif e.get("kind") == "system" and e.get("name") == "takeover_ended" and cur:
+            cur["ended"] = e.get("ts")
+        elif e.get("kind") == "system" and e.get("name") == "takeover_aborted":
+            cur = None
+    return cur
+
+
 def dispatch_stale(events: list[dict], tid: str, minutes: float, now: datetime) -> dict | None:
     """{since, age_min} when the task's CURRENT dispatch — its newest `dispatched` state event — is older than
     `minutes` and no `launch` system event follows it in the log (T-0122). The launcher (scr/launch.py)
@@ -182,8 +215,8 @@ def dispatch_stale(events: list[dict], tid: str, minutes: float, now: datetime) 
             continue
         if e.get("kind") == "state" and e.get("to") == "dispatched":
             since, launched = _event_ts(e), False
-        elif e.get("kind") == "system" and e.get("name") == "launch":
-            launched = True
+        elif is_scriber_launch(e) or (e.get("kind") == "system" and e.get("name") == "takeover"):
+            launched = True                          # a task Omri took over is his, never timed out (T-0247)
     if since is None or launched:
         return None
     age_min = (now - since).total_seconds() / 60
@@ -410,7 +443,7 @@ class Watcher:
                 continue
             if e.get("kind") == "state" and e.get("to") == "in_progress" and e.get("from") == "dispatched":
                 launch = None
-            elif e.get("kind") == "system" and e.get("name") == "launch":
+            elif is_scriber_launch(e):
                 launch = e
         if not launch:
             return None
@@ -607,8 +640,19 @@ class Watcher:
                 self.unflag(f"report_unfinished:{t.id}")
             # A finished session with a report is a submission, never a death; a session that is gone
             # without one has nothing left to submit -> returned (dispatch relaunches it when ready).
-            sess = self.session_of(t) if t.status in DEAD_CHECK_STATUSES else None
+            # A task Omri took over (T-0247) is his: no dead check (its headless pid was stopped on purpose), no
+            # stale alarm; report.md still submits it. The log is re-read before a death is acted on, so a takeover
+            # written after this tick read the events still wins over the pid it stopped.
+            tk = takeover_of(self.read_events(), t.id) if t.status in DEAD_CHECK_STATUSES else None
+            sess = self.session_of(t) if t.status in DEAD_CHECK_STATUSES and not tk else None
             dead = self.session_dead(t, sess) if sess and not submitted else None
+            if dead and (tk := takeover_of(EventLog(self.root / "events" / "events.jsonl").read(), t.id)):
+                dead = None
+            if tk:
+                flags.append("TAKEOVER" + (" ended" if tk["ended"] else ""))
+                if tk["ended"] and not submitted:
+                    self.need(f"takeover:{t.id}", f"{t.id} takeover session ended without report.md — resume it again (Take over), "
+                              f"or `scr task set {t.id} submitted` / `returned`", t.id)
             if ok and submitted and t.status != "submitted":
                 if t.status == "checkpoint":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "in_progress", "--quiet")
@@ -642,7 +686,7 @@ class Watcher:
                 if t.status == "in_progress":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "checkpoint", "--quiet")
                 self.scr(f"steward:{t.id}", "task", "set", t.id, "in_progress", "--quiet")
-            if idle >= self.stale and not dead:
+            if idle >= self.stale and not dead and not tk:
                 flags.append(f"STALE {idle}m")
                 alive = f"pid {sess['pid']} is alive" if sess else "no recorded pid to check"
                 self.need(f"stale:{t.id}", f"{t.id} silent for {idle} min ({alive}) — is its session hung?", t.id)
@@ -974,8 +1018,8 @@ class Watcher:
                           f"delete `review:{t.id}` from .scr/watch.state.txt after `scr task set {t.id} returned` + `ready`")
             elif t.status in {"in_progress", "checkpoint"}:
                 log_md = t.dir / "log.md"
-                if not log_md.exists():
-                    continue
+                if not log_md.exists() or takeover_of(events, t.id):
+                    continue                        # under takeover Omri is in the session: his HELP lines hold nothing
                 seen: dict[str, datetime] = {}
                 for e in events:
                     if e.get("kind") == "system" and e.get("name") == "help" and e.get("task") == t.id and e.get("note") and e["note"] not in seen:
@@ -1242,10 +1286,13 @@ class Watcher:
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
         if not wt.exists():
             self.log(f"{t.id} cannot start review: worktree missing"); self.unflag(f"review:{t.id}"); return
-        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode, root=self.root)
+        sid = new_session_id()
+        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode, root=self.root, session_id=sid)
         if pid:
-            self.log(f"{t.id} review session started (pid {pid}) -> {tr}")
+            self.log(f"{t.id} review session started (pid {pid}, session {sid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid}", "--quiet")
+            record_launch(self.root, "review", t.id, pid, sid, wt, session_argv(wt, root=self.root, permission_mode=self.permission_mode,
+                          session_id=sid), data={"transcript": tr.name})
         else:
             self.log(f"{t.id} cannot start review: claude not on PATH"); self.unflag(f"review:{t.id}")
 
@@ -1271,10 +1318,13 @@ class Watcher:
         bf = t.dir / "review-brief.txt"
         bf.write_text(brief, encoding="utf-8")
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
-        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode, root=self.root)
+        sid = new_session_id()
+        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode, root=self.root, session_id=sid)
         if pid:
-            self.log(f"{t.id} tooling review session started (pid {pid}) -> {tr}")
+            self.log(f"{t.id} tooling review session started (pid {pid}, session {sid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid} (tooling)", "--quiet")
+            record_launch(self.root, "tooling-review", t.id, pid, sid, self.root, session_argv(
+                self.root, root=self.root, permission_mode=self.permission_mode, session_id=sid), data={"transcript": tr.name})
         else:
             self.log(f"{t.id} cannot start review: claude not on PATH"); self.unflag(f"review:{t.id}")
 

@@ -2,7 +2,6 @@
 hooks/launch_dispatched.ps1 and hooks/intake_run.ps1)."""
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -13,7 +12,8 @@ from . import bgwait
 from .brief import brief_for
 from .events import EventLog
 from .ops import spawn, task_worktree, workload_for
-from .run import claude_bin, permission_mode_for, process_created, scr_cmd, session_argv, start_claude
+from .run import (claude_bin, new_session_id, permission_mode_for, process_created, record_launch, scr_cmd, session_argv,
+                  start_claude)
 from .store import Store
 
 
@@ -72,18 +72,20 @@ def launch(root: Path, tids: list[str] | None = None, mode: str = "headless", pe
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"\n- {stamp} [launcher] headless scriber session started (permission-mode {permission_mode}); "
                         f"background-wait ceiling {bgwait.describe(ceiling.get(tid))}\n")
+            sid = new_session_id()                                 # resumable by `scr takeover` (T-0247)
+            argv = session_argv(wt, root=root, permission_mode=permission_mode, model=model, session_id=sid) or []
             pid = start_claude(wt, bf, tr, permission_mode=permission_mode, model=model, root=root,
-                               env_extra=bgwait.env_for(ceiling.get(tid)) or None)
+                               env_extra=bgwait.env_for(ceiling.get(tid)) or None, session_id=sid)
             created = process_created(pid) if pid else None      # the pid's identity: None if it already died (T-0147)
             with log_md.open("a", encoding="utf-8") as f:
                 f.write(f"- {stamp} [launcher] pid {pid}, transcript {tr}\n")
+                f.write(f"- {stamp} [launcher] session {sid} (cwd {Path(wt).resolve()}; take over: scr takeover {tid})\n")
             # the watcher re-checks this pid and this transcript's .err every tick (T-0063): both go in `data`,
             # the note stays human-readable (and is the fallback for events recorded before `data` existed);
             # `created` lets it tell this session from a later process that reused the pid (T-0147)
-            scr_cmd(root, f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid, "--note", f"headless pid {pid}",
-                    "--data", json.dumps({"pid": pid, "transcript": tr.name, "created": created,
-                                          "bg_wait_minutes": ceiling.get(tid)}), "--quiet")
-            out.append(f"  headless pid {pid}; transcript {tr}")
+            record_launch(root, "scriber", tid, pid, sid, wt, argv, note=f"headless pid {pid}",
+                          data={"transcript": tr.name, "created": created, "bg_wait_minutes": ceiling.get(tid)})
+            out.append(f"  headless pid {pid}; session {sid}; transcript {tr}")
         else:
             ps1 = t.dir / "launch.ps1"     # a script, not an inline command: wt splits command lines on ';'
             from .discuss import ps_quote
@@ -133,18 +135,24 @@ End with: scr event system --name intake_ran --note '<n created>'; scr verify.
 
 
 def intake(root: Path, dry_run: bool = False, timeout: int = 3600) -> list[str]:
-    argv = session_argv(root, root=root)          # the config permission mode (scr/run.py), cwd = the root
+    sid = new_session_id()
+    argv = session_argv(root, root=root, session_id=sid)   # the config permission mode (scr/run.py), cwd = the root
     if not argv:
         return ["claude not on PATH — intake skipped"]
     scr = root / ".venv" / "Scripts" / "scr.exe"
     brief = INTAKE_BRIEF.format(root=root, scr=scr if scr.exists() else "scr", dry="DRY RUN: do not create anything; print what you would create." if dry_run else "")
     out_file = root / "reports" / f"intake-{datetime.now():%Y%m%d-%H%M%S}.txt"
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    # Popen, not run: the pid and the session id go on record BEFORE the wait, so an Intake that runs for 17
+    # minutes can be taken over while it runs (`scr takeover --session <id>`, T-0247)
+    p = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", errors="replace")
+    record_launch(root, "intake", None, p.pid, sid, root, argv, actor="steward-watch", data={"transcript": out_file.name})
     try:
-        r = subprocess.run(argv, input=brief, cwd=root,
-                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-        text = r.stdout + r.stderr
+        so, se = p.communicate(input=brief, timeout=timeout)
+        text = (so or "") + (se or "")
     except subprocess.TimeoutExpired:
+        p.kill()
         text = "intake timed out"
     out_file.write_text(text, encoding="utf-8")
     EventLog(root / "events" / "events.jsonl").append("system", name="intake_run", actor="steward-watch", note=str(out_file.name))

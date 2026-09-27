@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from .events import now_iso
-from .run import claude_bin, scr_cmd, start_claude
+from .run import claude_bin, new_session_id, record_launch, scr_cmd, session_argv, start_claude
 from .store import RepoError, Store
 
 GATE_TARGETS = {"accept": "accepted", "return": "triaged", "reject": "rejected"}
@@ -95,7 +95,13 @@ def start_concierge(root: Path, tid: str, answer: str) -> int | None:
     bf = root / ".scr" / f"concierge-{tid}-{int(time.time())}.txt"
     bf.parent.mkdir(exist_ok=True)
     bf.write_text(brief, encoding="utf-8")
-    return start_claude(root, bf, root / "reports" / f"concierge-{tid}-{int(time.time())}.txt", root=root)
+    tr = root / "reports" / f"concierge-{tid}-{int(time.time())}.txt"
+    sid = new_session_id()                            # recorded so `scr takeover` can resume it (T-0247)
+    pid = start_claude(root, bf, tr, root=root, session_id=sid)
+    if pid:
+        record_launch(root, "concierge", tid, pid, sid, root, session_argv(root, root=root, session_id=sid),
+                      actor="concierge", data={"transcript": tr.name})
+    return pid
 
 
 def add_inbox(root: Path, text: str, actor: str = "omri") -> dict:

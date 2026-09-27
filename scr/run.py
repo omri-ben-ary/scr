@@ -2,11 +2,13 @@
 (so each call journals itself), and start Claude Code sessions detached."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 _LOCK = threading.Lock()
@@ -98,13 +100,20 @@ def permission_mode_for(root: Path | None) -> str:
     return str(mode).strip() if mode else DEFAULT_PERMISSION_MODE
 
 
+def new_session_id() -> str:
+    """A fresh Claude Code session id (`--session-id` wants a valid UUID; claude 2.1.283, T-0247)."""
+    return str(uuid.uuid4())
+
+
 def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | None = None, model: str | None = None,
-                 extra: list[str] | None = None) -> list[str] | None:
-    """The argv of a headless session: `claude -p --permission-mode <mode> --output-format text`, plus
-    `--add-dir <root>` when it runs somewhere other than the scriptorium root (a task worktree) so it can
-    read tasks/<id>/ and agents/. `permission_mode=None` means the config default (permission_mode_for)."""
+                 extra: list[str] | None = None, session_id: str | None = None) -> list[str] | None:
+    """The argv of a headless session: `claude -p --session-id <uuid> --permission-mode <mode> --output-format text`,
+    plus `--add-dir <root>` when it runs somewhere other than the scriptorium root (a task worktree) so it can
+    read tasks/<id>/ and agents/. `permission_mode=None` means the config default (permission_mode_for).
+    `session_id=None` means a new one: every session gets an id the launcher knows, so it can be resumed
+    (`scr takeover`, T-0247); a caller that records the id passes it in (new_session_id)."""
     mode = permission_mode or permission_mode_for(root)
-    args = claude_argv("-p", "--permission-mode", mode, "--output-format", "text")
+    args = claude_argv("-p", "--session-id", session_id or new_session_id(), "--permission-mode", mode, "--output-format", "text")
     if not args:
         return None
     if root is not None and Path(cwd).resolve() != Path(root).resolve():
@@ -115,14 +124,45 @@ def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | Non
     return args
 
 
+def argv_value(argv: list[str], flag: str) -> str | None:
+    """The value after `flag` in an argv, or None."""
+    return argv[argv.index(flag) + 1] if flag in argv[:-1] else None
+
+
+def argv_values(argv: list[str], flag: str) -> list[str]:
+    """Every value after a repeatable `flag` (`--add-dir`)."""
+    return [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == flag]
+
+
+def record_launch(root: Path, kind: str, task: str | None, pid: int | None, session_id: str | None, cwd: Path,
+                  argv: list[str] | None = None, note: str | None = None, actor: str | None = None,
+                  data: dict | None = None) -> None:
+    """The ONE `launch` system event of a headless session (T-0247): `kind` (scriber | review | tooling-review |
+    intake | concierge, T-0108's names), `session_id`, `pid`, `cwd` (resolved: a session is stored under its
+    project folder and only resumes from there), and the `agent` / `add_dirs` / `permission_mode` its argv had,
+    so `scr takeover` can reopen it exactly. `data` adds the caller's own fields (the scriber's transcript,
+    created, bg_wait_minutes). The watcher reads only `kind` scriber (or no kind: older events) as a task's
+    scriber session."""
+    argv = argv or []
+    body = {"kind": kind, "session_id": session_id, "pid": pid, "cwd": str(Path(cwd).resolve()),
+            "agent": argv_value(argv, "--agent"), "add_dirs": argv_values(argv, "--add-dir"),
+            "permission_mode": argv_value(argv, "--permission-mode"), **(data or {})}
+    args = ["event", "system", "--name", "launch", "--note", note or f"{kind} pid {pid}, session {session_id}",
+            "--data", json.dumps(body), "--quiet"]
+    if task:
+        args[4:4] = ["--task", task]
+    scr_cmd(root, actor or (f"steward:{task}" if task else "steward-watch"), *args)
+
+
 def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode: str | None = None,
                  model: str | None = None, extra: list[str] | None = None, root: Path | None = None,
-                 env_extra: dict[str, str] | None = None) -> int | None:
+                 env_extra: dict[str, str] | None = None, session_id: str | None = None) -> int | None:
     """Detached `claude -p` reading the brief from stdin; stdout/stderr to the transcript. Returns the pid.
     Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv).
     `env_extra` is added to the inherited environment (the launcher's per-task background-wait ceiling,
-    scr/bgwait.py); None leaves the environment as it is."""
-    args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra)
+    scr/bgwait.py); None leaves the environment as it is. `session_id` is the `--session-id` the caller records
+    with record_launch (None: a fresh one nobody records)."""
+    args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra, session_id=session_id)
     if not args:
         return None
     flags = 0

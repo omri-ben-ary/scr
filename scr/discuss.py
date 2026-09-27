@@ -37,7 +37,7 @@ from pathlib import Path
 from .events import EventLog
 from .ops import task_worktree, workload, workload_for
 from .review import read_decision
-from .run import claude_bin, permission_mode_for, scr_exe
+from .run import claude_bin, permission_mode_for, scr_cmd, scr_exe
 from .store import Store
 
 CONCLUDE = """
@@ -430,19 +430,150 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
                        f"$first = (Get-Content -Raw -Encoding UTF8 {ps_quote(str(ff))}).Trim()\n"
                        f"claude {flags_ps} --append-system-prompt $sys $first\n",
                        encoding="utf-8")
-        title = (f"{ROLES[s.role][0]}: {s.title}").replace(";", ",").replace('"', "'")
-        if shutil.which("wt"):
-            subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", title, "-d", str(s.cwd), "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)])
-        else:
-            subprocess.Popen(["powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)], cwd=s.cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
-        out.append(f"terminal opened: {title}")
+        out.append(open_ps1_terminal(ps1, f"{ROLES[s.role][0]}: {s.title}", s.cwd))
     else:
-        term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
-        line = (f"cd \"{s.cwd}\" && {exe} {flags_sh} "
-                f"--append-system-prompt \"$(cat \"{sp}\")\" \"{first}\"")
-        if term:
-            subprocess.Popen([term, "-e", f"bash -c '{line}'"])
-            out.append("terminal opened")
+        out.append(open_sh_terminal(f"cd \"{s.cwd}\" && {exe} {flags_sh} "
+                                    f"--append-system-prompt \"$(cat \"{sp}\")\" \"{first}\""))
+    return out
+
+
+def open_ps1_terminal(ps1: Path, title: str, cwd: Path) -> str:
+    """Run a launcher script in a new Windows Terminal tab (a plain PowerShell console without wt). Returns the
+    output line. The shared path of Discuss and Take over (T-0247)."""
+    title = title.replace(";", ",").replace('"', "'")
+    if shutil.which("wt"):
+        subprocess.Popen(["wt", "-w", "0", "new-tab", "--title", title, "-d", str(cwd), "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)])
+    else:
+        subprocess.Popen(["powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", str(ps1)], cwd=cwd, creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
+    return f"terminal opened: {title}"
+
+
+def open_sh_terminal(line: str) -> str:
+    term = shutil.which("x-terminal-emulator") or shutil.which("gnome-terminal") or shutil.which("xterm")
+    if term:
+        subprocess.Popen([term, "-e", f"bash -c '{line}'"])
+        return "terminal opened"
+    return "no terminal emulator found; run: " + line
+
+
+# ---- take over a headless session (T-0247) ---------------------------------------------------------------
+# Every `claude -p` the operation starts carries `--session-id <uuid>` and a `launch` event naming it with its
+# pid, cwd, agent and add-dirs (scr/run.py record_launch). Take over resumes that session interactively, in its
+# ORIGINAL folder (claude stores sessions per project folder: `--resume` from another folder does not find it,
+# checked 2026-09-27), never while the headless pid still runs: it is stopped first, on the watcher's own path.
+TAKEOVER_WAIT_S = 30          # how long the headless pid may take to exit after the stop before nothing is resumed
+
+
+def recorded_session(events: list[dict], task: str | None = None, session: str | None = None) -> dict | None:
+    """The newest `launch` event that recorded a session id, for `task` and/or `session`: its data plus `task`
+    and `ts`. None when no launch of it carried one (a run started before T-0247)."""
+    found = None
+    for e in events:
+        if e.get("kind") != "system" or e.get("name") != "launch":
+            continue
+        d = e.get("data") or {}
+        if not d.get("session_id") or (task and e.get("task") != task) or (session and d["session_id"] != session):
+            continue
+        found = {**d, "task": e.get("task"), "ts": e.get("ts")}
+    return found
+
+
+def remote_control_name(rec: dict) -> str:
+    return f"{rec.get('task') or rec.get('kind') or 'session'} takeover"
+
+
+def resume_argv(root: Path, rec: dict, phone: bool = False) -> list[str]:
+    """`claude --resume <id>` with the agent, permission mode and add-dirs the session was launched with (the
+    config default when the launch recorded no mode); `phone` adds `--remote-control <name>` (claude 2.1.283:
+    "Start an interactive session with Remote Control enabled"), so it can be continued from claude.ai/code or
+    the Claude app."""
+    args = ["claude", "--resume", rec["session_id"]]
+    if rec.get("agent"):
+        args += ["--agent", rec["agent"]]
+    args += ["--permission-mode", rec.get("permission_mode") or permission_mode_for(root)]
+    for d in rec.get("add_dirs") or []:
+        args += ["--add-dir", d]
+    if phone:
+        args += ["--remote-control", remote_control_name(rec)]
+    return args
+
+
+def session_alive(rec: dict) -> bool:
+    """The recorded headless pid still runs as that session (not a later process that reused the pid, T-0147).
+    Through scr.watch, so the kill path and its tests' fakes are the watcher's."""
+    from . import watch as w
+    pid = rec.get("pid")
+    return bool(pid) and w.pid_alive(pid) and not w.Watcher.pid_reused({"pid": pid, "created": rec.get("created")})
+
+
+def takeover(root: Path, task: str | None = None, session: str | None = None, stop: bool = False, phone: bool = False,
+             open_terminal: bool = True, by: str = "omri") -> list[str]:
+    """Resume a headless session interactively. The newest recorded session of `task` (or the one `session` names);
+    if its pid still runs, nothing happens unless `stop` (the UI asks first): then the `takeover` event is written
+    FIRST, so the watcher already treats the task as Omri's when the pid disappears, the pid is stopped on the
+    watcher's path (a scriber's worktree is checkpoint-committed first: Watcher.stop_session), and the resume
+    waits for it to exit — two writers never. A pid that will not exit is a `takeover_aborted` event and an error.
+    The terminal runs `claude --resume` in the recorded cwd and, when it closes, records `takeover_ended`."""
+    from . import watch as w
+    from .store import RepoError
+    rec = recorded_session(EventLog(root / "events" / "events.jsonl").read(), task, session)
+    if not rec:
+        raise RepoError(f"no recorded session id for {task or session} (sessions launched before T-0247 carry none)")
+    sid, tid, kind, pid = rec["session_id"], rec.get("task"), rec.get("kind") or "scriber", rec.get("pid")
+    cwd = Path(rec.get("cwd") or root)
+    if not cwd.is_dir():
+        raise RepoError(f"session {sid} was started in {cwd}, which no longer exists; it resumes only from there")
+    alive = session_alive(rec)
+    if alive and not stop:
+        raise RepoError(f"session {sid} is still running (pid {pid}); taking over stops it first: "
+                        f"scr takeover {tid or '--session ' + sid} --stop")
+
+    def event(name: str, note: str, **data) -> None:
+        scr_cmd(root, by, "event", "system", "--name", name, *(["--task", tid] if tid else []), "--note", note[:300],
+                "--data", json.dumps({"session_id": sid, "by": by, **data}), "--quiet")
+
+    event("takeover", f"session {sid} ({kind}) taken over by {by}" + (f"; stopping headless pid {pid}" if alive else ""),
+          pid=pid, stopped=alive, cwd=str(cwd), kind=kind, phone=phone)
+    out = [f"session {sid} ({kind}{', ' + tid if tid else ''}) in {cwd}"]
+    if alive:
+        if tid and kind == "scriber":
+            store = Store(root)
+            t = store.get(tid)
+            clause = w.Watcher(root, quiet=True).stop_session(t, pid, task_worktree(workload_for(root, store, t), t),
+                                                              t.rec.get("branch") or f"task/{tid}", created=rec.get("created"))
         else:
-            out.append("no terminal emulator found; run: " + line)
+            clause = f"pid {pid} stopped" if w.kill(pid) else f"stopping pid {pid} FAILED"
+        out.append(clause)
+        deadline = time.monotonic() + TAKEOVER_WAIT_S
+        while w.pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        if w.pid_alive(pid):
+            event("takeover_aborted", f"pid {pid} still running {TAKEOVER_WAIT_S} s after the stop; nothing resumed ({clause})", pid=pid)
+            raise RepoError(f"pid {pid} is still running after the stop ({clause}); nothing was resumed")
+    argv = resume_argv(root, rec, phone)
+    out.append("resume: " + " ".join(argv))
+    if not open_terminal:
+        return out
+    first = (f"Taking over {tid or kind}: session {sid}, resumed in {cwd}. "
+             + (f"The headless session (pid {pid}) was stopped; if it was stopped in the middle of a tool call, that step "
+                "may need to be run again. " if alive else "The headless session had already ended. ")
+             + (f"Remote Control is on: continue it from claude.ai/code or the Claude app ('{remote_control_name(rec)}'). " if phone else "")
+             + (f"The watcher leaves {tid} to you until you submit it (report.md, then `scr task set {tid} submitted`)." if tid else ""))
+    tdir = root / ".scr" / "takeover"
+    tdir.mkdir(parents=True, exist_ok=True)
+    stem = tdir / f"{tid or kind}-{int(time.time())}"
+    ended = [*scr_exe(root), "--root", str(root), "--actor", by, "event", "system", "--name", "takeover_ended",
+             *(["--task", tid] if tid else []), "--note", f"takeover terminal of session {sid} closed", "--quiet"]
+    if os.name == "nt":
+        ff = stem.with_suffix(".first.txt")
+        ff.write_text(first, encoding="utf-8")
+        ps1 = stem.with_suffix(".launch.ps1")
+        ps1.write_text("﻿" + f"Set-Location -LiteralPath {ps_quote(str(cwd))}\n"
+                       f"Write-Host (Get-Content -Raw -Encoding UTF8 {ps_quote(str(ff))}) -ForegroundColor Yellow\n"
+                       f"& {' '.join(ps_quote(a) for a in argv)}\n"
+                       f"& {' '.join(ps_quote(a) for a in ended)}\n", encoding="utf-8")
+        out.append(open_ps1_terminal(ps1, f"Take over: {tid or kind}", cwd))
+    else:
+        q = lambda a: "'" + a.replace("'", "'\\''") + "'"   # noqa: E731
+        out.append(open_sh_terminal(f"cd {q(str(cwd))} && echo {q(first)} && {' '.join(q(a) for a in argv)}; {' '.join(q(a) for a in ended)}"))
     return out

@@ -27,6 +27,12 @@ class _Proc:
     stdout = ""
     stderr = ""
 
+    def communicate(self, input=None, timeout=None):      # Intake waits on its Popen (T-0247)
+        return "", ""
+
+    def kill(self):
+        pass
+
 
 class _Shim:
     """Stands in for a module imported by ONE scr module: the named attributes are fakes, everything else
@@ -42,7 +48,7 @@ class _Shim:
 
 
 def _record_launches(monkeypatch) -> list[dict]:
-    """Replace the claude lookup and the two spawn paths (Popen in scr.run for detached sessions,
+    """Replace the claude lookup and the spawn paths (Popen in scr.run for detached sessions, Popen and
     subprocess.run in scr.launch for the synchronous Intake); return the list that collects the calls."""
     import scr.launch as launch_mod
     import scr.run as run_mod
@@ -62,7 +68,7 @@ def _record_launches(monkeypatch) -> list[dict]:
         return _Proc()
 
     monkeypatch.setattr(run_mod, "subprocess", _Shim(subprocess, Popen=fake_popen))
-    monkeypatch.setattr(launch_mod, "subprocess", _Shim(subprocess, run=fake_run))
+    monkeypatch.setattr(launch_mod, "subprocess", _Shim(subprocess, run=fake_run, Popen=fake_popen))
     return calls
 
 
@@ -2907,3 +2913,209 @@ def test_brief_names_the_ceiling(world):
     scr(root, "--quiet", "--actor", "s", "task", "field", "T-0001", bgwait.FIELD, "300")
     st = Store(root)
     assert "300 min" in brief_for(root, st, st.get("T-0001"))
+
+
+# ---- T-0247: every headless session has a known id, and Omri can take it over ---------------------------------
+# claude 2.1.283 takes `--session-id <uuid>` with -p; `--resume <id>` finds the session only from the folder it was
+# started in (checked 2026-09-27). Every launch site records the id in a `launch` event; `scr takeover` resumes it
+# there, never while the headless pid runs; the watcher leaves a taken-over task alone.
+import uuid  # noqa: E402
+
+import scr.discuss as discuss_mod  # noqa: E402
+from scr.events import EventLog  # noqa: E402
+from scr.store import RepoError  # noqa: E402
+from scr.watch import is_scriber_launch, takeover_of  # noqa: E402
+
+
+def _sid(argv: list[str]) -> str:
+    return argv[argv.index("--session-id") + 1]
+
+
+def test_session_argv_carries_a_fresh_uuid_session_id(world, monkeypatch):
+    import scr.run as run_mod
+    root, repo, _ = world
+    monkeypatch.setattr(run_mod, "claude_bin", lambda: FAKE_CLAUDE)
+    a, b = run_mod.session_argv(repo, root=root), run_mod.session_argv(repo, root=root)
+    for argv in (a, b):
+        assert str(uuid.UUID(_sid(argv))) == _sid(argv)             # a valid, canonical UUID
+    assert _sid(a) != _sid(b)                                        # two launches, two ids
+    fixed = run_mod.new_session_id()
+    assert _sid(run_mod.session_argv(repo, root=root, session_id=fixed)) == fixed
+
+
+def test_every_launch_site_records_its_session_id(world, monkeypatch):
+    """scriber (launch + auto-dispatch), review, tooling-review, intake, concierge: one `launch` event each whose
+    session_id, pid and cwd are the ones the session really got."""
+    from scr.answers import start_concierge
+    root, _, _ = world
+    sites = _five_call_sites(world, monkeypatch)
+    calls = _record_launches(monkeypatch)
+    start_concierge(root, "T-0001", "go ahead")
+    sites["concierge"] = calls.pop()
+    kinds = {"watch_dispatch": "scriber", "launch": "scriber", "start_review": "review",
+             "start_tooling_review": "tooling-review", "intake": "intake", "concierge": "concierge"}
+    launches = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "system" and e.get("name") == "launch"]
+    by_sid = {(e.get("data") or {}).get("session_id"): e for e in launches}
+    sids = set()
+    for name, c in sites.items():
+        sid = _sid(c["argv"])
+        sids.add(sid)
+        e = by_sid.get(sid)
+        assert e, (name, sid, [(x.get("data") or {}).get("session_id") for x in launches])
+        d = e["data"]
+        assert d["kind"] == kinds[name] and d["pid"] == _Proc.pid, (name, d)
+        assert Path(d["cwd"]) == c["cwd"].resolve(), (name, d["cwd"], c["cwd"])
+        assert d["add_dirs"] == _add_dirs(c["argv"]) and d["permission_mode"] == _mode(c["argv"]), (name, d)
+        assert e.get("task") == (None if name == "intake" else "T-0001"), (name, e.get("task"))
+    assert len(sids) == len(sites)                                   # every session its own id
+    # the scriber's log.md names the id too, and only scriber launches are the watcher's session
+    log = (Store(root).get("T-0001").dir / "log.md").read_text(encoding="utf-8")
+    assert f"[launcher] session {_sid(sites['launch']['argv'])}" in log
+    assert [is_scriber_launch(by_sid[_sid(sites[n]["argv"])]) for n in kinds] == [k == "scriber" for k in kinds.values()]
+
+
+def _recorded(root: Path, cwd: Path, pid: int = 4242, tid: str = "T-0001", kind: str = "scriber") -> str:
+    sid = str(uuid.uuid4())
+    data = {"kind": kind, "session_id": sid, "pid": pid, "cwd": str(cwd.resolve()), "agent": "scriptorium-steward",
+            "add_dirs": [str(root)], "permission_mode": "auto", "transcript": "session-20260927-000000.txt"}
+    scr(root, "--quiet", "--actor", f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid,
+        "--note", f"headless pid {pid}", "--data", json.dumps(data))
+    return sid
+
+
+def _fake_process(monkeypatch, alive: bool) -> list[str]:
+    """pid_alive / kill / checkpoint in scr.watch (the watcher's kill path, which takeover uses) and resume_argv in
+    scr.discuss replaced; returns the ordered calls. The fake pid dies when it is killed."""
+    import scr.watch as w
+    calls: list[str] = []
+    state = {"alive": alive}
+    monkeypatch.setattr(w, "pid_alive", lambda pid: state["alive"])
+    monkeypatch.setattr(w, "process_created", lambda pid: None)
+
+    def fake_kill(pid):
+        calls.append(f"kill {pid}")
+        state["alive"] = False
+        return True
+    monkeypatch.setattr(w, "kill", fake_kill)
+    monkeypatch.setattr(w, "checkpoint", lambda *a, **k: calls.append("checkpoint"))
+    real = discuss_mod.resume_argv
+
+    def spy(*a, **k):
+        calls.append("resume")
+        return real(*a, **k)
+    monkeypatch.setattr(discuss_mod, "resume_argv", spy)
+    return calls
+
+
+def test_takeover_stops_a_live_pid_before_building_the_resume(world, monkeypatch):
+    root, repo, _ = world
+    spawn(root, ["T-0001"], lake=False)                               # a worktree to checkpoint before the stop
+    sid = _recorded(root, repo, pid=777001)
+    calls = _fake_process(monkeypatch, alive=True)
+    with pytest.raises(RepoError, match="still running"):             # never without --stop (the UI asks first)
+        discuss_mod.takeover(root, "T-0001", open_terminal=False)
+    assert calls == [] and not _sys_events(root, "takeover")
+    out = discuss_mod.takeover(root, "T-0001", stop=True, open_terminal=False)
+    assert calls.index("kill 777001") < calls.index("resume"), calls
+    assert calls[0] == "checkpoint"                                   # the watcher's stop path: checkpoint, then kill
+    ev = _sys_events(root, "takeover")
+    assert len(ev) == 1 and ev[0]["task"] == "T-0001" and ev[0]["data"]["session_id"] == sid and ev[0]["data"]["stopped"] is True
+    assert ev[0]["data"]["by"] == "omri" and any(line.startswith("resume: claude --resume " + sid) for line in out)
+
+
+def test_takeover_of_an_ended_session_resumes_it_in_its_folder(world, monkeypatch):
+    root, repo, _ = world
+    folder = repo / ".worktrees"
+    folder.mkdir(exist_ok=True)
+    sid = _recorded(root, folder, pid=777002)
+    calls = _fake_process(monkeypatch, alive=False)
+    opened: list[tuple] = []
+    monkeypatch.setattr(discuss_mod, "open_ps1_terminal", lambda ps1, title, cwd: opened.append((ps1, cwd)) or "terminal opened")
+    monkeypatch.setattr(discuss_mod, "open_sh_terminal", lambda line: opened.append((line, None)) or "terminal opened")
+    discuss_mod.takeover(root, "T-0001")
+    assert calls == ["resume"]                                         # nothing to stop
+    rec = discuss_mod.recorded_session(EventLog(root / "events" / "events.jsonl").read(), "T-0001")
+    argv = discuss_mod.resume_argv(root, rec)
+    assert argv == ["claude", "--resume", sid, "--agent", "scriptorium-steward", "--permission-mode", "auto", "--add-dir", str(root)]
+    (script, cwd), = opened
+    if cwd is not None:                                                # Windows: the launcher script
+        text = Path(script).read_text(encoding="utf-8-sig")
+        assert Path(cwd) == folder.resolve()
+        assert f"Set-Location -LiteralPath '{folder.resolve()}'" in text
+        assert " ".join(f"'{a}'" for a in argv) in text                 # claude --resume with the recorded flags
+        assert "'takeover_ended'" in text                              # the terminal says when it closed
+    else:
+        assert str(folder.resolve()) in script and sid in script
+    phone = discuss_mod.resume_argv(root, {"session_id": sid, "task": "T-0001"}, phone=True)
+    assert phone[-2:] == ["--remote-control", "T-0001 takeover"]
+
+
+def test_takeover_of_a_session_nobody_recorded_is_refused(world):
+    root, _, _ = world
+    with pytest.raises(RepoError, match="no recorded session id"):
+        discuss_mod.takeover(root, "T-0001", open_terminal=False)
+
+
+def test_after_a_takeover_the_watcher_leaves_the_dead_pid_alone(world, monkeypatch):
+    """The same no-work death that is returned without a takeover (the control test below) is left in_progress
+    with one: no session_dead, no returned, no relaunch, no attempt spent, no stale."""
+    root, _, _ = world
+    _dying(root, transcript="partial answer\n")
+    _dead_pids(monkeypatch)
+    attempts = Store(root).get("T-0001").rec.get("attempts")
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--task", "T-0001",
+        "--note", "taken over", "--data", json.dumps({"session_id": str(uuid.uuid4()), "by": "omri"}))
+    n_launch = len(_sys_events(root, "launch"))
+    w = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True, stale_minutes=0)
+    for _ in range(2):
+        res = w.tick()
+    t = Store(root).get("T-0001")
+    assert t.status == "in_progress" and t.rec.get("attempts") == attempts
+    assert not _sys_events(root, "session_dead") and not _sys_events(root, "stale")
+    assert len(_sys_events(root, "launch")) == n_launch                 # never relaunched
+    row = next(r for r in res["rows"] if r["task"] == "T-0001")
+    assert "TAKEOVER" in row["flags"] and "DEAD" not in row["flags"]
+    # the terminal closed without a report: one needs line, still no death
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover_ended", "--task", "T-0001", "--note", "closed")
+    res = w.tick()
+    assert Store(root).get("T-0001").status == "in_progress" and not _sys_events(root, "session_dead")
+    assert any("takeover session ended" in n for n in res["needs"])
+
+
+def test_without_a_takeover_the_same_death_is_returned(world, monkeypatch):
+    root, _, _ = world
+    _dying(root, transcript="partial answer\n")
+    _dead_pids(monkeypatch)
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status in {"returned", "ready"} and _sys_events(root, "session_dead")
+
+
+def test_takeover_of_is_scoped_to_the_current_run():
+    def ev(**k):
+        return {"kind": "system", "task": "T-1", **k}
+    assert takeover_of([ev(name="takeover", data={"session_id": "s"})], "T-1")["session_id"] == "s"
+    assert takeover_of([ev(name="takeover"), ev(name="launch", data={"kind": "scriber"})], "T-1") is None
+    assert takeover_of([ev(name="takeover"), ev(name="launch", data={"kind": "review"})], "T-1") is not None
+    assert takeover_of([ev(name="takeover"), ev(name="takeover_aborted")], "T-1") is None
+    assert takeover_of([ev(name="takeover"), {"kind": "state", "task": "T-1", "from": "dispatched", "to": "in_progress"}], "T-1") is None
+    assert takeover_of([ev(name="takeover", ts="a"), ev(name="takeover_ended", ts="b")], "T-1")["ended"] == "b"
+    # a takeover counts as the launcher's hold on a dispatched task: no dispatch timeout
+    old = "2026-09-01T00:00:00Z"
+    assert dispatch_stale([{"kind": "state", "task": "T-1", "to": "dispatched", "ts": old}, ev(name="takeover", ts=old)], "T-1", 30,
+                          datetime.now(timezone.utc)) is None
+
+
+def test_ui_offers_take_over_for_a_recorded_session(world, monkeypatch):
+    """The task page (and the running / recent rows, same helper) carries the newest recorded session; `alive`
+    is what makes the Take over button ask before it stops the pid."""
+    import scr.watch as w
+    root, repo, _ = world
+    assert ui_mod.task_detail(root, "T-0001")["session"] is None           # launched before T-0247: no button
+    sid = _recorded(root, repo, pid=777003)
+    monkeypatch.setattr(w, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(w, "process_created", lambda pid: None)
+    s = ui_mod.task_detail(root, "T-0001")["session"]
+    assert s == {"session_id": sid, "kind": "scriber", "pid": 777003, "alive": True, "taken_over": False}
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--task", "T-0001",
+        "--note", "taken over", "--data", json.dumps({"session_id": sid, "by": "omri"}))
+    assert ui_mod.session_cards(root, {"T-0001"})["T-0001"]["taken_over"] is True
