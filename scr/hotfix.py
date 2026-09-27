@@ -34,13 +34,13 @@ from pathlib import Path
 
 from .events import EventLog, now_iso
 from .gitops import Git
-from .ops import LAND_TEST_TIMEOUT_KEY, land_test_timeout
+from .ops import LAND_TEST_TIMEOUT_KEY, land_test_timeout, self_workload
 from .run import resolve_test_argv
 from .store import Store
 
 TOOLING = ("scr/", "ui/", "tests/", "agents/", "templates/", "config/", "hooks/", "pyproject.toml", "README.md", ".gitignore")
 OPEN_FILE = ".scr/hotfix/open"
-WORKLOAD = "scriptorium"
+WORKLOAD = "scriptorium"     # fallback only: the checkout's workload is ops.self_workload (repo: .), whatever its key (T-0256)
 
 
 def tooling_paths(paths: list[str]) -> list[str]:
@@ -89,9 +89,10 @@ def open_hotfix(root: Path, symptom: str, who: str = "omri", files: list[str] | 
     _ensure_workload(root)
     from . import lifecycle
     tid = store.next_id()
+    wl = self_workload(root, store)
     title = f"hotfix: {symptom.strip()[:70]}"
     rec = {
-        "id": tid, "title": title, "queue": "scribers", "kind": "refactor", "status": "proposed", "workload": WORKLOAD,
+        "id": tid, "title": title, "queue": "scribers", "kind": "refactor", "status": "proposed", "workload": wl.name if wl else WORKLOAD,
         "created": now_iso(), "scope": {"files": files or [], "decls": [], "may_touch_statements": False},
         "done_when": {"mechanical": ["tests pass: `scr hotfix close` runs the scriptorium workload's test command"],
                       "judgment": ["the Steward's review finds the fix addresses the symptom and proposes follow-ups"]},
@@ -155,7 +156,8 @@ def run_tests(root: Path, timeout: int | None = None) -> tuple[int, str]:
     store = Store(root)
     if timeout is None:     # the landing's limit (limits.yaml land_test_timeout_seconds): same suite, same budget (T-0186 fold)
         timeout = land_test_timeout(store)
-    cmd = ((store.config("workloads") or {}).get(WORKLOAD) or {}).get("tests")
+    wl = self_workload(root, store)     # the workload whose repo is this checkout, not a hard-coded key (T-0256)
+    cmd = (wl.cfg or {}).get("tests") if wl else None
     if not cmd:
         cmd = f"{root / '.venv' / 'Scripts' / 'python.exe'} -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q"
     argv, note = resolve_test_argv(cmd, root)     # relative program resolved against root, not the process cwd (T-0131, T-0255)

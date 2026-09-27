@@ -571,6 +571,38 @@ def _set_tests_cmd(root: Path, cmd: str) -> None:
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
 
 
+def test_hotfix_self_workload_renamed_key(world, monkeypatch):
+    """T-0256: hotfix open/test find the checkout's workload with ops.self_workload (the one whose repo is
+    `.`), not the hard-coded `scriptorium` key: renamed to `tooling`, its tests: command runs and the record
+    names `tooling`. With no workload at `.`, both fall back as before: the default command, `scriptorium`."""
+    from scr import hotfix, ops
+    root, _, _ = world
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools" / "wl_marker.py").write_text("print('tooling-tests-ran')\n")
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["tooling"] = {**wl.pop("scriptorium"), "repo": ".", "tests": f"{sys.executable} tools/wl_marker.py"}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+    rc, out = hotfix.run_tests(root)
+    assert rc == 0 and "tooling-tests-ran" in out, (rc, out)
+    r = hotfix.open_hotfix(root, "renamed key", who="t")
+    t = Store(root).get(r["id"])
+    assert t.rec["workload"] == "tooling" and ops.workload_for(root, None, t).name == "tooling"
+    rc, out = hotfix.run_tests(root)                  # still the renamed entry after open_hotfix's _ensure_workload
+    assert rc == 0 and "tooling-tests-ran" in out, (rc, out)
+    # fallback: no workload is the checkout
+    (root / hotfix.OPEN_FILE).unlink()
+    monkeypatch.setattr(hotfix, "self_workload", lambda root, store=None: None)
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, "1 passed", "")
+    monkeypatch.setattr(hotfix.subprocess, "run", fake_run)
+    assert hotfix.run_tests(root)[0] == 0 and seen["argv"][-4:] == ["-m", "pytest", "tests", "-q"], seen
+    r = hotfix.open_hotfix(root, "no self workload", who="t")
+    assert Store(root).get(r["id"]).rec["workload"] == "scriptorium"
+
+
 def test_hotfix_run_tests_resolves_relative_command_against_root(world, monkeypatch, tmp_path):
     """T-0131: `tests: .venv/Scripts/python.exe -m pytest tests -q` is relative to the checkout. Windows'
     CreateProcess does not resolve a relative forward-slash program name even with cwd=root, so run_tests
