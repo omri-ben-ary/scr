@@ -532,6 +532,9 @@ def takeover(root: Path, task: str | None = None, session: str | None = None, st
         scr_cmd(root, by, "event", "system", "--name", name, *(["--task", tid] if tid else []), "--note", note[:300],
                 "--data", json.dumps({"session_id": sid, "by": by, **data}), "--quiet")
 
+    if alive and kind != "scriber" and rec.get("created") is None:
+        raise RepoError(f"pid {pid} of session {sid} runs, but its launch recorded no creation time, so it may be "
+                        f"another process that reused the pid; not stopping it (check it, stop it by hand, then retry)")
     event("takeover", f"session {sid} ({kind}) taken over by {by}" + (f"; stopping headless pid {pid}" if alive else ""),
           pid=pid, stopped=alive, cwd=str(cwd), kind=kind, phone=phone)
     out = [f"session {sid} ({kind}{', ' + tid if tid else ''}) in {cwd}"]

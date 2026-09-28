@@ -140,13 +140,16 @@ def record_launch(root: Path, kind: str, task: str | None, pid: int | None, sess
     """The ONE `launch` system event of a headless session (T-0247): `kind` (scriber | review | tooling-review |
     intake | concierge, T-0108's names), `session_id`, `pid`, `cwd` (resolved: a session is stored under its
     project folder and only resumes from there), and the `agent` / `add_dirs` / `permission_mode` its argv had,
-    so `scr takeover` can reopen it exactly. `data` adds the caller's own fields (the scriber's transcript,
-    created, bg_wait_minutes). The watcher reads only `kind` scriber (or no kind: older events) as a task's
+    so `scr takeover` can reopen it exactly, and the pid's `created` (process_created, unless `data` gives it)
+    so a pid reused by another process is never taken for the session (T-0147). `data` adds the caller's own
+    fields (the scriber's transcript, created, bg_wait_minutes). The watcher reads only `kind` scriber (or no kind: older events) as a task's
     scriber session."""
     argv = argv or []
     body = {"kind": kind, "session_id": session_id, "pid": pid, "cwd": str(Path(cwd).resolve()),
             "agent": argv_value(argv, "--agent"), "add_dirs": argv_values(argv, "--add-dir"),
             "permission_mode": argv_value(argv, "--permission-mode"), **(data or {})}
+    if pid and "created" not in body:
+        body["created"] = process_created(pid)                   # every kind: takeover --stop checks it (T-0147)
     args = ["event", "system", "--name", "launch", "--note", note or f"{kind} pid {pid}, session {session_id}",
             "--data", json.dumps(body), "--quiet"]
     if task:

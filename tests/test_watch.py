@@ -2974,10 +2974,10 @@ def test_every_launch_site_records_its_session_id(world, monkeypatch):
     assert [is_scriber_launch(by_sid[_sid(sites[n]["argv"])]) for n in kinds] == [k == "scriber" for k in kinds.values()]
 
 
-def _recorded(root: Path, cwd: Path, pid: int = 4242, tid: str = "T-0001", kind: str = "scriber") -> str:
+def _recorded(root: Path, cwd: Path, pid: int = 4242, tid: str = "T-0001", kind: str = "scriber", **extra) -> str:
     sid = str(uuid.uuid4())
     data = {"kind": kind, "session_id": sid, "pid": pid, "cwd": str(cwd.resolve()), "agent": "scriptorium-steward",
-            "add_dirs": [str(root)], "permission_mode": "auto", "transcript": "session-20260927-000000.txt"}
+            "add_dirs": [str(root)], "permission_mode": "auto", "transcript": "session-20260927-000000.txt", **extra}
     scr(root, "--quiet", "--actor", f"steward:{tid}", "event", "system", "--name", "launch", "--task", tid,
         "--note", f"headless pid {pid}", "--data", json.dumps(data))
     return sid
@@ -3048,6 +3048,46 @@ def test_takeover_of_an_ended_session_resumes_it_in_its_folder(world, monkeypatc
         assert str(folder.resolve()) in script and sid in script
     phone = discuss_mod.resume_argv(root, {"session_id": sid, "task": "T-0001"}, phone=True)
     assert phone[-2:] == ["--remote-control", "T-0001 takeover"]
+
+
+def test_record_launch_records_created_for_every_kind(world, monkeypatch):
+    """Not only the scriber: a review / intake / concierge launch carries its pid's creation time too, so a
+    takeover can tell the session from a later process that reused its pid (T-0147)."""
+    import scr.run as run_mod
+    root, repo, _ = world
+    monkeypatch.setattr(run_mod, "process_created", lambda pid: 1234500 + int(pid))
+    run_mod.record_launch(root, "review", "T-0001", 17, str(uuid.uuid4()), repo, [])
+    run_mod.record_launch(root, "scriber", "T-0001", 18, str(uuid.uuid4()), repo, [], data={"created": 99})
+    run_mod.record_launch(root, "intake", None, None, str(uuid.uuid4()), root, [])
+    ev = _sys_events(root, "launch")
+    assert [e["data"].get("created") for e in ev] == [1234517, 99, None]   # the caller's own value is kept
+
+
+def test_takeover_never_kills_a_reused_pid_of_a_review_session(world, monkeypatch):
+    """A review that ended long ago; its pid now belongs to another live process (another creation time). The
+    session is not alive, so --stop kills nothing: it resumes as already ended."""
+    import scr.watch as w
+    root, repo, _ = world
+    sid = _recorded(root, repo, pid=777003, kind="review", created=111)
+    calls = _fake_process(monkeypatch, alive=True)
+    monkeypatch.setattr(w, "process_created", lambda pid: 222)
+    rec = discuss_mod.recorded_session(EventLog(root / "events" / "events.jsonl").read(), "T-0001")
+    assert not discuss_mod.session_alive(rec)
+    out = discuss_mod.takeover(root, "T-0001", stop=True, open_terminal=False)
+    assert calls == ["resume"], calls                                   # no kill of the stranger
+    ev = _sys_events(root, "takeover")
+    assert len(ev) == 1 and ev[0]["data"]["stopped"] is False and any(sid in line for line in out)
+
+
+def test_takeover_refuses_to_stop_a_non_scriber_pid_with_no_creation_time(world, monkeypatch):
+    """A review launch recorded before `created` was written for every kind: its live pid cannot be told from a
+    reused one, so --stop refuses rather than taskkill /T /F on it."""
+    root, repo, _ = world
+    _recorded(root, repo, pid=777004, kind="review")
+    calls = _fake_process(monkeypatch, alive=True)
+    with pytest.raises(RepoError, match="no creation time"):
+        discuss_mod.takeover(root, "T-0001", stop=True, open_terminal=False)
+    assert calls == [] and not _sys_events(root, "takeover")
 
 
 def test_takeover_of_a_session_nobody_recorded_is_refused(world):
