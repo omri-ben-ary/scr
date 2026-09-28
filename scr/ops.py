@@ -7,10 +7,8 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,6 +18,7 @@ from .events import EventLog, now_iso
 from .gitops import Git, GitError, NOISE, gh_available, pr_create, pr_merge, pr_url_for
 from .journal import LOCK_STALE_S, SCR_DIR, _Lock as _JournalLock, journal
 from .review import acceptance_problem
+from .run import resolve_test_argv
 from .store import RepoError, Store, Task
 
 
@@ -494,30 +493,24 @@ def land_test_timeout(store: Store) -> int:
 
 
 def _run_tests(wl: Workload, cwd: Path, timeout: int = LAND_TEST_TIMEOUT_S) -> tuple[int, str]:
-    """Run the workload's `tests:` command IN `cwd` (a worktree). Same resolution as scr.hotfix.run_tests,
-    which is bound to the checkout: a relative interpreter path is taken relative to cwd (a spawned
-    scriptorium worktree links `.venv` to the checkout's), a missing python.exe falls back to this one.
+    """Run the workload's `tests:` command IN `cwd` (a worktree). The argv comes from scr.run.resolve_test_argv,
+    shared with scr.hotfix.run_tests (bound to the checkout): a relative program path is taken relative to cwd
+    (a spawned scriptorium worktree links `.venv` to the checkout's), a missing python* interpreter falls back
+    to this one and the returned text then starts with a one-line note naming it (T-0255).
     land_scriptorium passes `timeout` from limits.yaml land_test_timeout_seconds (land_test_timeout)."""
     cmd = wl.cfg.get("tests")
     if not cmd:
         cmd = ".venv/Scripts/python.exe -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q"
-    argv = shlex.split(cmd, posix=(os.name != "nt"))
-    if os.name == "nt":
-        argv = [a.strip('"') for a in argv]
-    exe = Path(argv[0])
-    if not exe.is_absolute() and len(exe.parts) > 1:      # a path relative to the worktree (.venv/Scripts/python.exe), not a PATH lookup
-        if (cwd / exe).exists():
-            argv[0] = str(cwd / exe)
-        elif exe.name.lower().startswith("python"):
-            argv[0] = sys.executable
+    argv, note = resolve_test_argv(cmd, cwd)
+    lead = f"{note}\n" if note else ""
     env = {**os.environ, "SCR_NO_JOURNAL": "1"}
     try:
         r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, encoding="utf-8", errors="replace")
-        return r.returncode, (r.stdout + r.stderr)[-6000:]
+        return r.returncode, lead + (r.stdout + r.stderr)[-6000:]
     except subprocess.TimeoutExpired:
-        return 124, f"tests timed out after {timeout}s (raise {LAND_TEST_TIMEOUT_KEY} in config/limits.yaml)"
+        return 124, lead + f"tests timed out after {timeout}s (raise {LAND_TEST_TIMEOUT_KEY} in config/limits.yaml)"
     except FileNotFoundError as e:
-        return 127, f"test command not found: {e}"
+        return 127, lead + f"test command not found: {e}"
 
 
 # The scriptorium's record paths (T-0120): on a task branch they are never authoritative — they exist there

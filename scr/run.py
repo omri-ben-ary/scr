@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,29 @@ def service_argv(root: Path) -> list[str]:
         if pyw.exists():
             return [str(pyw), "-m", "scr"]
     return scr_exe(root)
+
+
+def resolve_test_argv(cmd: str, cwd: Path) -> tuple[list[str], str | None]:
+    """A workload `tests:` command as the argv to launch IN `cwd`, plus a one-line note when a missing
+    `python*` interpreter was replaced by sys.executable (None otherwise). The one resolver behind
+    scr.hotfix.run_tests (cwd = the checkout) and scr.ops._run_tests (cwd = the worktree) (T-0255)."""
+    cwd = Path(cwd)
+    argv = shlex.split(cmd, posix=(os.name != "nt"))
+    if os.name == "nt":
+        argv = [a.strip('"') for a in argv]
+    # Resolve the program against cwd, not the process cwd: `.venv/Scripts/python.exe` in workloads.yaml
+    # is relative to the checkout, and on Windows CreateProcess does not resolve a relative forward-slash
+    # program name even when cwd is set (T-0131: WinError 2 from any directory). An absolute, native path
+    # launches everywhere; a bare name (`python`, `pytest`) stays a PATH lookup.
+    note = None
+    exe = Path(argv[0])
+    if not exe.is_absolute() and (len(exe.parts) > 1 or not shutil.which(argv[0])):
+        if (cwd / exe).exists():
+            argv[0] = os.path.abspath(cwd / exe)         # absolute + native separators; abspath keeps a linked .venv under cwd (resolve would follow the junction)
+        elif exe.name.lower().startswith("python"):      # a missing python.exe: this interpreter (same venv on a linked worktree)
+            note = f"note: tests: interpreter {argv[0]} not found under {cwd}; using {sys.executable}"
+            argv[0] = sys.executable
+    return argv, note
 
 
 def _env() -> dict:

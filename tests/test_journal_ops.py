@@ -571,11 +571,45 @@ def _set_tests_cmd(root: Path, cmd: str) -> None:
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
 
 
+def test_hotfix_self_workload_renamed_key(world, monkeypatch):
+    """T-0256: hotfix open/test find the checkout's workload with ops.self_workload (the one whose repo is
+    `.`), not the hard-coded `scriptorium` key: renamed to `tooling`, its tests: command runs and the record
+    names `tooling`. With no workload at `.`, both fall back as before: the default command, `scriptorium`."""
+    from scr import hotfix, ops
+    root, _, _ = world
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools" / "wl_marker.py").write_text("print('tooling-tests-ran')\n")
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text())
+    wl["tooling"] = {**wl.pop("scriptorium"), "repo": ".", "tests": f"{sys.executable} tools/wl_marker.py"}
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl))
+    rc, out = hotfix.run_tests(root)
+    assert rc == 0 and "tooling-tests-ran" in out, (rc, out)
+    r = hotfix.open_hotfix(root, "renamed key", who="t")
+    t = Store(root).get(r["id"])
+    assert t.rec["workload"] == "tooling" and ops.workload_for(root, None, t).name == "tooling"
+    rc, out = hotfix.run_tests(root)                  # still the renamed entry after open_hotfix's _ensure_workload
+    assert rc == 0 and "tooling-tests-ran" in out, (rc, out)
+    # fallback: no workload is the checkout
+    (root / hotfix.OPEN_FILE).unlink()
+    monkeypatch.setattr(hotfix, "self_workload", lambda root, store=None: None)
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, "1 passed", "")
+    monkeypatch.setattr(hotfix.subprocess, "run", fake_run)
+    assert hotfix.run_tests(root)[0] == 0 and seen["argv"][-4:] == ["-m", "pytest", "tests", "-q"], seen
+    r = hotfix.open_hotfix(root, "no self workload", who="t")
+    assert Store(root).get(r["id"]).rec["workload"] == "scriptorium"
+
+
 def test_hotfix_run_tests_resolves_relative_command_against_root(world, monkeypatch, tmp_path):
     """T-0131: `tests: .venv/Scripts/python.exe -m pytest tests -q` is relative to the checkout. Windows'
     CreateProcess does not resolve a relative forward-slash program name even with cwd=root, so run_tests
-    hands subprocess an absolute native path; the process cwd is irrelevant."""
-    from scr import hotfix
+    hands subprocess an absolute native path; the process cwd is irrelevant. The resolution is
+    scr.run.resolve_test_argv, shared with ops._run_tests (T-0255), so the landing launches the same argv."""
+    from types import SimpleNamespace
+    from scr import hotfix, ops
     root, _, _ = world
     (root / "tools").mkdir(); (root / "tools" / "fake-python.exe").write_bytes(b"")
     _set_tests_cmd(root, "tools/fake-python.exe -m pytest tests -q")
@@ -592,6 +626,12 @@ def test_hotfix_run_tests_resolves_relative_command_against_root(world, monkeypa
     assert exe.is_absolute() and exe.exists() and exe.resolve() == (root / "tools" / "fake-python.exe").resolve(), seen
     assert seen["argv"][1:] == ["-m", "pytest", "tests", "-q"] and Path(seen["cwd"]) == root
     assert seen["env"]["SCR_NO_JOURNAL"] == "1"
+    assert not out.startswith("note:")                            # no substitution, no note
+    # the landing's runner resolves the same command against its cwd to the same argv
+    hotfix_argv = seen["argv"]
+    monkeypatch.setattr(ops.subprocess, "run", fake_run)
+    ops._run_tests(SimpleNamespace(cfg={"tests": "tools/fake-python.exe -m pytest tests -q"}), root)
+    assert seen["argv"] == hotfix_argv and Path(seen["cwd"]) == root
     # a bare name is left to the PATH lookup, untouched
     _set_tests_cmd(root, "pytest tests -q")
     hotfix.run_tests(root)
@@ -633,6 +673,44 @@ def test_hotfix_run_tests_timeout_follows_land_test_timeout(world, monkeypatch):
     rc, out = hotfix.run_tests(root)
     assert seen == [4321, 7, 4321]
     assert rc == 124 and "4321" in out and "land_test_timeout_seconds" in out, out
+
+
+def test_resolve_test_argv_cases(tmp_path, monkeypatch):
+    """T-0255: the one resolver behind hotfix.run_tests and ops._run_tests. Absolute stays; a relative path
+    that exists under cwd becomes absolute (abspath, not resolve); a missing python* becomes sys.executable
+    with a one-line note naming both; a bare name nobody can find is left alone, without a note."""
+    import os
+    from scr.run import resolve_test_argv
+    monkeypatch.chdir(tmp_path.parent)                            # the process cwd is not the resolution root
+    absolute = Path(sys.executable)
+    argv, note = resolve_test_argv(f'"{absolute}" -m pytest tests -q', tmp_path)
+    assert Path(argv[0]) == absolute and argv[1:] == ["-m", "pytest", "tests", "-q"] and note is None
+    (tmp_path / "tools").mkdir(); (tmp_path / "tools" / "fake-python.exe").write_bytes(b"")
+    argv, note = resolve_test_argv("tools/fake-python.exe -m pytest", tmp_path)
+    assert argv[0] == os.path.abspath(tmp_path / "tools" / "fake-python.exe") and argv[1:] == ["-m", "pytest"] and note is None
+    argv, note = resolve_test_argv(".venv/Scripts/python.exe -m pytest tests -q", tmp_path)
+    assert argv[0] == sys.executable and argv[1:] == ["-m", "pytest", "tests", "-q"]
+    assert note is not None and "\n" not in note and note.startswith("note: tests: interpreter")
+    assert ".venv/Scripts/python.exe" in note and str(tmp_path) in note and sys.executable in note
+    argv, note = resolve_test_argv("no-such-runner-t0255 tests -q", tmp_path)
+    assert argv == ["no-such-runner-t0255", "tests", "-q"] and note is None
+
+
+def test_ops_run_tests_names_substituted_interpreter(tmp_path, monkeypatch):
+    """T-0255: a `tests:` line naming an interpreter that is not in the worktree still runs (on this python),
+    but the landing log's text now says so on its first line instead of substituting silently."""
+    from types import SimpleNamespace
+    from scr import ops
+    seen: dict = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        return subprocess.CompletedProcess(argv, 0, "5 passed", "")
+    monkeypatch.setattr(ops.subprocess, "run", fake_run)
+    rc, out = ops._run_tests(SimpleNamespace(cfg={"tests": "tools/python.exe -m pytest tests -q"}), tmp_path)
+    first, _, rest = out.partition("\n")
+    assert rc == 0 and seen["argv"][0] == sys.executable and "5 passed" in rest
+    assert first.startswith("note:") and "tools/python.exe" in first and sys.executable in first and str(tmp_path) in first, out
 
 
 def test_discuss_hotfix_is_toolsmith_in_root(world):
