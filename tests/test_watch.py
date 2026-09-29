@@ -1528,6 +1528,9 @@ def test_dispatch_timeout_frees_the_slot_for_the_next_ready_task(world, monkeypa
     _dispatched(root)
     _backdate(root, "T-0001", "dispatched", 45)
     _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    # T-0127: the bounced dispatch no longer costs T-0001 an attempt, so w_retry no longer ranks it below T-0002 and
+    # the two tie; T-0002 is made the better-ranked ready task, the premise of this test (the assertions are T-0122's)
+    scr(root, "--quiet", "--actor", "omri", "task", "field", "T-0002", "priority.omri_weight", "1")
     assert "(running: 1, cap 1)" in scr(root, "dispatch", "--dry-run").stdout
     launches = _record_launches(monkeypatch)
     calls = _spy_scr(monkeypatch)
