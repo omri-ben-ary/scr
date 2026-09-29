@@ -3152,6 +3152,166 @@ def test_takeover_of_is_scoped_to_the_current_run():
                           datetime.now(timezone.utc)) is None
 
 
+# ---- T-0273: a takeover terminal closed with X still ends the takeover ------------------------------------------
+# The launch script records its own process first (`scr takeover <id> --session <sid> --terminal-pid $PID`); closing
+# the window kills it before the `takeover_ended` line runs, so the watcher writes that event itself, once.
+from scr.watch import open_takeovers  # noqa: E402
+
+
+def _taken_over(root: Path, monkeypatch, terminal_pid: int | None = 5555, created: int | None = 111) -> str:
+    """T-0001 running under a takeover (its headless session dead, as after a --stop) whose terminal recorded
+    `terminal_pid` with creation time `created` (through the same helper the CLI flag calls)."""
+    import scr.watch as w
+    _dying(root, transcript="partial answer\n")
+    sid = str(uuid.uuid4())
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--task", "T-0001",
+        "--note", "taken over", "--data", json.dumps({"session_id": sid, "by": "omri"}))
+    if terminal_pid is not None:
+        monkeypatch.setattr(w, "process_created", lambda pid: created)
+        discuss_mod.takeover_terminal(root, "T-0001", sid, terminal_pid)
+    return sid
+
+
+def _terminal(monkeypatch, alive: bool, created: int | None = 111) -> None:
+    """The recorded terminal pid is `alive` with creation time `created`; every other pid (the stopped headless
+    session) is dead."""
+    import scr.watch as w
+    monkeypatch.setattr(w, "pid_alive", lambda pid: alive and int(pid) == 5555)
+    monkeypatch.setattr(w, "process_created", lambda pid: created if int(pid) == 5555 else None)
+
+
+def _takeover_needs(res: dict) -> list[str]:
+    return [n for n in res["needs"] if "takeover" in n]
+
+
+def test_a_closed_takeover_terminal_is_ended_by_the_watcher_once(world, monkeypatch):
+    root, _, _ = world
+    _taken_over(root, monkeypatch)
+    attempts = Store(root).get("T-0001").rec.get("attempts")
+    n_launch = len(_sys_events(root, "launch"))
+    _terminal(monkeypatch, alive=False)
+    w = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True, stale_minutes=0)
+    for _ in range(2):
+        res = w.tick()
+        needs = _takeover_needs(res)
+        assert len(needs) == 1 and "terminal was closed" in needs[0], res["needs"]
+        assert [i["key"] for i in w.need_items if "takeover" in i["text"]] == ["takeover:T-0001"]
+    ended = _sys_events(root, "takeover_ended")
+    assert len(ended) == 1, ended
+    assert ended[0]["actor"] == "watcher" and ended[0]["note"] == "terminal closed" and ended[0]["task"] == "T-0001"
+    assert ended[0]["data"]["pid"] == 5555 and "no longer exists" in ended[0]["data"]["reason"]
+    # Omri decides: no relaunch, no attempt, no death, no stale
+    t = Store(root).get("T-0001")
+    assert t.status == "in_progress" and t.rec.get("attempts") == attempts
+    assert len(_sys_events(root, "launch")) == n_launch and not _sys_events(root, "session_dead") and not _sys_events(root, "stale")
+    assert takeover_of(EventLog(root / "events" / "events.jsonl").read(), "T-0001")["ended_by"] == "watcher"
+
+
+def test_a_live_takeover_terminal_is_left_alone_and_a_reused_pid_ends_it(world, monkeypatch):
+    root, _, _ = world
+    _taken_over(root, monkeypatch, created=111)
+    w = Watcher(root, quiet=True, auto_decide=True, stale_minutes=0)
+    _terminal(monkeypatch, alive=True, created=111)                   # the same process: Omri is still in it
+    for _ in range(2):
+        res = w.tick()
+    assert not _sys_events(root, "takeover_ended") and not _takeover_needs(res)
+    row = next(r for r in res["rows"] if r["task"] == "T-0001")
+    assert row["flags"].split().count("TAKEOVER") == 1 and "ended" not in row["flags"]
+    _terminal(monkeypatch, alive=True, created=222)                   # the pid now belongs to another process
+    res = w.tick()
+    ended = _sys_events(root, "takeover_ended")
+    assert len(ended) == 1 and ended[0]["actor"] == "watcher" and "reused" in ended[0]["data"]["reason"]
+    assert len(_takeover_needs(res)) == 1
+
+
+def test_a_takeover_closed_normally_gets_no_second_ended_event(world, monkeypatch):
+    root, _, _ = world
+    _taken_over(root, monkeypatch)
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover_ended", "--task", "T-0001",
+        "--note", "takeover terminal closed")                        # the script's own line after claude exited
+    _terminal(monkeypatch, alive=False)                               # and then the window was closed
+    w = Watcher(root, quiet=True, auto_decide=True, stale_minutes=0)
+    for _ in range(2):
+        res = w.tick()
+    ended = _sys_events(root, "takeover_ended")
+    assert len(ended) == 1 and ended[0]["actor"] == "omri"
+    needs = _takeover_needs(res)
+    assert len(needs) == 1 and "takeover session ended" in needs[0], needs
+
+
+def test_a_takeover_with_no_terminal_recorded_is_left_alone(world, monkeypatch):
+    """A takeover opened before T-0273 (or whose script has not recorded its pid yet): nothing to check."""
+    root, _, _ = world
+    _taken_over(root, monkeypatch, terminal_pid=None)
+    _terminal(monkeypatch, alive=False)
+    Watcher(root, quiet=True, auto_decide=True, stale_minutes=0).tick()
+    assert not _sys_events(root, "takeover_ended")
+
+
+def test_a_closed_takeover_of_a_session_with_no_task_is_ended_too(world, monkeypatch):
+    """An intake session (no task): the takeover is found by its session id, and the script's own takeover_ended,
+    which names the session only in its note, closes it."""
+    import scr.watch as w
+    root, _, _ = world
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    for s in (sid, other):
+        scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--note", "taken over",
+            "--data", json.dumps({"session_id": s, "by": "omri", "kind": "intake"}))
+        monkeypatch.setattr(w, "process_created", lambda pid: 111)
+        discuss_mod.takeover_terminal(root, None, s, 5555)
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover_ended",
+        "--note", f"takeover terminal of session {other} closed")
+    assert [tk["session_id"] for tk in open_takeovers(EventLog(root / "events" / "events.jsonl").read())] == [sid]
+    _terminal(monkeypatch, alive=False)
+    wt = Watcher(root, quiet=True, stale_minutes=0)
+    res = wt.tick()
+    assert [n for n in _takeover_needs(res) if sid in n]
+    wt.tick()
+    ended = [e for e in _sys_events(root, "takeover_ended") if e["actor"] == "watcher"]
+    assert len(ended) == 1 and ended[0].get("task") is None and ended[0]["data"]["session_id"] == sid
+
+
+def test_takeover_of_carries_the_terminal_and_who_ended_it():
+    def ev(**k):
+        return {"kind": "system", "task": "T-1", **k}
+    to = ev(name="takeover", ts="a", data={"session_id": "s"})
+    term = ev(name="takeover_terminal", data={"session_id": "s", "pid": 9, "created": 7})
+    tk = takeover_of([to, term], "T-1")
+    assert (tk["pid"], tk["created"], tk["ended"]) == (9, 7, None)
+    assert takeover_of([to, ev(name="takeover_terminal", data={"session_id": "x", "pid": 9})], "T-1")["pid"] is None
+    tk = takeover_of([to, term, ev(name="takeover_ended", ts="b", actor="watcher"), ev(name="takeover_ended", ts="c", actor="omri")], "T-1")
+    assert (tk["ended"], tk["ended_by"]) == ("b", "watcher")          # the first end is the end
+    assert open_takeovers([to, term]) and not open_takeovers([to, term, ev(name="takeover_ended", ts="b")])
+
+
+def test_takeover_script_records_its_terminal_before_resuming(world, monkeypatch):
+    """The launch script names its own process before `claude --resume` (the resume line itself unchanged), and
+    `scr takeover --terminal-pid` records that pid with its real creation time."""
+    import scr.run as run_mod
+    root, repo, _ = world
+    sid = _recorded(root, repo, pid=777005)
+    _fake_process(monkeypatch, alive=False)
+    opened: list[tuple] = []
+    monkeypatch.setattr(discuss_mod, "open_ps1_terminal", lambda ps1, title, cwd: opened.append((ps1, cwd)) or "terminal opened")
+    monkeypatch.setattr(discuss_mod, "open_sh_terminal", lambda line: opened.append((line, None)) or "terminal opened")
+    discuss_mod.takeover(root, "T-0001")
+    (script, cwd), = opened
+    text = Path(script).read_text(encoding="utf-8-sig") if cwd is not None else script
+    argv = discuss_mod.resume_argv(root, discuss_mod.recorded_session(EventLog(root / "events" / "events.jsonl").read(), "T-0001"))
+    if cwd is not None:
+        lines = text.splitlines()
+        rec = next(i for i, l in enumerate(lines) if "'--terminal-pid' $PID" in l)
+        res = next(i for i, l in enumerate(lines) if " ".join(f"'{a}'" for a in argv) in l)
+        assert rec < res and f"'{sid}'" in lines[rec] and "'takeover'" in lines[rec]
+    else:
+        assert text.index("--terminal-pid") < text.index("--resume")
+    scr(root, "--quiet", "--actor", "omri", "takeover", "T-0001", "--session", sid, "--terminal-pid", str(os.getpid()))
+    ev, = _sys_events(root, "takeover_terminal")
+    assert ev["task"] == "T-0001" and ev["data"]["session_id"] == sid and ev["data"]["pid"] == os.getpid()
+    assert ev["data"]["created"] == run_mod.process_created(os.getpid())
+    assert takeover_of(EventLog(root / "events" / "events.jsonl").read(), "T-0001")["pid"] == os.getpid()
+
+
 def test_ui_offers_take_over_for_a_recorded_session(world, monkeypatch):
     """The task page (and the running / recent rows, same helper) carries the newest recorded session; `alive`
     is what makes the Take over button ask before it stops the pid."""

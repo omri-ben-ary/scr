@@ -567,16 +567,34 @@ def takeover(root: Path, task: str | None = None, session: str | None = None, st
     stem = tdir / f"{tid or kind}-{int(time.time())}"
     ended = [*scr_exe(root), "--root", str(root), "--actor", by, "event", "system", "--name", "takeover_ended",
              *(["--task", tid] if tid else []), "--note", f"takeover terminal of session {sid} closed", "--quiet"]
+    # T-0273: the terminal's own process is recorded first (its pid is appended by the shell: $PID / $$). Closing the
+    # window kills it with the claude inside it, before the `ended` line can run; the watcher then ends the takeover.
+    terminal = [*scr_exe(root), "--root", str(root), "--actor", by, "takeover", *([tid] if tid else []), "--session", sid,
+                "--quiet", "--terminal-pid"]
     if os.name == "nt":
         ff = stem.with_suffix(".first.txt")
         ff.write_text(first, encoding="utf-8")
         ps1 = stem.with_suffix(".launch.ps1")
         ps1.write_text("﻿" + f"Set-Location -LiteralPath {ps_quote(str(cwd))}\n"
+                       f"& {' '.join(ps_quote(a) for a in terminal)} $PID | Out-Null\n"
                        f"Write-Host (Get-Content -Raw -Encoding UTF8 {ps_quote(str(ff))}) -ForegroundColor Yellow\n"
                        f"& {' '.join(ps_quote(a) for a in argv)}\n"
                        f"& {' '.join(ps_quote(a) for a in ended)}\n", encoding="utf-8")
         out.append(open_ps1_terminal(ps1, f"Take over: {tid or kind}", cwd))
     else:
         q = lambda a: "'" + a.replace("'", "'\\''") + "'"   # noqa: E731
-        out.append(open_sh_terminal(f"cd {q(str(cwd))} && echo {q(first)} && {' '.join(q(a) for a in argv)}; {' '.join(q(a) for a in ended)}"))
+        out.append(open_sh_terminal(f"cd {q(str(cwd))} && {' '.join(q(a) for a in terminal)} $$ >/dev/null; echo {q(first)} && "
+                                    f"{' '.join(q(a) for a in argv)}; {' '.join(q(a) for a in ended)}"))
     return out
+
+
+def takeover_terminal(root: Path, task: str | None, session: str, pid: int, by: str = "omri") -> dict:
+    """Record the process of a takeover's terminal (T-0273): the launch script calls `scr takeover <task> --session
+    <id> --terminal-pid <its own pid>` before it resumes claude. The event carries the pid's creation time (T-0147),
+    so the watcher can tell the terminal from a later process that reused its pid; while the takeover is open and
+    this pid is gone, the terminal was closed without its `takeover_ended` line and the watcher writes it."""
+    from . import watch as w
+    return EventLog(root / "events" / "events.jsonl").append(
+        "system", name="takeover_terminal", actor=by, **({"task": task} if task else {}),
+        note=f"takeover terminal of session {session}: pid {pid}",
+        data={"session_id": session, "by": by, "pid": int(pid), "created": w.process_created(pid)})

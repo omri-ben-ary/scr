@@ -18,7 +18,8 @@ Per tick:
                     its attempt refunded, and ONE credits_exhausted event pauses auto-dispatch and reviews (one
                     `credits` needs line) for credits_pause_minutes or until a credits_resumed / watcher_resumed event
     takeover     a `takeover` event (scr takeover, T-0247) makes the run Omri's: no dead check, no stale, no HELP
-                    escalation, no dispatch timeout, no relaunch; one needs line once its terminal closed unsubmitted
+                    escalation, no dispatch timeout, no relaunch; one needs line once its terminal closed unsubmitted;
+                    a terminal closed with X (its recorded pid dead or reused, T-0273) -> takeover_ended by the watcher
     heartbeat    checkpoint -> in_progress
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
@@ -190,22 +191,66 @@ def takeover_of(events: list[dict], tid: str) -> dict | None:
     `takeover` event, `ended` the ts of a later `takeover_ended` (the resumed terminal closed) or None. A new run
     (dispatched -> in_progress), a new scriber launch or a `takeover_aborted` (the headless pid could not be
     stopped, so nothing was resumed) ends it. While one stands the task is Omri's: its headless session ending is
-    no death, it is not relaunched, costs no attempt, is never stale and never escalated for a HELP line."""
+    no death, it is not relaunched, costs no attempt, is never stale and never escalated for a HELP line.
+    T-0273 adds `pid` / `created` (the terminal's process, from its `takeover_terminal` event; None until the launch
+    script recorded it) and `ended_by` (the actor of the `takeover_ended`: `watcher` when the terminal was closed)."""
     cur: dict | None = None
     for e in events:
         if e.get("task") != tid:
             continue
-        if e.get("kind") == "state" and e.get("to") == "in_progress" and e.get("from") == "dispatched":
-            cur = None
-        elif is_scriber_launch(e):
-            cur = None
-        elif e.get("kind") == "system" and e.get("name") == "takeover":
-            cur = {"ts": e.get("ts"), "session_id": (e.get("data") or {}).get("session_id"), "ended": None}
-        elif e.get("kind") == "system" and e.get("name") == "takeover_ended" and cur:
-            cur["ended"] = e.get("ts")
-        elif e.get("kind") == "system" and e.get("name") == "takeover_aborted":
-            cur = None
+        cur = _takeover_step(cur, e)
     return cur
+
+
+def _takeover_step(cur: dict | None, e: dict) -> dict | None:
+    """One event applied to the takeover standing on one run (takeover_of's rule; open_takeovers' for sessions
+    with no task)."""
+    name, d = e.get("name"), e.get("data") or {}
+    if e.get("kind") == "state" and e.get("to") == "in_progress" and e.get("from") == "dispatched":
+        return None
+    if is_scriber_launch(e) or (e.get("kind") == "system" and name == "takeover_aborted"):
+        return None
+    if e.get("kind") != "system":
+        return cur
+    if name == "takeover":
+        return {"ts": e.get("ts"), "task": e.get("task"), "session_id": d.get("session_id"), "ended": None, "ended_by": None,
+                "pid": None, "created": None}
+    if name == "takeover_terminal" and cur and not cur["ended"] and d.get("session_id") in (None, cur["session_id"]):
+        cur["pid"], cur["created"] = d.get("pid"), d.get("created")
+    elif name == "takeover_ended" and cur and not cur["ended"]:
+        cur["ended"], cur["ended_by"] = e.get("ts"), e.get("actor")
+    return cur
+
+
+_ENDED_SESSION = re.compile(r"session (\S+) closed")
+
+
+def open_takeovers(events: list[dict]) -> list[dict]:
+    """Every takeover still open (no `takeover_ended` yet), task or not (T-0273): a task's current one by
+    takeover_of's rule; a session with no task (intake) by its session id, which its `takeover_ended` carries only
+    in the note (`takeover terminal of session <id> closed`)."""
+    tids = {e.get("task") for e in events if e.get("kind") == "system" and e.get("name") == "takeover" and e.get("task")}
+    out = [tk for tid in sorted(tids) if (tk := takeover_of(events, tid)) and not tk["ended"]]
+    loose: dict[str, dict | None] = {}
+    for e in events:
+        if e.get("kind") != "system" or e.get("task") or e.get("name") not in {"takeover", "takeover_terminal", "takeover_ended", "takeover_aborted"}:
+            continue
+        sid = (e.get("data") or {}).get("session_id")
+        if not sid and e.get("name") == "takeover_ended":
+            m = _ENDED_SESSION.search(e.get("note") or "")
+            sid = m.group(1) if m else None
+        if sid:
+            loose[sid] = _takeover_step(loose.get(sid), e)
+    return out + [tk for tk in loose.values() if tk and not tk["ended"]]
+
+
+def takeover_need_text(tid: str, tk: dict) -> str:
+    """The one needs line of a task whose takeover ended without a submission (T-0247); T-0273: when the watcher
+    ended it, the terminal was closed without its takeover_ended line."""
+    how = ("takeover terminal was closed (the watcher ended the takeover)" if tk.get("ended_by") == "watcher"
+           else "takeover session ended")
+    return (f"{tid} {how} without report.md — resume it again (Take over), "
+            f"or `scr task set {tid} submitted` / `returned`")
 
 
 def dispatch_stale(events: list[dict], tid: str, minutes: float, now: datetime) -> dict | None:
@@ -584,6 +629,48 @@ class Watcher:
                 pass
         return datetime.fromtimestamp(newest, tz=timezone.utc) if newest else None
 
+    @staticmethod
+    def terminal_gone(tk: dict) -> str | None:
+        """Why an open takeover's terminal is gone, or None: its recorded pid no longer exists, or the pid now
+        belongs to another process (another creation time, T-0147). None when no terminal was recorded yet."""
+        if not tk.get("pid"):
+            return None
+        if not pid_alive(tk["pid"]):
+            return f"pid {tk['pid']} no longer exists"
+        if Watcher.pid_reused(tk):
+            return f"pid {tk['pid']} was reused by another process"
+        return None
+
+    def end_closed_takeovers(self, tasks: dict, running: set[str]) -> None:
+        """T-0273: a takeover terminal closed with X never runs its `takeover_ended` line, so the task stayed Omri's
+        forever. Every open takeover whose recorded terminal pid is dead or reused gets that event here, once (actor
+        `watcher`, note "terminal closed"), and ONE needs line: the running loop's `takeover:<id>` line for a
+        running task (every tick while it stands), this one, on the tick it is ended, for any other task or a session
+        with no task. Nothing is relaunched; Omri decides what the task does next."""
+        for tk in open_takeovers(self.read_events()):
+            why = self.terminal_gone(tk)
+            if not why:
+                continue
+            who = tk["task"] or f"session {tk['session_id']}"
+            key = f"takeover_closed:{tk['task'] or tk['session_id']}:{tk['ts']}"
+            if not self.flag(key):
+                continue
+            data = {"session_id": tk["session_id"], "by": "watcher", "pid": tk["pid"], "reason": why}
+            if self.scr("watcher", "event", "system", "--name", "takeover_ended", *(["--task", tk["task"]] if tk["task"] else []),
+                        "--note", "terminal closed", "--data", json.dumps(data), "--quiet") is None:
+                self.unflag(key)                                     # retried next tick
+                continue
+            self.log(f"{who} takeover terminal closed without takeover_ended ({why}): takeover ended by the watcher")
+            self.events = None                                       # the running loop below reads the new event
+            if not tk["task"]:
+                self.need(f"takeover:{tk['session_id']}", f"session {tk['session_id']} takeover terminal closed ({why}); "
+                          "the watcher ended the takeover — resume it again (Take over) if it was not finished")
+            elif tk["task"] not in running:
+                t = tasks.get(tk["task"])
+                self.need(f"takeover:{tk['task']}", f"{tk['task']} ({t.status if t else 'no record'}) takeover terminal of session "
+                          f"{tk['session_id']} closed ({why}); the watcher ended the takeover — resume it again (Take over) "
+                          "if it was not finished", tk["task"])
+
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
         now = datetime.now(timezone.utc)
@@ -611,6 +698,8 @@ class Watcher:
             self.scr("steward-watch", "event", "system", "--name", "verify_failed", "--note", "; ".join(v["errors"][:3])[:300], "--quiet")
         tasks = self.store.load_all()
         running = [t for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint"}]
+        if ok:
+            self.end_closed_takeovers(tasks, {t.id for t in running})
 
         for t in running:
             wl = workload_for(self.root, self.store, t)     # the task's own workload, not the default
@@ -725,8 +814,7 @@ class Watcher:
             if tk:
                 flags.append("TAKEOVER" + (" ended" if tk["ended"] else ""))
                 if tk["ended"] and not submitted:
-                    self.need(f"takeover:{t.id}", f"{t.id} takeover session ended without report.md — resume it again (Take over), "
-                              f"or `scr task set {t.id} submitted` / `returned`", t.id)
+                    self.need(f"takeover:{t.id}", takeover_need_text(t.id, tk), t.id)
             if ok and submitted and t.status != "submitted":
                 if t.status == "checkpoint":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "in_progress", "--quiet")
