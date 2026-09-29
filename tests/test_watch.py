@@ -3726,3 +3726,113 @@ def test_live_config_leaves_every_workload_unfrozen_and_intake_names_the_note():
     wls = yaml.safe_load((REPO / "config" / "workloads.yaml").read_text(encoding="utf-8"))
     assert all(not cfg.get("frozen") for cfg in wls.values())
     assert '"frozen workload: parked for the thaw"' in (REPO / "agents" / "intake.md").read_text(encoding="utf-8")
+
+
+# ---- T-0274: taking over a review session holds the review; its end relaunches it or applies the Decision -------
+# `scr takeover` on a submitted task picks the review's launch (recorded_session), so the `takeover` event carries
+# `kind: review`. Before T-0274 the watcher ignored it: review_stale escalated the task under Omri, and a takeover
+# ended with no Decision left `review:<id>` set (the dead-review state: a hand edit of .scr/watch.state.txt).
+from scr.watch import review_takeover  # noqa: E402
+
+
+def _takeover_event(root: Path, tid: str = "T-0001", kind: str = "review") -> str:
+    sid = str(uuid.uuid4())
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--task", tid,
+        "--note", "taken over", "--data", json.dumps({"session_id": sid, "by": "omri", "kind": kind}))
+    return sid
+
+
+def _reviewing(root: Path, monkeypatch) -> list[str]:
+    """T-0001 submitted and its review launched (the `review:` flag set, start_review faked); returns the ids
+    start_review was called for."""
+    _submit(root)
+    reviews: list[str] = []
+    monkeypatch.setattr(Watcher, "start_review", lambda self, t: reviews.append(t.id))
+    Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert reviews == ["T-0001"] and "review:T-0001" in _flags(root)
+    return reviews
+
+
+def test_review_takeover_is_the_takeover_of_the_current_submissions_review():
+    def ev(ts, **k):
+        return {"kind": "system", "task": "T-1", "ts": ts, **k}
+    sub = {"kind": "state", "task": "T-1", "from": "in_progress", "to": "submitted", "ts": "2026-09-29T10:00:00Z"}
+    rev = ev("2026-09-29T11:00:00Z", name="takeover", data={"session_id": "r", "kind": "review"})
+    assert review_takeover([sub, rev], "T-1")["session_id"] == "r"
+    assert review_takeover([sub, ev("2026-09-29T11:00:00Z", name="takeover", data={"session_id": "r", "kind": "tooling-review"})], "T-1")
+    assert review_takeover([sub, ev("2026-09-29T11:00:00Z", name="takeover", data={"session_id": "s", "kind": "scriber"})], "T-1") is None
+    assert review_takeover([sub, ev("2026-09-29T11:00:00Z", name="takeover", data={"session_id": "s"})], "T-1") is None
+    assert review_takeover([rev, {**sub, "ts": "2026-09-29T12:00:00Z"}], "T-1") is None      # an earlier submission's review
+    assert review_takeover([rev], "T-1") is None                                                 # never submitted
+    ended = review_takeover([sub, rev, ev("2026-09-29T12:00:00Z", name="takeover_ended")], "T-1")
+    assert ended["ended"] == "2026-09-29T12:00:00Z"
+
+
+def test_an_open_review_takeover_raises_no_dead_review_or_review_stale(world, monkeypatch):
+    root, repo, _ = world
+    reviews = _reviewing(root, monkeypatch)
+    _recorded(root, repo, pid=777010, kind="review", created=1)       # the review's launch, which takeover picks
+    _takeover_event(root)
+    _backdate(root, "T-0001", "submitted", 300)                        # 5 h > review_stale_hours 2
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: False)     # the stopped review pid is gone
+    w = Watcher(root, quiet=True, auto_review=True, auto_decide=True)
+    for _ in range(2):
+        res = w.tick()
+        assert res["ok"] and not res["escalated"], res
+    assert Store(root).get("T-0001").status == "submitted" and not _events(root, "slot_freed", "T-0001")
+    assert reviews == ["T-0001"] and "review:T-0001" in _flags(root)  # Omri's review: nothing relaunched, flag held
+    assert not [n for n in res["needs"] if "T-0001" in n], res["needs"]
+
+
+def test_a_review_takeover_ended_without_a_decision_relaunches_the_review(world, monkeypatch):
+    root, _, _ = world
+    reviews = _reviewing(root, monkeypatch)
+    _takeover_event(root)
+    _backdate(root, "T-0001", "submitted", 300)
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover_ended", "--task", "T-0001",
+        "--note", "takeover terminal closed")
+    w = Watcher(root, quiet=True, auto_review=True, auto_decide=True)
+    res = w.tick()
+    # the flag is gone from watch.state (nobody edited it) and the review_stale clock restarted at the end
+    assert "review:T-0001" not in _flags(root) and reviews == ["T-0001"]
+    assert not res["escalated"] and Store(root).get("T-0001").status == "submitted"
+    assert "review takeover ended with no Decision" in (root / LOG).read_text(encoding="utf-8")
+    w.tick()                                                           # the next tick launches a fresh review
+    assert reviews == ["T-0001", "T-0001"] and "review:T-0001" in _flags(root)
+    w.tick()                                                           # once: the flag is not cleared again
+    assert reviews == ["T-0001", "T-0001"] and Store(root).get("T-0001").status == "submitted"
+
+
+def test_a_review_takeover_ended_with_a_decision_applies_it(world, monkeypatch):
+    root, _, _ = world
+    reviews = _reviewing(root, monkeypatch)
+    _takeover_event(root)
+    _write_review(root, "T-0001", _review(decision="returned (feedback below)", feedback="Decision: returned (Omri: tests red)"))
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover_ended", "--task", "T-0001",
+        "--note", "takeover terminal closed")
+    res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "returned" and res["decided"] and reviews == ["T-0001"]
+    assert _state_events(root, "T-0001")[-1]["note"].startswith(DECISION_NOTE)
+    # without auto-decide the written Decision is held for Omri as before, and no review is relaunched over it
+    root2 = root
+    for st in ("ready", "dispatched", "in_progress", "submitted"):
+        scr(root2, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    _takeover_event(root2)
+    scr(root2, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover_ended", "--task", "T-0001", "--note", "closed")
+    Watcher(root2, quiet=True, auto_review=True).tick()
+    assert Store(root2).get("T-0001").status == "submitted" and reviews == ["T-0001"]
+
+
+def test_a_scriber_takeover_does_not_hold_the_review(world, monkeypatch):
+    """T-0247's scriber takeover is untouched: its task, once submitted, is reviewed and review_stale escalates it."""
+    root, _, _ = world
+    _dispatched(root)
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "in_progress")
+    _takeover_event(root, kind="scriber")
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "submitted")
+    reviews: list[str] = []
+    monkeypatch.setattr(Watcher, "start_review", lambda self, t: reviews.append(t.id))
+    _backdate(root, "T-0001", "submitted", 300)
+    assert review_takeover(EventLog(root / "events" / "events.jsonl").read(), "T-0001") is None
+    res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
+    assert reviews == ["T-0001"] and res["escalated"] and Store(root).get("T-0001").status == "escalated"

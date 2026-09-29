@@ -19,7 +19,10 @@ Per tick:
                     `credits` needs line) for credits_pause_minutes or until a credits_resumed / watcher_resumed event
     takeover     a `takeover` event (scr takeover, T-0247) makes the run Omri's: no dead check, no stale, no HELP
                     escalation, no dispatch timeout, no relaunch; one needs line once its terminal closed unsubmitted;
-                    a terminal closed with X (its recorded pid dead or reused, T-0273) -> takeover_ended by the watcher
+                    a terminal closed with X (its recorded pid dead or reused, T-0273) -> takeover_ended by the watcher;
+                    a takeover of a submitted task's REVIEW session (T-0274) holds its review the same way: no relaunch,
+                    no review_stale while it stands; ended with no Decision -> `review:<id>` cleared once, so the next
+                    tick relaunches the review (its review_stale clock counts from the end)
     heartbeat    checkpoint -> in_progress
     stale        idle >= stale_minutes while the session is alive -> stale event (once per idle episode)
   submitted     -> a Decision written in review.md is applied as steward:<id> (auto-decide; T-0091)
@@ -214,12 +217,27 @@ def _takeover_step(cur: dict | None, e: dict) -> dict | None:
         return cur
     if name == "takeover":
         return {"ts": e.get("ts"), "task": e.get("task"), "session_id": d.get("session_id"), "ended": None, "ended_by": None,
-                "pid": None, "created": None}
+                "pid": None, "created": None, "kind": d.get("kind")}
     if name == "takeover_terminal" and cur and not cur["ended"] and d.get("session_id") in (None, cur["session_id"]):
         cur["pid"], cur["created"] = d.get("pid"), d.get("created")
     elif name == "takeover_ended" and cur and not cur["ended"]:
         cur["ended"], cur["ended_by"] = e.get("ts"), e.get("actor")
     return cur
+
+
+REVIEW_KINDS = {"review", "tooling-review"}     # the `launch` kinds of a submitted task's review session
+
+
+def review_takeover(events: list[dict], tid: str) -> dict | None:
+    """The takeover of the review of the task's CURRENT submission, or None (T-0274): takeover_of's takeover when
+    its session kind is a review's and it was taken after the newest `submitted`. While it is open the review is
+    Omri's (no relaunch, no review_stale); once it ended without a Decision the watcher clears `review:<id>` so
+    the next tick relaunches the review, and the review_stale clock counts from the end."""
+    tk = takeover_of(events, tid)
+    if not tk or tk.get("kind") not in REVIEW_KINDS:
+        return None
+    since, at = submitted_since(events, tid), _event_ts({"ts": tk["ts"]})
+    return tk if since and at and at >= since else None
 
 
 _ENDED_SESSION = re.compile(r"session (\S+) closed")
@@ -667,9 +685,10 @@ class Watcher:
                           "the watcher ended the takeover — resume it again (Take over) if it was not finished")
             elif tk["task"] not in running:
                 t = tasks.get(tk["task"])
+                then = ("with no Decision in review.md the review is relaunched (T-0274)" if tk.get("kind") in REVIEW_KINDS
+                        else "resume it again (Take over) if it was not finished")
                 self.need(f"takeover:{tk['task']}", f"{tk['task']} ({t.status if t else 'no record'}) takeover terminal of session "
-                          f"{tk['session_id']} closed ({why}); the watcher ended the takeover — resume it again (Take over) "
-                          "if it was not finished", tk["task"])
+                          f"{tk['session_id']} closed ({why}); the watcher ended the takeover — {then}", tk["task"])
 
     # ---- one tick ------------------------------------------------------------------
     def tick(self) -> dict:
@@ -870,6 +889,17 @@ class Watcher:
             # A verdict the review wrote but could not execute (T-0061: `scr` denied, `escalated` sat 35 h)
             # is applied here; a task whose decision is applied needs no review session.
             if self.auto_decide and ok and self.apply_decision(t, decided):
+                continue
+            # T-0274: a review Omri took over is his while the takeover stands (its `review:` flag holds, nothing is
+            # relaunched); once it ended with no Decision applied above, the flag goes ONCE, so the next tick
+            # launches a fresh review — no hand edit of watch.state
+            if (rt := review_takeover(self.read_events(), t.id)) and not rt["ended"]:
+                continue
+            rev = t.dir / "review.md"
+            written = any(read_decision(rev.read_text(encoding="utf-8", errors="replace"))) if rev.exists() else False
+            if ok and rt and not written and self.flag(f"review_takeover_ended:{t.id}:{rt['ts']}"):
+                self.unflag(f"review:{t.id}")
+                self.log(f"{t.id} review takeover ended with no Decision: review:{t.id} cleared, the next tick relaunches the review")
                 continue
             # T-0187: a review session that printed the credit-exhaustion line never reviewed; its flag goes, so a
             # fresh review starts once the credit pause is over (never while it stands)
@@ -1236,7 +1266,12 @@ class Watcher:
             if t.status == "submitted":
                 rev = t.dir / "review.md"
                 text = rev.read_text(encoding="utf-8", errors="replace") if rev.exists() else ""
-                row = submitted_stale(t.status, text, submitted_since(events, t.id), review_h, now)
+                since = submitted_since(events, t.id)
+                if rt := review_takeover(events, t.id):
+                    if not rt["ended"]:
+                        continue            # Omri is in the review (T-0274): no review_stale while it stands
+                    since = max(since, _event_ts({"ts": rt["ended"]}) or since)   # the relaunched review's clock
+                row = submitted_stale(t.status, text, since, review_h, now)
                 if not row:
                     continue
                 tr = self.newest_review_transcript(t)
