@@ -285,6 +285,24 @@ def cmd_dispatch(args):
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")
     ranked = [r["task"] for r in rows]
+    # T-0272: a frozen workload's task is never picked; `scr --actor omri dispatch <id>` is the one exception path
+    from .ops import task_frozen, workload_for
+    if args.ids:
+        for tid in args.ids:
+            if tid not in g.tasks:
+                raise RepoError(f"{tid}: no such task")
+            if task_frozen(store, g.tasks[tid]) and args.actor != "omri":
+                raise RepoError(f"{tid}: workload '{workload_for(root, store, g.tasks[tid]).name}' is frozen (config/workloads.yaml); "
+                                f"only Omri dispatches its tasks: scr --actor omri dispatch {tid}")
+            if tid not in ranked:
+                raise RepoError(f"{tid}: not dispatchable (status {g.tasks[tid].status}; needs a ready scribers task)")
+        ranked = [t for t in ranked if t in args.ids]
+    held: list[str] = []
+    if not args.ids:
+        held = [t for t in ranked if task_frozen(store, g.tasks[t])]
+        if held:
+            print(f"frozen: {len(held)} task(s) held ({', '.join(held)})")
+            ranked = [t for t in ranked if t not in held]
     # may_touch_statements tasks need --allow-statements and the limits.yaml statement_window to be open (T-0125)
     if not args.allow_statements or not statement_window_open(limits.get("statement_window")):
         if args.allow_statements:
@@ -313,7 +331,7 @@ def cmd_dispatch(args):
         print(f"dispatched {tid} -> {t.rec['branch']} (attempt {nxt} if it launches)")
     if not chosen:
         log.append("system", name="intake_starved" if not rows else "dispatch_blocked", actor=args.actor,
-                   data={"ready": len(rows), "running": running})
+                   data={"ready": len(rows), "running": running, **({"frozen": held} if held else {})})
         print("nothing dispatched")
     refresh(root, args.quiet)
 
@@ -340,6 +358,9 @@ def cmd_verify(args):
         for w in r["warnings"]:
             if not args.quiet:
                 print("warn   ", w)
+        for i in r.get("info", []):
+            if not args.quiet:
+                print("info   ", i)
         print(f"state_root {r['state_root'][:16]}  {len(r['errors'])} errors, {len(r['warnings'])} warnings")
     sys.exit(1 if r["errors"] else 0)
 
@@ -701,6 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sc = sub.add_parser("score", parents=[common], help="prioritization scores"); sc.add_argument("id", nargs="?"); sc.add_argument("--queue", default="scribers"); sc.set_defaults(fn=cmd_score)
     d = sub.add_parser("dispatch", parents=[common], help="pick a conflict-free set of ready tasks and mark them dispatched")
+    d.add_argument("ids", nargs="*", help="dispatch only these tasks (a frozen workload's task: --actor omri only)")
     d.add_argument("--dry-run", action="store_true"); d.add_argument("--allow-statements", action="store_true"); d.set_defaults(fn=cmd_dispatch)
 
     ev = sub.add_parser("event", parents=[common], help="append a system/checkin event")

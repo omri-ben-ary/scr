@@ -31,6 +31,7 @@ from . import chores as chores_mod
 from .events import EventLog, now_iso
 from .graph import Graph
 from .journal import last_failure
+from .ops import frozen_workloads
 from .queue import ESCALATED_STATUSES, decision_line
 from .run import _env, scr_cmd, scr_exe
 from .state import State
@@ -385,6 +386,7 @@ def state(root: Path) -> dict:
         "verify_ok": not v["errors"], "verify_out": "; ".join(v["errors"][:3])[:400], "state_root": (snap.get("state_root") or "")[:12],
         "journal": {"head": head, "dirty": len(gj.dirty()) if head else 0, "last_failure": last_failure(root)},
         "last_watch_tick": last_tick, "pid": os.getpid(), "paused": paused(root),
+        "frozen": frozen_workloads(store),   # T-0272: the header badge
         "watcher_running": bool(__import__("scr.run", fromlist=["pids_matching"]).pids_matching(__import__("scr.admin", fromlist=["WATCH_PATTERN"]).WATCH_PATTERN)),
         "needs": needs,
         "running": running, "ready": ready, "recent": recent,

@@ -3446,3 +3446,123 @@ def test_dispatch_records_the_worktree_the_watcher_resolves(world):
     assert t.status == "dispatched"
     assert (root / t.rec["worktree"]).resolve() == task_worktree(workload_for(root, Store(root), t), t).resolve()
     assert t.rec["worktree"] == "../quantum-insertion/.worktrees/T-0001"          # the entry's string form
+
+
+# ---- T-0272: the freeze switch -----------------------------------------------------------------------------
+# `frozen: true` on a workload in config/workloads.yaml: no auto-dispatch (scr dispatch skips the task), no
+# auto-review, no auto-land for its tasks; `scr dispatch <id>` refuses it unless the actor is omri. The world
+# fixture has two workloads: quantum-insertion (first; T-0001) and scriptorium.
+from scr.ops import frozen_workloads, is_frozen  # noqa: E402
+
+
+def _set_frozen(root: Path, name: str, value) -> None:
+    """Set (value True/False) or delete (value None) `frozen` on a workload and commit it, like _set_limit."""
+    p = root / "config" / "workloads.yaml"
+    cfg = yaml.safe_load(p.read_text(encoding="utf-8"))
+    if value is None:
+        cfg[name].pop("frozen", None)
+    else:
+        cfg[name]["frozen"] = value
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    sgit(root, "add", "config/workloads.yaml"); sgit(root, "commit", "-q", "-m", f"[test] workloads: {name}.frozen={value}")
+
+
+def _ready_tooling_task(root: Path, tid: str = "T-0002") -> None:
+    scr(root, "--quiet", "task", "new", f"Tool {tid}", "--id", tid, "--workload", "scriptorium", "--files", "tool.txt", "--origin", "omri")
+    for st in ("triaged", "ready"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+
+
+def test_frozen_workload_task_is_not_auto_dispatched_and_another_is(world, monkeypatch):
+    root, _, _ = world
+    _set_frozen(root, "scriptorium", True)
+    _ready_tooling_task(root)
+    _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    Watcher(root, quiet=True, auto_dispatch=True).tick()
+    assert any(a[0] == "dispatch" for _, a in calls)
+    assert Store(root).get("T-0001").status == "in_progress"            # quantum-insertion: dispatched and launched
+    assert Store(root).get("T-0002").status == "ready"                  # scriptorium, frozen: held
+    log = (root / LOG_FILE).read_text(encoding="utf-8")
+    assert log.count("frozen: 1 scriptorium tasks held (1 ready)") == 1  # one count line per tick, not one per task
+    assert scr(root, "verify", "--quiet").returncode == 0
+
+
+def test_frozen_workload_gets_no_auto_review_and_no_auto_land(world, monkeypatch):
+    root, _, _ = world
+    _set_frozen(root, "quantum-insertion", True)
+    _submit(root)
+    reviews: list[str] = []
+    monkeypatch.setattr(Watcher, "start_review", lambda self, t: reviews.append(t.id))
+    Watcher(root, quiet=True, auto_review=True).tick()
+    assert reviews == [] and "review:T-0001" not in _flags(root)        # held; the flag waits for the thaw
+    assert "frozen: 1 quantum-insertion tasks held (1 submitted)" in (root / LOG_FILE).read_text(encoding="utf-8")
+
+    _write_review(root, "T-0001", accepted_review())
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "accepted")
+    lands: list[str] = []
+    monkeypatch.setattr(watch_mod, "land", lambda root, tid, merge=True: lands.append(tid) or {"ok": False, "url": None, "out": []})
+    Watcher(root, quiet=True, auto_land=True).tick()
+    assert lands == [] and "land:T-0001" not in _flags(root) and Store(root).get("T-0001").status == "accepted"
+
+    _set_frozen(root, "quantum-insertion", False)                        # the thaw: landing resumes on the next tick
+    Watcher(root, quiet=True, auto_land=True).tick()
+    assert lands == ["T-0001"]
+
+
+def test_frozen_submitted_task_is_reviewed_after_the_thaw(world, monkeypatch):
+    root, _, _ = world
+    _set_frozen(root, "quantum-insertion", True)
+    _submit(root)
+    reviews: list[str] = []
+    monkeypatch.setattr(Watcher, "start_review", lambda self, t: reviews.append(t.id))
+    Watcher(root, quiet=True, auto_review=True).tick()
+    assert reviews == []
+    _set_frozen(root, "quantum-insertion", None)
+    Watcher(root, quiet=True, auto_review=True).tick()
+    assert reviews == ["T-0001"]
+
+
+def test_scr_dispatch_of_a_frozen_task_is_omris_alone(world):
+    root, _, _ = world
+    _set_frozen(root, "scriptorium", True)
+    _ready_tooling_task(root)
+    r = scr(root, "--actor", "prioritizer", "dispatch", "T-0002", check=False)
+    assert r.returncode == 2 and "T-0002: workload 'scriptorium' is frozen" in r.stderr, r.stderr
+    assert "scr --actor omri dispatch T-0002" in r.stderr
+    assert Store(root).get("T-0002").status == "ready"
+    out = scr(root, "--actor", "prioritizer", "dispatch", "--dry-run").stdout      # a bare dispatch skips it
+    assert "frozen: 1 task(s) held (T-0002)" in out and "would dispatch: T-0001 " in out, out
+    r = scr(root, "--actor", "omri", "dispatch", "T-0002")
+    assert "dispatched T-0002" in r.stdout and Store(root).get("T-0002").status == "dispatched"
+    assert Store(root).get("T-0001").status == "ready"                           # only the named task
+    assert scr(root, "verify", "--quiet").returncode == 0
+
+
+def test_frozen_flag_absent_is_false(world):
+    root, _, _ = world
+    _ready_tooling_task(root)
+    outs = []
+    for value in (None, False):
+        _set_frozen(root, "scriptorium", value)
+        assert not is_frozen(Store(root), "scriptorium") and frozen_workloads(Store(root)) == []
+        outs.append(scr(root, "dispatch", "--dry-run").stdout)
+        scr(root, "--quiet", "refresh")                                           # the snapshot hashes config/
+        assert "info" not in scr(root, "verify").stdout
+    assert outs[0] == outs[1] and "T-0001" in outs[0] and "T-0002" in outs[0] and "frozen" not in outs[0]
+    _set_frozen(root, "scriptorium", "yes")                                        # only a real true freezes
+    assert not is_frozen(Store(root), "scriptorium")
+    _set_frozen(root, "scriptorium", True)
+    assert is_frozen(Store(root), "scriptorium") and not is_frozen(Store(root), "quantum-insertion")
+    assert frozen_workloads(Store(root)) == ["scriptorium"]
+    scr(root, "--quiet", "refresh")
+    v = scr(root, "verify").stdout
+    assert v.count("info    workload 'scriptorium' is frozen") == 1, v
+    assert "exception: scr --actor omri dispatch <id>" in v
+
+
+def test_live_config_leaves_every_workload_unfrozen_and_intake_names_the_note():
+    """T-0272 builds the switch only (T-0276 throws it); the Intake rule names the parking note verbatim."""
+    wls = yaml.safe_load((REPO / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    assert all(not cfg.get("frozen") for cfg in wls.values())
+    assert '"frozen workload: parked for the thaw"' in (REPO / "agents" / "intake.md").read_text(encoding="utf-8")

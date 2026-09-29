@@ -56,6 +56,29 @@ def workload_for(root: Path, store: Store | None, t: Task) -> Workload:
     return workload(root, store, (t.rec or {}).get("workload"))
 
 
+def is_frozen(store: Store, workload: str | None) -> bool:
+    """`frozen: true` on the workload's entry in config/workloads.yaml (T-0272; absent = false). The name resolves
+    the way `workload()` does: missing or unregistered -> the first entry. The one reader of the flag: while it
+    holds, the watcher does not auto-dispatch, auto-review or auto-land the workload's tasks, `scr dispatch`
+    refuses them unless the actor is omri, and `scr verify` and the UI header say so."""
+    wls = store.config("workloads") or {}
+    if not wls:
+        return False
+    if not workload or workload not in wls:
+        workload = next(iter(wls))
+    return (wls.get(workload) or {}).get("frozen") is True
+
+
+def frozen_workloads(store: Store) -> list[str]:
+    """The registered workloads with `frozen: true`, in config order."""
+    return [name for name in (store.config("workloads") or {}) if is_frozen(store, name)]
+
+
+def task_frozen(store: Store, t: Task) -> bool:
+    """True when the task's own workload (T-0036's `workload:`) is frozen."""
+    return is_frozen(store, (t.rec or {}).get("workload"))
+
+
 def self_workload(root: Path, store: Store | None = None) -> Workload | None:
     """The workload whose repo IS the scriptorium checkout (`repo: .` — registered as `scriptorium` by
     T-0043), or None. It is special in three ways (T-0061): its worktrees are spawned from the checkout's

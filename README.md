@@ -140,6 +140,22 @@ submits it; the watcher's Steward reviews the diff and proposes follow-ups, whic
 tasks; accepted → merged. An external agent without a shell here (Claude in Cowork) uses two files:
 `.scr/hotfix/pending.json` before editing and `.scr/hotfix/close.json` when done. See `agents/toolsmith.md`.
 
+## Freezing a workload
+
+`frozen: true` on a workload's entry in `config/workloads.yaml` (T-0272; absent means `false`) stops the
+automation for that workload's tasks and nothing else: the watcher does not auto-dispatch, auto-review or
+auto-land them (it logs one `frozen: N <workload> tasks held` line per tick), and Intake files new proposals
+for it as `triaged` with the note "frozen workload: parked for the thaw" instead of `ready`. Tasks already
+running finish their session and are submitted as usual; they then wait for the thaw. `scr verify` prints
+one `info` line per frozen workload and the UI header shows "<workload> frozen". Other workloads are untouched.
+
+The exception path, for a hotfix during a freeze, is your explicit dispatch: `scr --actor omri dispatch <id>`
+(then `scr launch`). Any other actor, and a bare `scr dispatch`, is refused or skips the task.
+
+To thaw: set `frozen: false` (or delete the key); the next watcher tick dispatches, reviews and lands as
+before. Intake's parked `triaged` tasks need no promotion: `scr dispatch` already picks an unblocked
+`triaged` task, so they are dispatchable again from that tick on.
+
 ## Lifecycle
 
 `proposed → triaged → (blocked) → ready → dispatched → in_progress ⇄ checkpoint →

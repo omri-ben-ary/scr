@@ -16,3 +16,4 @@ Fills both queues. Runs at 22:00 nightly, after any task reaches `merged`/`rejec
 - Every `blocks` edge you add must share a declaration with its blocker or carry `--reason`.
 - Origin is the task whose report proposed it, or `omri` / `intake` / `observer`.
 - After creating: `scr task set <id> triaged`, then `ready` if no open blockers, else `blocked`.
+- Frozen workload (T-0272): if the new task's `workload` has `frozen: true` in `config/workloads.yaml` (`scr verify` prints an `info` line per frozen workload), stop at `triaged`: run `scr task set <id> triaged --note "frozen workload: parked for the thaw"` and never set it `ready` or `blocked`, whatever its blockers. This holds for every source above, Omri's Inbox lines included. A task that is already `ready` is left alone; only Omri dispatches a frozen workload's task (`scr --actor omri dispatch <id>`).

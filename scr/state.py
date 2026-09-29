@@ -181,6 +181,11 @@ class State:
                     warnings.append(f"{tid}: workload '{key or ''}' is not registered in config/workloads.yaml "
                                     f"(resolves to the first entry, '{wls[0]}')")
 
+        # T-0272: a frozen workload is a deliberate state, not a problem: one info line each, never a warning
+        from .ops import frozen_workloads
+        info = [f"workload '{name}' is frozen (config/workloads.yaml): no auto-dispatch, auto-review or auto-land; "
+                f"exception: scr --actor omri dispatch <id>" for name in frozen_workloads(self.store)]
+
         limits = self.store.config("limits")
         warnings += limits_warnings(limits if isinstance(limits, dict) else {})
 
@@ -193,7 +198,7 @@ class State:
                 errors.append("graph/graph.json is not valid JSON")
         else:
             warnings.append("graph/graph.json missing — run `scr snapshot`")
-        return {"errors": errors, "warnings": warnings, "state_root": c["state_root"]}
+        return {"errors": errors, "warnings": warnings, "info": info, "state_root": c["state_root"]}
 
     def diff(self, a: dict, b: dict) -> dict:
         """Compare two snapshots by their recorded hashes only."""

@@ -104,6 +104,7 @@
   <span class="stat">ready <b id="nReady">–</b></span>
   <span class="stat">needs you <b id="nNeeds">–</b></span>
   <span class="stat">watcher <b id="tick">–</b></span>
+  <span class="badge failed" id="frozenBadge" hidden title="frozen: true in config/workloads.yaml — no auto-dispatch, auto-review or auto-land; exception: scr --actor omri dispatch &lt;id&gt;"></span>
   <button id="pauseBtn" class="small" title="Pause: the watcher keeps running but does nothing until you resume">Pause</button>
   <button id="quitBtn" class="small" title="Stop the UI and the watcher; start again from the Scriptorium shortcut">Quit</button>
   <span class="spacer"></span>
@@ -174,6 +175,8 @@ async function refresh() {
   document.title = STATE.needs.length ? `(${STATE.needs.length}) Scriptorium` : 'Scriptorium';   // a pinned tab shows the count (T-0090)
   $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
   $('#pauseBtn').textContent = STATE.paused ? 'Resume' : 'Pause';
+  const frozen = STATE.frozen || [];   // T-0272: "<workload> frozen" while a workload's freeze switch is on
+  $('#frozenBadge').hidden = !frozen.length; $('#frozenBadge').textContent = frozen.map(w => `${w} frozen`).join(' · ');
   renderNeeds(); renderLists(); renderTabs();
 }
 

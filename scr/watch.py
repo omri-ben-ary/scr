@@ -65,7 +65,7 @@ from .gitops import Git
 from .journal import journal
 from .lifecycle import requeue
 from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
-                  scope_drift, self_workload, sweep, task_worktree, workload, workload_for)
+                  scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
 from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, session_argv, start_claude
 from .state import State
 from .store import Store
@@ -777,6 +777,7 @@ class Watcher:
         tasks = self.store.load_all()
         review = [t for t in tasks.values() if t.status == "submitted"]
         decided: list[dict] = []
+        held = self.frozen_held(tasks)
         for t in review:
             # A verdict the review wrote but could not execute (T-0061: `scr` denied, `escalated` sat 35 h)
             # is applied here; a task whose decision is applied needs no review session.
@@ -790,7 +791,8 @@ class Watcher:
                     self.log(f"{t.id} review session out of usage credits ({tr.name}): review relaunched after the pause")
                     self.unflag(f"review:{t.id}")
                     self.credits_seen(t.id, line, now)
-            if self.auto_review and ok and not self.credits_paused(now) and self.flag(f"review:{t.id}"):
+            # a frozen workload's task gets no review (T-0272); its `review:` flag stays unset for the thaw
+            if self.auto_review and ok and t.id not in held and not self.credits_paused(now) and self.flag(f"review:{t.id}"):
                 self.start_review(t)
         if decided:
             tasks = self.store.load_all()                   # auto-land below sees an `accepted` applied this tick
@@ -810,6 +812,8 @@ class Watcher:
         merged_now = 0
         if self.auto_land and ok:
             for t in [t for t in tasks.values() if t.status == "accepted"]:
+                if task_frozen(self.store, t):          # T-0272: held for the thaw; `land:` stays unset
+                    continue
                 if not self.flag(f"land:{t.id}"):
                     continue
                 if is_scriptorium_task(self.root, self.store, t):
@@ -847,6 +851,8 @@ class Watcher:
                 for line in intake(self.root):
                     self.log(f"  intake: {line}")
 
+        if ok and (self.auto_dispatch or self.auto_review or self.auto_land):
+            self.log_frozen(self.store.load_all())
         pause = self.credits_paused(now)
         if pause:
             self.need("credits", f"Out of usage credits (since {pause['since']:%Y-%m-%d %H:%M}Z): auto-dispatch and reviews are paused; "
@@ -875,6 +881,25 @@ class Watcher:
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
                 "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- the freeze switch (T-0272) ---------------------------------------------------------------------------------
+    def frozen_held(self, tasks: dict) -> set[str]:
+        """The ids of the submitted tasks whose workload is frozen (`frozen: true` in config/workloads.yaml,
+        ops.is_frozen): auto-review skips them."""
+        return {tid for tid, t in tasks.items() if t.status == "submitted" and task_frozen(self.store, t)}
+
+    def log_frozen(self, tasks: dict) -> None:
+        """ONE log line per tick for what the freeze holds: the ready, submitted and accepted tasks of each frozen
+        workload, as a count per workload ("frozen: 3 scriptorium tasks held (2 ready, 1 submitted)"), never a
+        line per task. Auto-dispatch skips them inside `scr dispatch`, auto-review and auto-land in tick()."""
+        per: dict[str, dict[str, int]] = {}
+        for t in tasks.values():
+            if t.status in {"ready", "submitted", "accepted"} and task_frozen(self.store, t):
+                c = per.setdefault(workload_for(self.root, self.store, t).name, {})
+                c[t.status] = c.get(t.status, 0) + 1
+        if per:
+            self.log("frozen: " + "; ".join(
+                f"{sum(c.values())} {name} tasks held ({', '.join(f'{n} {st}' for st, n in c.items())})" for name, c in per.items()))
 
     # ---- the daily hygiene pass (docs/hygiene-protocols.md §3, §10; T-0202) ------------------------------------------
     def hygiene_pass(self) -> Path | None:
