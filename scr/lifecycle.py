@@ -62,7 +62,7 @@ def cascade(store, log, tid: str, status: str, actor: str = "scr") -> list[str]:
 def requeue(store, log, tid: str, note: str, actor: str, refund: bool = False) -> bool:
     """A running task whose session is gone goes back to `ready` through the sanctioned path
     (in_progress / checkpoint -> returned -> ready; a task already `returned` takes the second step only), one
-    state event per step (T-0187). `refund` gives back the attempt its dispatch counted (attempts = dispatches),
+    state event per step (T-0187). `refund` gives back the attempt its launch counted (attempts = sessions started, T-0127),
     with a `field` event: a session that died of an exhausted usage-credit balance never ran, so it is not an
     attempt. False when the task is in no status this applies to. Callers refresh STATE.json afterwards."""
     t = store.get(tid)
@@ -88,7 +88,10 @@ def apply(rec: dict, new: str) -> None:
     rec["updated"] = now_iso()
     if new == "ready":
         rec["ready_since"] = now_iso()
-    if new == "dispatched":
-        rec["attempts"] = int(rec.get("attempts", 0)) + 1   # attempts = dispatches
+    if new == "in_progress" and old == "dispatched":
+        # attempts = scriber sessions started (T-0127): charged when the launcher opens the session (it makes this
+        # transition right before it starts claude), never at `scr dispatch`, so a dispatch that never launched and
+        # went back to ready (dispatch_timeout, T-0122) costs nothing. checkpoint -> in_progress is a heartbeat.
+        rec["attempts"] = int(rec.get("attempts", 0)) + 1
     if new in {"merged", "rejected", "closed"}:
         rec.pop("ready_since", None)

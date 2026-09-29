@@ -1547,6 +1547,10 @@ def test_dispatch_timeout_key_is_read_and_mirrored():
     assert "dispatch_timeout_minutes" in src and "dispatch_timeout" in src
     limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
     assert float(limits["dispatch_timeout_minutes"]) == DISPATCH_TIMEOUT_MINUTES == 30
+    # T-0127: the rounds limit, read by dispatch_rounds_needs, mirrored the same way
+    assert "dispatch_timeout_rounds" in src
+    from scr.watch import DISPATCH_TIMEOUT_ROUNDS
+    assert int(limits["dispatch_timeout_rounds"]) == DISPATCH_TIMEOUT_ROUNDS == 3
 
 
 # ---- T-0124: escalating a running task stops its session ---------------------------------------------------
@@ -3265,3 +3269,177 @@ def test_stuck_over_wall_under_takeover_is_held(world):
 def test_wall_rule_is_written_in_the_agent_docs():
     text = (REPO / "agents" / "_common.md").read_text(encoding="utf-8")
     assert any("max_wall_hours" in l and "watcher" in l for l in text.splitlines())
+
+
+# ---- T-0127: a launch that keeps failing costs no attempts and raises one needs line -----------------------
+# After T-0122 a dispatch with no launch goes back to ready after dispatch_timeout_minutes and auto-dispatch may
+# pick it again; `scr dispatch` charged an attempt each round (attempts = dispatches), so three failed launches
+# spent the whole budget with no scriber run, silently. Now the launcher's dispatched -> in_progress charges the
+# attempt, and dispatch_timeout_rounds rounds in a row raise one needs line quoting the launcher's reason.
+from scr.watch import DISPATCH_TIMEOUT_ROUNDS, dispatch_rounds, launcher_reason  # noqa: E402
+
+
+def _attempts(root: Path, tid: str = "T-0001") -> int:
+    return int(Store(root).get(tid).rec.get("attempts", 0))
+
+
+def _field_events(root: Path, tid: str, field: str) -> list[dict]:
+    from scr.events import EventLog
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "field" and e.get("task") == tid and e.get("field") == field]
+
+
+def _no_claude(monkeypatch) -> None:
+    """The launcher finds no claude: launch() logs `claude (Claude Code CLI) not on PATH — nothing launched`."""
+    import scr.launch as launch_mod
+    monkeypatch.setattr(launch_mod, "claude_bin", lambda: None)
+
+
+def _round_needs(res: dict, tid: str = "T-0001") -> list[str]:
+    return [n for n in res["needs"] if n.startswith(f"{tid} was dispatched") and "dispatch_timeout_rounds" in n]
+
+
+def test_dispatch_rounds_is_a_pure_function_of_the_log():
+    to = {"kind": "system", "name": "dispatch_timeout", "task": "T-1"}
+    launch = {"kind": "system", "name": "launch", "task": "T-1", "data": {"kind": "scriber"}}
+    review = {"kind": "system", "name": "launch", "task": "T-1", "data": {"kind": "review"}}
+    assert dispatch_rounds([], "T-1") == 0
+    assert dispatch_rounds([to, to, to], "T-1") == 3
+    assert dispatch_rounds([to, to, launch, to], "T-1") == 1                         # a launch resets the count
+    assert dispatch_rounds([to, review, to], "T-1") == 2                             # a review session is no scriber launch
+    assert dispatch_rounds([to, {**to, "task": "T-2"}, {**launch, "task": "T-2"}], "T-1") == 1
+    assert dispatch_rounds([to, {"kind": "system", "name": "takeover", "task": "T-1"}], "T-1") == 0
+
+
+def test_launcher_reason_reads_the_newest_run_that_names_the_task():
+    log = "\n".join([
+        "2026-09-29T01:00:00 auto-dispatch: dispatched T-0001 -> task/T-0001 (attempt 1 if it launches)",
+        "2026-09-29T01:00:00   launcher: launching: T-0001 (mode headless)",
+        "2026-09-29T01:00:00   launcher: claude (Claude Code CLI) not on PATH — nothing launched",
+        "2026-09-29T01:00:01 tick",
+        "2026-09-29T02:00:00   launcher: launching: T-0001, T-0002 (mode headless)",
+        "2026-09-29T02:00:00   launcher: === T-0001 -> C:/wt/T-0001 (task/T-0001)",
+        "2026-09-29T02:00:00   launcher:   exists, reusing",
+        "2026-09-29T02:00:00   launcher: === T-0002 [dispatched] C:/wt/T-0002",
+        "2026-09-29T02:00:00   launcher:   worktree missing — skipped",
+        "2026-09-29T02:00:00   launcher: === T-0001 [dispatched] C:/wt/T-0001",
+        "2026-09-29T02:00:00   launcher:   worktree missing — skipped",
+        "2026-09-29T02:00:01 tick",
+        "2026-09-29T03:00:00   launcher: launching: T-0002 (mode headless)",
+        "2026-09-29T03:00:00   launcher: === T-0002 NOT launched: bg_wait_minutes = 900 min is over 12 h and was not set by Omri",
+    ])
+    assert launcher_reason(log, "T-0001") == "worktree missing — skipped (launcher, 2026-09-29T02:00:00)"
+    assert launcher_reason(log, "T-0002").startswith("=== T-0002 NOT launched: bg_wait_minutes")
+    first = "\n".join(log.splitlines()[:4])
+    assert launcher_reason(first, "T-0001") == "claude (Claude Code CLI) not on PATH — nothing launched (launcher, 2026-09-29T01:00:00)"
+    assert launcher_reason(log, "T-0003") is None                                    # no run names it
+    assert launcher_reason(log, "T-000") is None                                     # an id prefix is not the task
+    ok = "2026-09-29T04:00:00   launcher: launching: T-0004 (mode headless)\n2026-09-29T04:00:00   launcher:   headless pid 7; transcript x"
+    assert launcher_reason(ok, "T-0004") is None                                     # the run names no failure
+
+
+def test_dispatch_that_never_launched_costs_no_attempt(world, monkeypatch):
+    """DoD: a task dispatched by `scr dispatch` and bounced by dispatch_checks (no launch event) has the attempts it
+    had before the dispatch; dispatched again and launched (the launcher's dispatched -> in_progress, start_claude
+    mocked) it has one more, with one `field attempts` event at the launch and none at a dispatch."""
+    root, _, _ = world
+    before = _attempts(root)
+    out = scr(root, "--actor", "prioritizer", "dispatch").stdout
+    assert f"dispatched T-0001 -> task/T-0001 (attempt {before + 1} if it launches)" in out, out
+    assert Store(root).get("T-0001").status == "dispatched" and _attempts(root) == before
+    assert _state_events(root, "T-0001")[-1]["note"] == f"attempt {before + 1} if it launches"
+    assert not _field_events(root, "T-0001", "attempts")
+    _backdate(root, "T-0001", "dispatched", 45)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and res["timed_out"][0]["task"] == "T-0001", res
+    assert Store(root).get("T-0001").status == "ready" and _attempts(root) == before
+    assert not _field_events(root, "T-0001", "attempts")
+    launches = _record_launches(monkeypatch)
+    res = Watcher(root, quiet=True, auto_dispatch=True).tick()
+    assert res["ok"] and len(launches) == 1, res
+    t = Store(root).get("T-0001")
+    assert t.status == "in_progress" and _attempts(root) == before + 1
+    assert [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["dispatched", "in_progress"]
+    assert [e["value"] for e in _field_events(root, "T-0001", "attempts")] == [before + 1]
+    assert len(_events(root, "launch", "T-0001")) == 1
+    assert scr(root, "verify", "--quiet").returncode == 0
+
+
+def test_dispatch_at_max_attempts_after_real_launches_is_unchanged(world, monkeypatch):
+    """DoD: attempts == max_attempts after real launches -> `scr dispatch` still dispatches it (the budget rule is
+    agents/_common.md's, applied by the Steward, not by dispatch), and its launch is attempt max + 1, as before."""
+    root, _, _ = world
+    budget = int(Store(root).get("T-0001").rec["budget"]["max_attempts"])
+    for i in range(budget):                                  # budget real runs, each launched and returned
+        if i:
+            for st in ("returned", "ready"):
+                scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+        _dispatched(root)
+        scr(root, "--quiet", "--actor", "steward:T-0001", "task", "set", "T-0001", "in_progress")
+        _launched(root, pid=5000 + i)
+    for st in ("returned", "ready"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    assert _attempts(root) == budget
+    out = scr(root, "--actor", "prioritizer", "dispatch").stdout
+    assert f"dispatched T-0001 -> task/T-0001 (attempt {budget + 1} if it launches)" in out, out
+    assert Store(root).get("T-0001").status == "dispatched" and _attempts(root) == budget
+    scr(root, "--quiet", "--actor", "steward:T-0001", "task", "set", "T-0001", "in_progress")
+    assert _attempts(root) == budget + 1
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "checkpoint")
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "in_progress")
+    assert _attempts(root) == budget + 1                     # the heartbeat checkpoint -> in_progress charges nothing
+
+
+def test_repeated_dispatch_timeouts_raise_one_needs_line(world, monkeypatch):
+    """DoD: dispatch_timeout_rounds (3) dispatch_timeout rounds in a row with no launch -> exactly one needs line
+    naming the task, the round count and the launcher's reason from reports/steward_watch.log (here the real
+    auto-dispatch branch logging launch()'s `not on PATH` line); a fourth round adds no second line or card; the
+    task is never escalated and no round costs an attempt; a launch event resets the count and the line goes."""
+    root, _, _ = world
+    limits = yaml.safe_load((root / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    assert int(limits["dispatch_timeout_rounds"]) == DISPATCH_TIMEOUT_ROUNDS == 3
+    _no_claude(monkeypatch)
+    before = _attempts(root)
+    _dispatched(root)
+    w = lambda: Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()   # noqa: E731
+    for k in (1, 2):
+        _backdate(root, "T-0001", "dispatched", 45)
+        res = w()
+        assert res["ok"] and res["timed_out"][0]["task"] == "T-0001", res
+        assert Store(root).get("T-0001").status == "dispatched"          # redispatched on the same tick, launch failed
+        assert not _round_needs(res), res["needs"]
+    assert "launcher: claude (Claude Code CLI) not on PATH — nothing launched" in (root / LOG).read_text(encoding="utf-8")
+    _backdate(root, "T-0001", "dispatched", 45)
+    res = w()
+    lines = _round_needs(res)
+    assert len(lines) == 1, res["needs"]
+    assert "T-0001 was dispatched 3 times in a row and never launched (dispatch_timeout_rounds 3)" in lines[0]
+    assert "the launcher says: claude (Claude Code CLI) not on PATH — nothing launched (launcher, " in lines[0]
+    assert "redispatched automatically" in lines[0] and "fix the launcher, not the task" in lines[0]
+    assert [n["key"] for n in _needs_file(root)["needs"]].count("dispatch_rounds:T-0001") == 1
+    _backdate(root, "T-0001", "dispatched", 45)
+    res = w()                                                                     # round 4
+    assert len(_events(root, "dispatch_timeout", "T-0001")) == 4
+    assert len(_round_needs(res)) == 1 and "dispatched 4 times" in _round_needs(res)[0]
+    assert [n["key"] for n in _needs_file(root)["needs"]].count("dispatch_rounds:T-0001") == 1   # the same card
+    assert (root / LOG).read_text(encoding="utf-8").count("rounds in a row without a launch") == 1
+    assert _attempts(root) == before and not res["escalated"] and not _sys_events(root, "slot_freed")
+    _launched(root)                                                               # a launch succeeds
+    res = w()
+    assert res["ok"] and not _round_needs(res) and "dispatch_rounds:T-0001" not in [n["key"] for n in _needs_file(root)["needs"]]
+    assert "dispatch_rounds:T-0001" not in _flags(root)
+    assert scr(root, "verify", "--quiet").returncode == 0
+
+
+def test_dispatch_records_the_worktree_the_watcher_resolves(world):
+    """T-0153 review, item 1: a record whose workload key is not registered gets from `scr dispatch` the same
+    worktree directory ops.task_worktree (the watcher, the launcher) resolves: the first entry's root."""
+    root, _, _ = world
+    t = Store(root).get("T-0001")
+    t.rec["workload"] = "not-registered"
+    t.save()
+    scr(root, "--quiet", "snapshot")
+    scr(root, "--quiet", "--actor", "prioritizer", "dispatch")
+    t = Store(root).get("T-0001")
+    assert t.status == "dispatched"
+    assert (root / t.rec["worktree"]).resolve() == task_worktree(workload_for(root, Store(root), t), t).resolve()
+    assert t.rec["worktree"] == "../quantum-insertion/.worktrees/T-0001"          # the entry's string form

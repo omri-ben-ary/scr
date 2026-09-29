@@ -38,7 +38,8 @@ Per tick:
   dispatched    -> ready after dispatch_timeout_minutes with no `launch` event (auto-decide; T-0122): a launch
                    that failed after `scr dispatch` never holds a slot; one dispatch_timeout event, and the slot
                    goes to the next ready task on the same tick (a dispatched task WITH a launch event is the
-                   launcher's and is left alone)
+                   launcher's and is left alone); after dispatch_timeout_rounds such rounds in a row with no launch,
+                   one needs line quoting the launcher's reason from this log (T-0127; no attempt was charged)
   accepted      -> land + merge + retire (auto-land)
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
@@ -83,6 +84,11 @@ DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}
 REVIEW_STALE_HOURS, HELP_STALE_HOURS = 2.0, 3.0      # limits.yaml: review_stale_hours / help_stale_hours
 DISPATCH_TIMEOUT_MINUTES = 30                        # limits.yaml: dispatch_timeout_minutes (T-0122)
+DISPATCH_TIMEOUT_ROUNDS = 3                          # limits.yaml: dispatch_timeout_rounds (T-0127)
+LAUNCH_LOG_TAIL_BYTES = 256_000                      # how much of LOG_FILE launcher_reason reads (T-0127)
+# A launcher line that says why a task did not launch (scr/launch.py: "claude ... not on PATH — nothing launched",
+# "worktree missing — skipped", "=== T-x NOT launched: ...", spawn's "worktree add failed: ...").
+_LAUNCH_FAILURE = re.compile(r"not on PATH|NOT launched|missing|skipped|fail|error|refused|denied|no record|Traceback", re.I)
 CREDITS_PAUSE_MINUTES = 60                           # limits.yaml: credits_pause_minutes (T-0187)
 # What a headless claude prints, alone, when the account has no usage credits left (T-0121's transcript,
 # 2026-09-23): the session never ran. Anchored at a line start and read only in a transcript's last lines, so
@@ -224,6 +230,49 @@ def dispatch_stale(events: list[dict], tid: str, minutes: float, now: datetime) 
     if age_min <= minutes:
         return None
     return {"since": since, "age_min": round(age_min, 1)}
+
+
+def dispatch_rounds(events: list[dict], tid: str) -> int:
+    """How many dispatches of the task in a row timed out with no launch (T-0127): the `dispatch_timeout` system
+    events of `tid` after its newest scriber `launch` (or `takeover`, which dispatch_stale also counts as the
+    task being run). A launch resets the count to 0; the whole log counts for a task that never launched."""
+    n = 0
+    for e in events:
+        if e.get("task") != tid:
+            continue
+        if is_scriber_launch(e) or (e.get("kind") == "system" and e.get("name") == "takeover"):
+            n = 0
+        elif e.get("kind") == "system" and e.get("name") == "dispatch_timeout":
+            n += 1
+    return n
+
+
+def launcher_reason(log_text: str, tid: str) -> str | None:
+    """The launcher's own words for why `tid` did not launch, from reports/steward_watch.log (T-0127): in the
+    newest launcher run that names the task (the auto-dispatch branch logs every line of scr/launch.py's output
+    as `launcher: <line>`, starting with `launching: <ids> (mode ...)`), the last failure line that belongs to the
+    run as a whole (claude not on PATH) or to the task's own `=== <id>` section (worktree missing — skipped, a
+    spawn failure, NOT launched: ...), with that line's timestamp. None when no launcher run names the task or
+    the run names no failure for it."""
+    lines = log_text.splitlines()
+    tid_re = re.compile(rf"\b{re.escape(tid)}\b")
+    start = max((i for i, l in enumerate(lines) if "launcher: launching:" in l and tid_re.search(l.split("launching:", 1)[1])), default=None)
+    if start is None:
+        return None
+    found, section = None, None
+    for line in lines[start + 1:]:
+        if "launcher:" not in line:
+            break                                            # the run's block ends at the first non-launcher line
+        ts, _, text = line.partition("launcher:")
+        text = text.strip()
+        if text.startswith("=== "):
+            section = text.split()[1] if len(text.split()) > 1 else None
+            if section == tid and _LAUNCH_FAILURE.search(text):
+                found = (text, ts.strip())
+            continue
+        if section in (None, tid) and _LAUNCH_FAILURE.search(text):
+            found = (text, ts.strip())
+    return f"{found[0]} (launcher, {found[1]})" if found else None
 
 
 def submitted_stale(status: str, review_md: str, since: datetime | None, hours: float, now: datetime) -> dict | None:
@@ -984,7 +1033,9 @@ class Watcher:
         Auto-dispatch runs after this on the same tick and may pick the task again or the next ready one.
         A `dispatched` task WITH a launch event is the launcher's (it owns the in_progress transition) and is
         never touched here; a dead launched session is the dead check's business once it is in_progress
-        (T-0063). Nothing is escalated: a failed dispatch needs no one. Returns how many were moved."""
+        (T-0063). Nothing is escalated: a failed dispatch needs no one. Returns how many were moved.
+        No attempt was charged for such a dispatch (the launch charges it, T-0127), so the cycle costs no budget;
+        what it needs is the launcher fixed: see dispatch_rounds_needs, run at the end."""
         minutes = float(self.limits.get("dispatch_timeout_minutes", DISPATCH_TIMEOUT_MINUTES))
         events = self.read_events()
         n = 0
@@ -1006,7 +1057,47 @@ class Watcher:
                 if r["task"] == t.id:
                     r["flags"] = (r["flags"] + " DISPATCH-TIMEOUT").strip()
             n += 1
+        if n:
+            self.events = None                                  # the dispatch_timeout events just written count below
+        self.dispatch_rounds_needs(tasks)
         return n
+
+    def dispatch_rounds_needs(self, tasks: dict) -> None:
+        """ONE needs line per task whose launch keeps failing (T-0127): `dispatch_rounds` >= dispatch_timeout_rounds
+        (limits.yaml) for a `ready` or `dispatched` task. It names the task, the round count and the launcher's
+        reason (`launcher_reason`, read from the tail of reports/steward_watch.log), and says the redispatch is
+        automatic, so the one action is fixing the launcher. The key `dispatch_rounds:<id>` is stable for the whole
+        streak: the line is raised on every tick while the streak stands (the needs file is rewritten each tick)
+        but it is one card, never one per round; the log gets one line when it first appears. A scriber launch
+        resets the count and the line goes. The task is not escalated and stays in the ranking."""
+        limit = int(self.limits.get("dispatch_timeout_rounds", DISPATCH_TIMEOUT_ROUNDS))
+        if limit <= 0:
+            return
+        events, log_text = self.read_events(), None
+        for t in tasks.values():
+            key = f"dispatch_rounds:{t.id}"
+            k = dispatch_rounds(events, t.id) if t.status in {"ready", "dispatched"} else 0
+            if k < limit:
+                self.unflag(key)
+                continue
+            if log_text is None:
+                log_text = self.log_tail()
+            reason = launcher_reason(log_text, t.id) or "no launcher line names it in the log tail"
+            self.need(key, f"{t.id} was dispatched {k} times in a row and never launched (dispatch_timeout_rounds {limit}); "
+                           f"the launcher says: {reason}. It keeps being redispatched automatically and no attempt is "
+                           "charged — fix the launcher, not the task (reports/steward_watch.log)", t.id)
+            if self.flag(key):
+                self.log(f"{t.id} dispatch timed out {k} rounds in a row without a launch: {reason}")
+
+    def log_tail(self) -> str:
+        """The last LAUNCH_LOG_TAIL_BYTES of LOG_FILE ('' when it does not exist)."""
+        p = self.root / LOG_FILE
+        try:
+            with p.open("rb") as f:
+                f.seek(max(0, p.stat().st_size - LAUNCH_LOG_TAIL_BYTES))
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
 
     # ---- a stuck task leaves the slot (T-0092) --------------------------------------------------------
     def escalation_checks(self, now: datetime, tasks: dict) -> int:

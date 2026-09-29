@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -122,7 +123,7 @@ def cmd_task_set(args):
     t.save()
     log.append("state", task=args.id, **{"from": old}, to=args.status, actor=args.actor, tokens=args.tokens or None,
                note=(args.note or "") + (" [forced]" if args.force else "") or None)
-    if args.status == "dispatched":
+    if old == "dispatched" and args.status == "in_progress":        # the launch charges the attempt (T-0127)
         log.append("field", task=args.id, field="attempts", value=t.rec["attempts"], actor=args.actor)
     if args.tokens:
         log.append("field", task=args.id, field="tokens_used", value=t.rec["tokens_used"], actor=args.actor)
@@ -258,6 +259,23 @@ def statement_window_open(window, now: datetime | None = None) -> bool:
     return lo <= t <= hi if lo <= hi else t >= lo or t <= hi     # "22:00-06:00" wraps midnight
 
 
+def _worktree_root(root: Path, store: Store, key: str | None) -> str:
+    """The worktree root `scr dispatch` records, resolved the way the watcher and the launcher resolve it
+    (ops.workload: an unregistered or missing key is the first entry; T-0153 review, item 1). The record keeps
+    the relative string form: the entry's `worktrees` value, else the resolved root relative to the scriptorium."""
+    from .ops import workload
+    try:
+        wl = workload(root, store, key)
+    except RepoError:                                       # no workloads.yaml entries at all: the old default
+        return "../worktrees"
+    if wl.cfg.get("worktrees"):
+        return str(wl.cfg["worktrees"])
+    try:
+        return Path(os.path.relpath(wl.wt_root, root.resolve())).as_posix()
+    except ValueError:                                      # another drive: no relative form
+        return wl.wt_root.as_posix()
+
+
 def cmd_dispatch(args):
     root, store, log = _ctx(args)
     limits = store.config("limits")
@@ -285,14 +303,14 @@ def cmd_dispatch(args):
             log.append("state", task=tid, **{"from": t.status}, to="ready", actor="scr")
         old = t.rec["status"]
         lifecycle.apply(t.rec, "dispatched")
-        wl = (store.config("workloads") or {}).get(t.rec.get("workload") or "", {})
-        wt_root = wl.get("worktrees") or "../worktrees"
-        t.rec["worktree"] = f"{wt_root}/{tid}"
+        t.rec["worktree"] = f"{_worktree_root(root, store, t.rec.get('workload'))}/{tid}"
         t.rec["branch"] = f"task/{tid}"
         t.save()
-        log.append("state", task=tid, **{"from": old}, to="dispatched", actor=args.actor, note=f"attempt {t.rec['attempts']}")
-        log.append("field", task=tid, field="attempts", value=t.rec["attempts"], actor=args.actor)
-        print(f"dispatched {tid} -> {t.rec['branch']} (attempt {t.rec['attempts']})")
+        # No attempt is charged here: the launcher's dispatched -> in_progress does it (T-0127), so a dispatch that
+        # never launches and times out back to ready (T-0122) leaves `attempts` where it was.
+        nxt = int(t.rec.get("attempts", 0)) + 1
+        log.append("state", task=tid, **{"from": old}, to="dispatched", actor=args.actor, note=f"attempt {nxt} if it launches")
+        print(f"dispatched {tid} -> {t.rec['branch']} (attempt {nxt} if it launches)")
     if not chosen:
         log.append("system", name="intake_starved" if not rows else "dispatch_blocked", actor=args.actor,
                    data={"ready": len(rows), "running": running})
