@@ -8,7 +8,7 @@ Per tick:
     checkpoint-commit its worktree on its task branch (nothing may exist only in a worktree)
     scope drift  -> scope_drift events (once per file)
     HELP: lines  -> help events (once per line)
-    wall budget  -> budget_wall (once)
+    wall budget  -> budget_wall (once per in_progress start); with auto-decide the task is then escalated below
     submission   report.md != template -> submitted, unless report_unfinished (a *_PLACEHOLDER token, an empty
                     or template-prompt `## Result`; T-0180): then one needs line, and the status stays
     dead session -> the launched pid is gone or the transcript .err says claude terminated it: returned
@@ -30,7 +30,8 @@ Per tick:
                    the blank template before this.
   stuck         -> escalated + one slot_freed event (auto-decide; T-0092): a task that cannot progress is
                    escalated, never held — submitted > review_stale_hours with no Decision written, or
-                   in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours; the
+                   in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours, or
+                   in_progress/checkpoint past its own budget.max_wall_hours (T-0121); the
                    escalated task no longer counts against the cap, so auto-dispatch below fills the slot
                    on the same tick. A running task's launched session is checkpointed, then stopped
                    (T-0124), so the refill never makes cap + 1 sessions
@@ -240,6 +241,25 @@ def submitted_stale(status: str, review_md: str, since: datetime | None, hours: 
     if age_h <= hours:
         return None
     return {"since": since, "age_h": round(age_h, 1)}
+
+
+def wall_hours(rec: dict) -> float:
+    """The task's own wall budget, `budget.max_wall_hours` (templates/task.yaml: 6). Per task, never limits.yaml."""
+    return float((rec.get("budget") or {}).get("max_wall_hours", 6))
+
+
+def wall_stale(started: datetime | None, hours: float, now: datetime) -> dict | None:
+    """{since, age_h} when a running task's wall — the hours since its `dispatched -> in_progress` start — is
+    over `budget.max_wall_hours` (T-0121). Out of budget is stuck (agents/_common.md: budgets are hard), so the
+    tick escalates it through `_escalate` like a stale review or an unanswered HELP. Undated (no start event,
+    e.g. still `dispatched`) is never early. The age is rounded the way the tick's OVER-WALL flag and the
+    `budget_wall` note round it, so the flag and the escalation are raised on the same tick."""
+    if started is None:
+        return None
+    age_h = round((now - started).total_seconds() / 3600, 1)
+    if age_h <= hours:
+        return None
+    return {"since": started, "age_h": age_h}
 
 
 def help_stale(log_md: str, hours: float, now: datetime, seen: dict[str, datetime] | None = None,
@@ -614,15 +634,20 @@ class Watcher:
                             if self.flag(f"help:{t.id}:{i + 1}"):
                                 self.scr(f"steward:{t.id}", "event", "system", "--name", "help", "--task", t.id, "--note", line.strip()[:300], "--quiet")
 
-            hours = float((t.rec.get("budget") or {}).get("max_wall_hours", 6))
+            hours = wall_hours(t.rec)
             started = self.started_at(t.id)
             wall = round((now - started).total_seconds() / 3600, 1) if started else None
-            if wall and wall > hours:
+            if wall_stale(started, hours, now):
                 flags.append(f"OVER-WALL({wall}/{hours}h)")
-                if self.flag(f"wall:{t.id}"):
+                # ONE diagnostic `budget_wall` per episode (the episode is this in_progress start, as for
+                # `slot_freed`); the enforcement is `escalation_checks` later this tick (T-0121), which escalates
+                # the task through `_escalate` unless the submission or dead branches below route it first.
+                if self.flag(f"wall:{t.id}:{started.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"):
                     self.log(f"{t.id} wall budget exhausted: {wall} h > {hours} h")
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "budget_wall", "--task", t.id, "--note", f"{wall} h", "--quiet")
-                self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
+                if not (self.auto_decide and ok) or takeover_of(self.read_events(), t.id):
+                    # held (no auto-decide, or Omri's own takeover run): the line says so every tick
+                    self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
 
             rep = t.dir / "report.md"
             rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
@@ -986,13 +1011,15 @@ class Watcher:
     # ---- a stuck task leaves the slot (T-0092) --------------------------------------------------------
     def escalation_checks(self, now: datetime, tasks: dict) -> int:
         """The one rule of agents/_common.md applied to every slot-holder: a task that cannot progress is
-        escalated, never held. Two conditions, both pure functions above: `submitted` with no Decision written
+        escalated, never held. Three conditions, all pure functions above: `submitted` with no Decision written
         after review_stale_hours (T-0075's relaunch, once landed, runs before this and its cap replaces the
-        clock); `in_progress`/`checkpoint` with the newest blocking HELP line unanswered after help_stale_hours
+        clock); `in_progress`/`checkpoint` past its own `budget.max_wall_hours` (T-0121: budgets are hard; the
+        submission and dead branches of the tick run first, so a finished session is submitted and a dead one
+        returned, never escalated); `in_progress`/`checkpoint` with the newest blocking HELP line unanswered after help_stale_hours
         (once T-0069 lands that scriber has exited with `WAITING:` and the task is `waiting`, not escalated;
         `waiting` is T-0069's transition and is not made here). Returns how many tasks were escalated. One
         escalation per episode: the persisted flag `slot_freed:<id>:<since>` names the episode (the submission
-        time, the HELP line's first sighting), and only SLOT_STATUSES are looked at, so a task already
+        time, the in_progress start, the HELP line's first sighting), and only SLOT_STATUSES are looked at, so a task already
         `escalated` never gets a second event. Nothing is deleted: the worktree and the branch stay, and the note
         says where the work is; an in_progress/checkpoint task's launched session is stopped by `_escalate`
         after a checkpoint commit (T-0124)."""
@@ -1016,10 +1043,22 @@ class Watcher:
                           f"(review_stale_hours {review_h:g}); the review did not finish")
                 action = ("read the review transcript, then decide in the gate card (accept / return), or re-review: "
                           f"delete `review:{t.id}` from .scr/watch.state.txt after `scr task set {t.id} returned` + `ready`")
+            elif t.status in {"in_progress", "checkpoint"} and takeover_of(events, t.id):
+                continue                            # under takeover Omri is in the session: his HELP lines and wall hold nothing
+            elif t.status in {"in_progress", "checkpoint"} and (row := wall_stale(self.started_at(t.id), hours := wall_hours(t.rec), now)):
+                # T-0121: out of budget is stuck. The running loop raised this episode's `budget_wall` earlier this
+                # tick, so the trail reads budget_wall -> escalated -> slot_freed. `escalated` leaves only for
+                # omri_queue (scr/lifecycle.py), so the redispatch route needs --force (it is logged).
+                sess = self.session_of(t)
+                transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
+                reason = (f"wall budget exhausted: {row['age_h']} h in progress since "
+                          f"{row['since'].astimezone(timezone.utc):%Y-%m-%dT%H:%MZ} > max_wall_hours {hours:g}")
+                action = (f"extend the wall with `scr task field {t.id} budget.max_wall_hours N`, then `scr task set {t.id} returned --force` "
+                          "+ `ready` so it is redispatched, or decide in the gate card")
             elif t.status in {"in_progress", "checkpoint"}:
                 log_md = t.dir / "log.md"
-                if not log_md.exists() or takeover_of(events, t.id):
-                    continue                        # under takeover Omri is in the session: his HELP lines hold nothing
+                if not log_md.exists():
+                    continue
                 seen: dict[str, datetime] = {}
                 for e in events:
                     if e.get("kind") == "system" and e.get("name") == "help" and e.get("task") == t.id and e.get("note") and e["note"] not in seen:

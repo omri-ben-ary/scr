@@ -3159,3 +3159,109 @@ def test_ui_offers_take_over_for_a_recorded_session(world, monkeypatch):
     scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--task", "T-0001",
         "--note", "taken over", "--data", json.dumps({"session_id": sid, "by": "omri"}))
     assert ui_mod.session_cards(root, {"T-0001"})["T-0001"]["taken_over"] is True
+
+
+# ---- T-0121: an over-wall task is escalated, not held ----------------------------------------------------------
+# `budget.max_wall_hours` is per task. The running loop raises the one `budget_wall` diagnostic per in_progress
+# start; with auto_decide on, `escalation_checks` then routes the task through `_escalate` on the same tick (one
+# `slot_freed` card), and auto-dispatch refills the slot. The in_progress start is backdated with T-0122's
+# `_backdate`, so the wall is a real 1 h budget, not 0.
+from scr.watch import wall_hours, wall_stale  # noqa: E402
+
+
+def _over_wall(root: Path, tid: str = "T-0001", hours: float = 1, minutes: float = 90) -> None:
+    _running(root, tid)
+    scr(root, "--quiet", "--actor", "s", "task", "field", tid, "budget.max_wall_hours", str(hours))
+    _backdate(root, tid, "in_progress", minutes)
+
+
+def test_stuck_wall_stale_is_a_pure_function_of_the_start_and_the_budget():
+    start = NOW - timedelta(hours=4)
+    assert wall_stale(start, 3.0, NOW) == {"since": start, "age_h": 4.0}
+    assert wall_stale(start, 4.0, NOW) is None                                   # exactly at the wall: not over
+    assert wall_stale(NOW - timedelta(minutes=183), 3.0, NOW) is None             # 3.05 h rounds to the 3.0 h the flag shows
+    assert wall_stale(None, 0.0, NOW) is None                                     # undated (still dispatched): never early
+    assert wall_hours({"budget": {"max_wall_hours": 1.5}}) == 1.5 and wall_hours({}) == 6.0
+
+
+def test_stuck_over_wall_is_escalated_and_the_slot_refilled(world, monkeypatch):
+    """DoD: in_progress task 1.5 h past its dispatched -> in_progress start with max_wall_hours 1, auto_decide
+    on, cap 1, one ready task -> after one tick() escalated as steward:<id>, one budget_wall, one slot_freed
+    naming max_wall_hours and `task set <id> returned`, and the ready task dispatched on the same tick."""
+    root, _, _ = world
+    _set_limit(root, "concurrency", 1)
+    _over_wall(root)
+    _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
+    launches = _record_launches(monkeypatch)
+    calls = _spy_scr(monkeypatch)
+    res = Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "escalated"
+    last = _state_events(root, "T-0001")[-1]
+    assert (last["to"], last["actor"]) == ("escalated", "steward:T-0001"), last
+    assert "wall budget exhausted: 1.5 h" in last["note"] and "max_wall_hours 1" in last["note"], last["note"]
+    assert len(_events(root, "budget_wall", "T-0001")) == 1
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and ev[0]["actor"] == "steward:T-0001", ev
+    note = ev[0]["note"]
+    assert note.startswith("ACTION for Omri: extend the wall") and "max_wall_hours" in note and "task set T-0001 returned" in note, note
+    assert "or decide in the gate card" in note and "1.5 h" in note and "max_wall_hours 1" in note, note
+    # the trail reads budget_wall -> escalated -> slot_freed, and the dispatch came after it, on this tick
+    i_wall = next(i for i, (_, a) in enumerate(calls) if a[:2] == ("event", "system") and "budget_wall" in a)
+    i_esc = next(i for i, (_, a) in enumerate(calls) if a[:2] == ("task", "set") and a[2:4] == ("T-0001", "escalated"))
+    i_slot = next(i for i, (_, a) in enumerate(calls) if a[:2] == ("event", "system") and "slot_freed" in a)
+    i_disp = next(i for i, (_, a) in enumerate(calls) if a[0] == "dispatch")
+    assert i_wall < i_esc < i_slot < i_disp, calls
+    assert Store(root).get("T-0002").status == "in_progress" and len(launches) == 1
+    assert res["escalated"][0]["task"] == "T-0001" and "wall budget exhausted" in res["escalated"][0]["reason"]
+    assert not any("over wall budget" in n for n in res["needs"]), res["needs"]      # escalated: the card, not a held line
+
+
+def test_stuck_over_wall_escalates_once_per_episode(world, monkeypatch):
+    """The same world ticked twice: still one slot_freed and one budget_wall; the flags name the in_progress start."""
+    root, _, _ = world
+    _over_wall(root)
+    _record_launches(monkeypatch)
+    for _ in range(2):
+        Watcher(root, quiet=True, auto_decide=True, auto_dispatch=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    assert len(_events(root, "slot_freed", "T-0001")) == 1 and len(_events(root, "budget_wall", "T-0001")) == 1
+    start = Watcher(root, quiet=True).started_at("T-0001").astimezone(timezone.utc)
+    assert {f"slot_freed:T-0001:{start:%Y%m%dT%H%M%SZ}", f"wall:T-0001:{start:%Y%m%dT%H%M%SZ}"} <= _flags(root)
+
+
+def test_stuck_over_wall_auto_decide_off_holds(world):
+    """auto_decide off: the task stays in_progress; one budget_wall event and the needs line every tick, as before."""
+    root, _, _ = world
+    _over_wall(root)
+    for _ in range(2):
+        res = Watcher(root, quiet=True).tick()
+        assert Store(root).get("T-0001").status in {"in_progress", "checkpoint"} and not res["escalated"]
+        assert any(n.startswith("T-0001 over wall budget (1.5 h of 1.0 h)") for n in res["needs"]), res["needs"]
+    assert len(_events(root, "budget_wall", "T-0001")) == 1 and not _events(root, "slot_freed", "T-0001")
+
+
+def test_stuck_over_wall_with_a_report_is_submitted_not_escalated(world):
+    """A finished session is never stuck: report.md written wins over the wall (the tick's submission branch)."""
+    root, _, _ = world
+    _over_wall(root)
+    (Store(root).get("T-0001").dir / "report.md").write_text("# Report\n\n## Result\nProved a.\n", encoding="utf-8")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "submitted" and not res["escalated"], res
+    assert not _events(root, "slot_freed", "T-0001")
+
+
+def test_stuck_over_wall_under_takeover_is_held(world):
+    """A task Omri took over (T-0247) is his run: over the wall it is flagged, never escalated (its session is his)."""
+    root, _, _ = world
+    _over_wall(root)
+    scr(root, "--quiet", "--actor", "omri", "event", "system", "--name", "takeover", "--task", "T-0001",
+        "--note", "taken over", "--data", json.dumps({"session_id": "s", "by": "omri"}))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status in {"in_progress", "checkpoint"} and not res["escalated"]
+    assert any(n.startswith("T-0001 over wall budget") for n in res["needs"]) and not _events(root, "slot_freed", "T-0001")
+
+
+def test_wall_rule_is_written_in_the_agent_docs():
+    text = (REPO / "agents" / "_common.md").read_text(encoding="utf-8")
+    assert any("max_wall_hours" in l and "watcher" in l for l in text.splitlines())
