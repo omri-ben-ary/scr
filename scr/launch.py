@@ -141,15 +141,21 @@ def intake(root: Path, dry_run: bool = False, timeout: int = 3600) -> list[str]:
         return ["claude not on PATH — intake skipped"]
     scr = root / ".venv" / "Scripts" / "scr.exe"
     brief = INTAKE_BRIEF.format(root=root, scr=scr if scr.exists() else "scr", dry="DRY RUN: do not create anything; print what you would create." if dry_run else "")
-    out_file = root / "reports" / f"intake-{datetime.now():%Y%m%d-%H%M%S}.txt"
+    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    out_file = root / "reports" / f"intake-{stamp}.txt"
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    # T-0285: the brief goes in as a FILE on stdin, exactly like start_claude (scr/run.py). Piping it through
+    # communicate() lost it: `claude -p` stops waiting for stdin after 3 s ("no stdin data received in 3s"), and
+    # every Intake run from 2026-09-30 to 2026-10-09 ended with "Input must be provided" and created nothing.
+    brief_file = root / "reports" / f"intake-{stamp}.brief.txt"
+    brief_file.write_text(brief, encoding="utf-8")
     # Popen, not run: the pid and the session id go on record BEFORE the wait, so an Intake that runs for 17
     # minutes can be taken over while it runs (`scr takeover --session <id>`, T-0247)
-    p = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    p = subprocess.Popen(argv, cwd=root, stdin=brief_file.open("rb"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding="utf-8", errors="replace")
     record_launch(root, "intake", None, p.pid, sid, root, argv, actor="steward-watch", data={"transcript": out_file.name})
     try:
-        so, se = p.communicate(input=brief, timeout=timeout)
+        so, se = p.communicate(timeout=timeout)
         text = (so or "") + (se or "")
     except subprocess.TimeoutExpired:
         p.kill()

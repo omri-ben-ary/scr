@@ -3836,3 +3836,24 @@ def test_a_scriber_takeover_does_not_hold_the_review(world, monkeypatch):
     assert review_takeover(EventLog(root / "events" / "events.jsonl").read(), "T-0001") is None
     res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
     assert reviews == ["T-0001"] and res["escalated"] and Store(root).get("T-0001").status == "escalated"
+
+def test_intake_brief_is_a_file_on_stdin(world, monkeypatch):
+    """T-0285: `claude -p` reads the Intake brief from a file on stdin (as start_claude does), never from a
+    communicate() pipe, which the CLI abandons after 3 s and which left every Intake run since 2026-09-30 empty."""
+    import scr.launch as launch_mod
+    from scr.launch import intake
+    root, _, _ = world
+    calls = _record_launches(monkeypatch)
+    stdins = []
+    real_popen = launch_mod.subprocess.Popen
+
+    def popen_capturing_stdin(args, cwd=None, **kw):
+        stdins.append(kw.get("stdin"))
+        return real_popen(args, cwd=cwd, **kw)
+
+    monkeypatch.setattr(launch_mod, "subprocess", _Shim(subprocess, Popen=popen_capturing_stdin))
+    intake(root)
+    assert len(calls) == 1 and len(stdins) == 1
+    assert stdins[0] is not subprocess.PIPE and hasattr(stdins[0], "read"), "the brief must be a file on stdin"
+    briefs = sorted((root / "reports").glob("intake-*.brief.txt"))
+    assert briefs and "You are Intake" in briefs[-1].read_text(encoding="utf-8")
