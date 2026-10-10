@@ -486,10 +486,14 @@ def cmd_watch(args):
     root, _, _ = _ctx(args)
     from .watch import Watcher
     store = Store(root)
-    interval = args.interval or int((store.config("limits") or {}).get("checkpoint_every_minutes", 30))
+    limits = store.config("limits") or {}
+    interval = args.interval or int(limits.get("checkpoint_every_minutes", 30))
     un = args.unattended
+    # T-0302: --unattended implies --allow-statements when limits.yaml sets a statement_window; the window then
+    # decides inside `scr dispatch`. No window: statement tasks still need the explicit flag (T-0125's default).
+    allow_statements = args.allow_statements or (un and bool(limits.get("statement_window")))
     w = Watcher(root, stale_minutes=args.stale, auto_review=un or args.auto_review, auto_decide=un or args.auto_decide,
-                auto_dispatch=un or args.auto_dispatch, allow_statements=args.allow_statements, auto_land=un or args.auto_land,
+                auto_dispatch=un or args.auto_dispatch, allow_statements=allow_statements, auto_land=un or args.auto_land,
                 auto_intake=un or args.auto_intake, permission_mode=args.permission_mode, push=args.push, quiet=args.quiet)
     w.loop(interval, once=args.once)
 

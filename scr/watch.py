@@ -992,6 +992,8 @@ class Watcher:
                     from .launch import launch
                     for line in launch(self.root, mode="headless", permission_mode=self.permission_mode):
                         self.log(f"  launcher: {line}")
+                elif out is not None:
+                    self.statements_held_need()
 
         self.publish_needs(datetime.now(timezone.utc))      # before the push, so it carries the watcher's own lines too
         self.notify_cards()
@@ -999,6 +1001,30 @@ class Watcher:
         journal(self.root, "steward-watch", "tick: records changed", push=self.push_journal)
         return {"ok": ok, "rows": self.rows, "review": [t.id for t in review], "decided": decided, "escalated": self.escalated,
                 "timed_out": self.timed_out, "needs": self.needs}
+
+    # ---- statement tasks held by auto-dispatch (T-0302) ---------------------------------------------------------------
+    def statements_held_need(self) -> None:
+        """After a dispatch step that dispatched nothing: ONE needs line (key `statements_held`) naming the ready
+        may_touch_statements tasks `scr dispatch` held back, either because this watcher runs without
+        --allow-statements or because limits.yaml statement_window is closed now. Recomputed every tick, so it
+        clears itself once a dispatch happens or no ready task is held. Frozen tasks are the freeze's, not this."""
+        from .cli import statement_window_open
+        from .graph import Graph
+        from .score import rank_ready
+        window = self.limits.get("statement_window")
+        if self.allow_statements and statement_window_open(window):
+            return
+        tasks = self.store.load_all()
+        ready = [r["task"] for r in rank_ready(Graph.build(tasks), self.store.config("weights"), "scribers")]
+        held = [tid for tid in ready if (tasks[tid].rec.get("scope") or {}).get("may_touch_statements")
+                and not task_frozen(self.store, tasks[tid])]
+        if not held:
+            return
+        why = (f"statement_window {window} is closed now; they dispatch when it opens (or widen it in config/limits.yaml)"
+               if self.allow_statements else
+               "the watcher runs without --allow-statements and config/limits.yaml sets no statement_window: "
+               "set statement_window (e.g. 00:00-23:59) and restart the watcher")
+        self.need("statements_held", f"{len(held)} statement task(s) held ({', '.join(held)}): {why}")
 
     # ---- the freeze switch (T-0272) ---------------------------------------------------------------------------------
     def frozen_held(self, tasks: dict) -> set[str]:

@@ -3857,3 +3857,88 @@ def test_intake_brief_is_a_file_on_stdin(world, monkeypatch):
     assert stdins[0] is not subprocess.PIPE and hasattr(stdins[0], "read"), "the brief must be a file on stdin"
     briefs = sorted((root / "reports").glob("intake-*.brief.txt"))
     assert briefs and "You are Intake" in briefs[-1].read_text(encoding="utf-8")
+
+
+# ---- T-0302: the unattended watcher dispatches statement tasks inside statement_window ---------------------------
+# `scr up` starts `watch --unattended --quiet`; until T-0302 that never passed --allow-statements, so every
+# may_touch_statements task sat ready forever (a dispatch_blocked event every ~30 min since 2026-10-03).
+def _drop_limit(root: Path, key: str) -> None:
+    """Remove a key from config/limits.yaml and commit it, like _set_limit."""
+    p = root / "config" / "limits.yaml"
+    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    cfg.pop(key, None)
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    sgit(root, "add", "config/limits.yaml"); sgit(root, "commit", "-q", "-m", f"[test] limits: drop {key}")
+
+
+def _statement_task(root: Path, tid: str = "T-0001") -> None:
+    t = Store(root).get(tid)
+    t.rec["scope"]["may_touch_statements"] = True
+    t.save()
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", f"[test] {tid} may_touch_statements")
+
+
+def _closed_window() -> str:
+    return "00:01-00:01" if datetime.now().strftime("%H:%M") == "00:00" else "00:00-00:00"   # one minute, never now
+
+
+def _watch_kwargs(root: Path, monkeypatch, *argv: str) -> dict:
+    """The keyword arguments cmd_watch builds the Watcher with for `scr watch --once <argv>`."""
+    import scr.cli as cli
+    seen: list[dict] = []
+
+    class FakeWatcher:
+        def __init__(self, root, **kw):
+            seen.append(kw)
+
+        def loop(self, interval, once=False):
+            pass
+
+    monkeypatch.setattr(watch_mod, "Watcher", FakeWatcher)
+    cli.main(["--root", str(root), "watch", "--once", *argv])
+    return seen[0]
+
+
+def test_unattended_implies_allow_statements_only_with_a_statement_window(world, monkeypatch):
+    root, _, _ = world
+    _set_limit(root, "statement_window", "00:00-23:59")
+    assert _watch_kwargs(root, monkeypatch, "--unattended")["allow_statements"] is True
+    assert _watch_kwargs(root, monkeypatch)["allow_statements"] is False                   # a bare watch: unchanged
+    _set_limit(root, "statement_window", "")
+    assert _watch_kwargs(root, monkeypatch, "--unattended")["allow_statements"] is False   # empty window: T-0125's default
+    _drop_limit(root, "statement_window")
+    assert _watch_kwargs(root, monkeypatch, "--unattended")["allow_statements"] is False   # absent window: the same
+    assert _watch_kwargs(root, monkeypatch, "--allow-statements")["allow_statements"] is True   # the explicit flag still works
+
+
+def test_unattended_watcher_dispatches_a_statement_task_inside_the_window(world, monkeypatch):
+    root, _, _ = world
+    _statement_task(root)
+    _set_limit(root, "statement_window", "00:00-23:59")
+    kw = _watch_kwargs(root, monkeypatch, "--unattended")
+    calls = _record_launches(monkeypatch)
+    res = Watcher(root, quiet=True, auto_dispatch=True, allow_statements=kw["allow_statements"]).tick()
+    assert calls and Store(root).get("T-0001").status == "in_progress"                   # dispatched and launched
+    assert not any(n["key"] == "statements_held" for n in _needs_file(root)["needs"]), res["needs"]
+
+
+def test_held_statement_tasks_raise_one_needs_line_that_clears_on_dispatch(world, monkeypatch):
+    root, _, _ = world
+    _statement_task(root)
+    _set_limit(root, "statement_window", _closed_window())
+    calls = _record_launches(monkeypatch)
+    for _ in range(2):                                                                  # a second tick adds no second line
+        Watcher(root, quiet=True, auto_dispatch=True, allow_statements=True).tick()
+        held = [n for n in _needs_file(root)["needs"] if n["key"] == "statements_held"]
+        assert len(held) == 1 and "T-0001" in held[0]["text"] and "closed" in held[0]["text"], held
+    assert not calls and Store(root).get("T-0001").status == "ready"
+
+    _drop_limit(root, "statement_window")                                               # no window, no flag: says why
+    Watcher(root, quiet=True, auto_dispatch=True).tick()
+    held = [n for n in _needs_file(root)["needs"] if n["key"] == "statements_held"]
+    assert len(held) == 1 and "--allow-statements" in held[0]["text"], held
+
+    _set_limit(root, "statement_window", "00:00-23:59")                                 # the window opens: dispatched, cleared
+    Watcher(root, quiet=True, auto_dispatch=True, allow_statements=True).tick()
+    assert calls and Store(root).get("T-0001").status == "in_progress"
+    assert not any(n["key"] == "statements_held" for n in _needs_file(root)["needs"])
