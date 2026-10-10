@@ -9,8 +9,11 @@ TRANSITIONS: dict[str, set[str]] = {
     "blocked":    {"ready", "escalated", "rejected"},
     "ready":      {"dispatched", "blocked", "rejected"},
     "dispatched": {"in_progress", "ready"},              # ready = dispatch_failed, redispatch
-    "in_progress": {"checkpoint", "submitted", "returned", "escalated"},
-    "checkpoint": {"in_progress", "returned", "escalated"},
+    "in_progress": {"checkpoint", "submitted", "returned", "escalated", "waiting"},
+    "checkpoint": {"in_progress", "returned", "escalated", "waiting"},
+    # waiting = the session ended its turn with `WAITING: job J-xxxx` (scr/jobs.py): the job runs detached under
+    # the watcher, the task holds NO concurrency slot, and the watcher resumes the session when the job ends
+    "waiting":    {"in_progress", "returned", "escalated"},
     "submitted":  {"accepted", "returned", "escalated"},
     "returned":   {"ready", "escalated", "rejected"},
     "escalated":  {"omri_queue"},

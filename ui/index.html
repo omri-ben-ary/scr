@@ -125,6 +125,7 @@
     <div id="home">
       <div class="empty">The operation at a glance. Open a ticket from a card or from the lists to get its own tab. Keys: <kbd>r</kbd> refresh · <kbd>1</kbd>–<kbd>5</kbd> record tabs · <kbd>d</kbd> discuss the open ticket · <kbd>w</kbd> close its tab.</div>
       <h2>Running <span class="n" id="runN">0</span></h2><div id="running"></div>
+      <h2>Jobs <span class="n" id="jobsN">0</span></h2><div id="runnerJobs"></div>
       <h2>Ready (next to dispatch) <span class="n" id="readyN">0</span></h2><div id="ready"></div>
       <h2>Recently closed</h2><div id="recent"></div>
     </div>
@@ -258,6 +259,8 @@ function renderLists() {
   const mk = (rows, fmt) => rows.length ? rows.map(fmt).join('') : '<div class="empty">—</div>';
   $('#running').innerHTML = mk(STATE.running, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.status}${r.started ? ' · since ' + fmtTs(r.started) : ''}</span>${takeoverBtn(r)}</div>`);
   $('#ready').innerHTML = mk(STATE.ready, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.kind}</span></div>`);
+  const rj = STATE.runner_jobs || []; $('#jobsN').textContent = rj.filter(j => j.status === 'running' || j.status === 'queued').length;
+  $('#runnerJobs').innerHTML = mk(rj, j => `<div class="row"><span class="id">${j.id}</span><span>${j.task ? `<span class="id" data-id="${j.task}">${j.task}</span> ` : ''}${esc(j.name || '')}${j.note ? ' — ' + esc(j.note) : ''}</span><span class="st"><span class="badge ${j.status === 'done' ? 'done' : (j.status === 'running' || j.status === 'queued' ? 'running' : 'failed')}">${j.status}</span>${j.rc != null ? ' rc ' + j.rc : ''}${j.seconds != null ? ' · ' + (j.seconds >= 120 ? Math.round(j.seconds / 60) + ' min' : j.seconds + ' s') : ''}</span></div>`);
   $('#recent').innerHTML = mk(STATE.recent, r => `<div class="row"><span class="id" data-id="${r.id}">${r.id}</span><span>${esc(r.title)}</span><span class="st">${r.to} · ${fmtTs(r.ts)}</span>${takeoverBtn(r)}</div>`);
   document.querySelectorAll('.row .id').forEach(el => el.onclick = () => select(el.dataset.id));
   const sess = Object.fromEntries([...STATE.running, ...STATE.recent].filter(r => r.session).map(r => [r.id, r.session]));

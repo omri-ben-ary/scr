@@ -130,14 +130,17 @@ def new_session_id() -> str:
 
 
 def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | None = None, model: str | None = None,
-                 extra: list[str] | None = None, session_id: str | None = None) -> list[str] | None:
+                 extra: list[str] | None = None, session_id: str | None = None, resume: str | None = None) -> list[str] | None:
     """The argv of a headless session: `claude -p --session-id <uuid> --permission-mode <mode> --output-format text`,
     plus `--add-dir <root>` when it runs somewhere other than the scriptorium root (a task worktree) so it can
     read tasks/<id>/ and agents/. `permission_mode=None` means the config default (permission_mode_for).
     `session_id=None` means a new one: every session gets an id the launcher knows, so it can be resumed
     (`scr takeover`, T-0247); a caller that records the id passes it in (new_session_id)."""
     mode = permission_mode or permission_mode_for(root)
-    args = claude_argv("-p", "--session-id", session_id or new_session_id(), "--permission-mode", mode, "--output-format", "text")
+    # `resume` = continue an existing session (the job runner hands a finished job back to the session that
+    # submitted it, scr/jobs.py): `claude -p --resume <id>` instead of a fresh `--session-id`
+    ident = ["--resume", resume] if resume else ["--session-id", session_id or new_session_id()]
+    args = claude_argv("-p", *ident, "--permission-mode", mode, "--output-format", "text")
     if not args:
         return None
     if root is not None and Path(cwd).resolve() != Path(root).resolve():
@@ -183,13 +186,13 @@ def record_launch(root: Path, kind: str, task: str | None, pid: int | None, sess
 
 def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode: str | None = None,
                  model: str | None = None, extra: list[str] | None = None, root: Path | None = None,
-                 env_extra: dict[str, str] | None = None, session_id: str | None = None) -> int | None:
+                 env_extra: dict[str, str] | None = None, session_id: str | None = None, resume: str | None = None) -> int | None:
     """Detached `claude -p` reading the brief from stdin; stdout/stderr to the transcript. Returns the pid.
     Every call site passes `root` and leaves `permission_mode` to the config default (see session_argv).
     `env_extra` is added to the inherited environment (the launcher's per-task background-wait ceiling,
     scr/bgwait.py); None leaves the environment as it is. `session_id` is the `--session-id` the caller records
     with record_launch (None: a fresh one nobody records)."""
-    args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra, session_id=session_id)
+    args = session_argv(cwd, root=root, permission_mode=permission_mode, model=model, extra=extra, session_id=session_id, resume=resume)
     if not args:
         return None
     flags = 0

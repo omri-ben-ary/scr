@@ -345,6 +345,21 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
     return sorted(needs, key=lambda x: CARD_ORDER[x["type"]])
 
 
+def _runner_jobs(root: Path, keep_finished: int = 12) -> list[dict]:
+    try:
+        from . import jobs as runner
+        rows = runner.list_jobs(root)
+    except Exception:  # noqa: BLE001 — the page must render without the runner
+        return []
+    active = [j for j in rows if j.get("status") in runner.ACTIVE]
+    done = [j for j in rows if j.get("status") not in runner.ACTIVE][-keep_finished:]
+    out = []
+    for j in active + list(reversed(done)):
+        out.append({"id": j["id"], "task": j.get("task"), "name": j.get("name"), "status": j.get("status"), "rc": j.get("rc"),
+                    "seconds": runner.seconds_of(j), "started": j.get("started"), "note": j.get("note"), "log": j.get("log")})
+    return out
+
+
 def state(root: Path) -> dict:
     store = Store(root)
     tasks = store.load_all()
@@ -353,7 +368,7 @@ def state(root: Path) -> dict:
     needs = needs_cards(root, tasks)
     running = [{"id": t.id, "status": t.status, "title": t.rec.get("title", ""), "kind": t.rec.get("kind"),
                 "attempts": t.rec.get("attempts", 0), "tokens": t.rec.get("tokens_used", 0), "started": _started(root, t.id)}
-               for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted", "accepted"}]
+               for t in tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "waiting", "submitted", "accepted"}]
     ready = [{"id": t.id, "title": t.rec.get("title", ""), "kind": t.rec.get("kind")} for t in tasks.values() if t.status == "ready"]
     recent = []
     for e in reversed(_events(root, None, 2000)):
@@ -391,6 +406,7 @@ def state(root: Path) -> dict:
         "needs": needs,
         "running": running, "ready": ready, "recent": recent,
         "jobs": JOBS.list(),
+        "runner_jobs": _runner_jobs(root),      # detached jobs (scr/jobs.py): running/queued first, then the last finished ones
         "counts": {s: sum(1 for t in tasks.values() if t.status == s) for s in
                    ("ready", "dispatched", "in_progress", "submitted", "accepted", "merged", "closed", "blocked", "omri_queue")},
     }
