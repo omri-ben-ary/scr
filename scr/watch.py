@@ -64,6 +64,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import bgwait, jobs
 from .events import EventLog
 from .gitops import Git
 from .journal import journal
@@ -85,7 +86,9 @@ DEAD_CHECK_STATUSES = {"in_progress", "checkpoint"}
 # What holds a concurrency slot (the watcher's n_running and cmd_dispatch's `running` count exactly these).
 # `escalated` and `returned` never do: an escalation is a queue item for Omri and its slot goes to the next
 # ready task on the same tick (T-0092; 2026-09-19..21 T-0050 and T-0061 held both slots for 35 h).
-SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}
+SLOT_STATUSES = {"dispatched", "in_progress", "checkpoint", "submitted"}   # `waiting` (a job runs for it, scr/jobs.py) holds no slot
+REVIEW_BG_WAIT_MINUTES = 120   # a review session's background-wait ceiling (limits.yaml review_bg_wait_minutes): check_done's lake build
+                               # outran Claude Code's 600 s default and every review of 9-10 Oct ended with no Decision
 REVIEW_STALE_HOURS, HELP_STALE_HOURS = 2.0, 3.0      # limits.yaml: review_stale_hours / help_stale_hours
 DISPATCH_TIMEOUT_MINUTES = 30                        # limits.yaml: dispatch_timeout_minutes (T-0122)
 DISPATCH_TIMEOUT_ROUNDS = 3                          # limits.yaml: dispatch_timeout_rounds (T-0127)
@@ -852,6 +855,14 @@ class Watcher:
                     flags.append("CREDITS")
                     if self.flag(key) and not self.credit_death(t, sess, credit, now):
                         self.unflag(key)                                  # retried next tick
+                elif (jid := self.waiting_job(t)):
+                    # the scriber handed off to a job (scr/jobs.py): the session ended ON PURPOSE; the task waits for the
+                    # job without a slot and the jobs tick resumes the session when it ends
+                    flags.append(f"WAITING {jid}")
+                    if self.flag(f"waiting:{t.id}:{jid}"):
+                        self.log(f"{t.id} session ended with WAITING: job {jid} -> waiting")
+                        if self.scr(f"steward:{t.id}", "task", "set", t.id, "waiting", "--note", f"waiting on job {jid}", "--quiet") is None:
+                            self.unflag(f"waiting:{t.id}:{jid}")
                 else:
                     requeued = False
                     if self.flag(key):
@@ -880,6 +891,9 @@ class Watcher:
         # a stale flag belongs to a running task: drop it when the task moved on, so a later run can raise it again
         for key in [k for k in self.flags if k.startswith("stale:") and k.split(":", 1)[1] not in {t.id for t in running}]:
             self.unflag(key)
+
+        if ok:
+            self.jobs_tick(now)
 
         tasks = self.store.load_all()
         review = [t for t in tasks.values() if t.status == "submitted"]
@@ -1543,6 +1557,125 @@ class Watcher:
         self.unflag(f"land:{t.id}")
         return False
 
+    def waiting_job(self, t) -> str | None:
+        """The job a task's scriber handed off to: a `WAITING: job J-xxxx` line among the last lines of log.md naming a
+        job of this task that is still queued or running (scr/jobs.py). None otherwise."""
+        log_md = t.dir / "log.md"
+        if not log_md.exists():
+            return None
+        jid = jobs.waiting_job_in(log_md.read_text(encoding="utf-8", errors="replace"))
+        if not jid:
+            return None
+        job = jobs.load(self.root, jid)
+        if not job or job.get("task") != t.id or job.get("status") not in jobs.ACTIVE:
+            return None
+        return jid
+
+    def jobs_tick(self, now: datetime) -> None:
+        """The watcher's pass over detached jobs (scr/jobs.py): poll (dead wrappers -> failed, deadlines -> timeout,
+        queued -> running), record job_done / job_failed once per job, and resume a `waiting` task's session with
+        the result of its finished job."""
+        try:
+            for j in jobs.poll(self.root, now):
+                self.log(f"job {j['id']} {j.get('transition')}: {jobs.describe(j)}")
+        except Exception as e:  # noqa: BLE001 — a jobs failure must not stop the tick
+            self.log(f"jobs poll failed: {e}")
+            return
+        for job in jobs.list_jobs(self.root):
+            if job.get("status") not in jobs.FINISHED or job.get("notified"):
+                continue
+            name = "job_done" if job["status"] == "done" else "job_failed"
+            note = f"{job['id']} {job.get('name')}: {job['status']}" + (f" rc {job['rc']}" if job.get("rc") is not None else "") \
+                   + (f" after {jobs.seconds_of(job)} s" if jobs.seconds_of(job) is not None else "") + (f"; {job['note']}" if job.get("note") else "")
+            args = ["event", "system", "--name", name, "--note", note[:300], "--quiet"]
+            if job.get("task"):
+                args[4:4] = ["--task", job["task"]]
+            self.scr(f"steward:{job['task']}" if job.get("task") else "steward-watch", *args)
+            job["notified"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            jobs.save(self.root, job)
+            self.log(f"job {note}")
+            if job["status"] != "done":
+                self.need(f"job:{job['id']}", f"job {job['id']} ({job.get('name')}) {job['status']}" + (f": {job['note']}" if job.get("note") else "")
+                          + f" — log: scr job tail {job['id']}", job.get("task"))
+        # resume: a waiting task whose jobs are all finished gets its session back, with the results as the prompt
+        for t in [t for t in self.store.load_all().values() if t.status == "waiting"]:
+            mine = [j for j in jobs.list_jobs(self.root) if j.get("task") == t.id]
+            if not mine:
+                self.need(f"waiting_nojob:{t.id}", f"{t.id} is waiting but has no job on record — set it returned or in_progress by hand", t.id)
+                continue
+            if any(j["status"] in jobs.ACTIVE for j in mine):
+                continue
+            pending = [j for j in mine if not j.get("resumed")]
+            if not pending:
+                continue
+            self.resume_task(t, pending, now)
+
+    def resume_task(self, t, finished: list[dict], now: datetime) -> None:
+        """`claude -p --resume <session>` for a waiting task whose jobs ended: the job results are the prompt. The
+        session id is the job's `session` or the task's last recorded scriber launch; without one (or without claude)
+        the task goes back to `returned` so the dispatcher relaunches it fresh with the results in log.md."""
+        wl = workload_for(self.root, self.store, t)
+        wt = task_worktree(wl, t)
+        sid = next((j.get("session") for j in finished if j.get("session")), None)
+        if not sid:
+            for e in self.read_events():
+                if e.get("task") == t.id and is_scriber_launch(e) and (e.get("data") or {}).get("session_id"):
+                    sid = e["data"]["session_id"]
+        lines = []
+        for j in finished:
+            secs = jobs.seconds_of(j)
+            lines.append(f"- job {j['id']} ({j.get('name')}): {j['status']}" + (f", exit code {j['rc']}" if j.get("rc") is not None else "")
+                         + (f", {secs} s" if secs is not None else "") + f". Log: {j['log']}" + (f" [{j['note']}]" if j.get("note") else ""))
+            tail = jobs.tail(self.root, j["id"], 60)
+            if tail:
+                lines.append("  last lines of the log:\n  " + "\n  ".join(tail.splitlines()))
+        summary = "\n".join(lines)
+        with (t.dir / "log.md").open("a", encoding="utf-8") as f:
+            f.write(f"\n- {now:%Y-%m-%dT%H:%M:%SZ} [watcher] job(s) finished; resuming the session:\n" + "\n".join("  " + l for l in lines[:len(finished)]) + "\n")
+        for j in finished:
+            j["resumed"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            jobs.save(self.root, j)
+        if not sid or not wt.exists():
+            self.log(f"{t.id} cannot resume (session {sid}, worktree exists {wt.exists()}): -> returned, results are in log.md")
+            self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", "job finished; no session to resume (relaunch reads log.md)", "--quiet")
+            return
+        brief = (f"You are resuming Scriptorium task {t.id} after the job(s) you submitted finished. Results:\n{summary}\n"
+                 f"Read the full log(s) if the tail is not enough, then continue the task exactly where you stopped: your brief, "
+                 f"{t.dir / 'spec.md'}, {t.dir / 'log.md'} and {t.dir / 'report.md'} are unchanged. Submit further long "
+                 f"commands the same way ({self.root / '.venv' / 'Scripts' / 'scr.exe'} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
+                 f"line of log.md and end your turn).\n")
+        bf = t.dir / f"resume-brief-{now:%Y%m%d-%H%M%S}.txt"
+        bf.write_text(brief, encoding="utf-8")
+        tr = t.dir / f"session-{now:%Y%m%d-%H%M%S}.txt"
+        if self.scr(f"steward:{t.id}", "task", "set", t.id, "in_progress", "--note", "resumed after job(s) finished", "--quiet") is None:
+            return
+        try:
+            ceiling = bgwait.requested(t.rec)
+        except ValueError:
+            ceiling = None
+        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode, root=self.root,
+                           env_extra=bgwait.env_for(ceiling) or None, resume=sid)
+        if not pid:
+            self.log(f"{t.id} resume failed: claude not on PATH; -> returned")
+            self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--note", "resume failed: claude not on PATH", "--quiet")
+            return
+        created = process_created(pid)
+        argv = session_argv(wt, root=self.root, permission_mode=self.permission_mode, resume=sid) or []
+        with (t.dir / "log.md").open("a", encoding="utf-8") as f:
+            f.write(f"- {now:%Y-%m-%dT%H:%M:%S} [launcher] pid {pid}, transcript {tr}\n"
+                    f"- {now:%Y-%m-%dT%H:%M:%S} [launcher] session {sid} resumed (cwd {wt.resolve()}; take over: scr takeover {t.id})\n")
+        record_launch(self.root, "scriber", t.id, pid, sid, wt, argv, note=f"headless pid {pid} (resumed after job)",
+                      data={"transcript": tr.name, "created": created, "resumed_jobs": [j["id"] for j in finished]})
+        self.log(f"{t.id} session {sid} resumed (pid {pid}) with {len(finished)} finished job(s)")
+
+    def review_env(self) -> dict | None:
+        """The background-wait ceiling for review sessions (REVIEW_BG_WAIT_MINUTES / limits.yaml review_bg_wait_minutes)."""
+        try:
+            minutes = int(self.limits.get("review_bg_wait_minutes", REVIEW_BG_WAIT_MINUTES))
+        except (TypeError, ValueError):
+            minutes = REVIEW_BG_WAIT_MINUTES
+        return bgwait.env_for(minutes) or None
+
     def start_review(self, t) -> None:
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
@@ -1558,6 +1691,11 @@ class Watcher:
                  f"origin/{wl.main} and HEAD; never pass a bare {wl.main}: the stale local ref names every file merged since the branch point as out of scope), "
                  f"fill review.md completely, and end with a "
                  f"Decision line: accepted | returned (feedback) | escalated (Gate N, reason).\n{decide}\n"
+                 f"Run every check in the FOREGROUND and wait for it; never background check_done.py or a build and end your turn "
+                 f"(this headless session is killed {int(self.limits.get('review_bg_wait_minutes', REVIEW_BG_WAIT_MINUTES))} min after "
+                 f"your turn ends, and a review that ends without a Decision is lost). A check you expect to take over an hour: "
+                 f"`{self.root / '.venv' / 'Scripts' / 'scr.exe'} job submit --task {t.id} --name <name> -- <command>` then "
+                 f"`scr job wait <J-id>` keeps it under the watcher's eye while you wait here.\n"
                  f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; never run git in the scriptorium folder (it journals itself).\n")
         bf = t.dir / "review-brief.txt"
         bf.write_text(brief, encoding="utf-8")
@@ -1565,7 +1703,7 @@ class Watcher:
         if not wt.exists():
             self.log(f"{t.id} cannot start review: worktree missing"); self.unflag(f"review:{t.id}"); return
         sid = new_session_id()
-        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode, root=self.root, session_id=sid)
+        pid = start_claude(wt, bf, tr, permission_mode=self.permission_mode, root=self.root, session_id=sid, env_extra=self.review_env())
         if pid:
             self.log(f"{t.id} review session started (pid {pid}, session {sid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid}", "--quiet")
@@ -1592,12 +1730,14 @@ class Watcher:
                  f"(4) judge: does the change fix the symptom, is it minimal, is there a test that would have caught it, what else has the same bug class; "
                  f"(5) fill review.md and add an `unlocks` block of follow-up tasks (title, why, files) — regression tests, root cause, the same pattern "
                  f"elsewhere — which Intake turns into records; (6) end with a Decision line: accepted | returned (feedback) | escalated (reason).\n{decide}\n"
+                 f"Run `hotfix test` in the FOREGROUND and wait for it (this session is killed "
+                 f"{int(self.limits.get('review_bg_wait_minutes', REVIEW_BG_WAIT_MINUTES))} min after your turn ends; a review without a Decision is lost).\n"
                  f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; the tree journals itself.\n")
         bf = t.dir / "review-brief.txt"
         bf.write_text(brief, encoding="utf-8")
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
         sid = new_session_id()
-        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode, root=self.root, session_id=sid)
+        pid = start_claude(self.root, bf, tr, permission_mode=self.permission_mode, root=self.root, session_id=sid, env_extra=self.review_env())
         if pid:
             self.log(f"{t.id} tooling review session started (pid {pid}, session {sid}) -> {tr}")
             self.scr(f"steward:{t.id}", "event", "system", "--name", "review_started", "--task", t.id, "--note", f"pid {pid} (tooling)", "--quiet")
