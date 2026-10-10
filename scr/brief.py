@@ -15,8 +15,12 @@ not depend on it). When done, write {report} using the template already there â€
 truthfully (any entry routes to Gate 1) and the `unlocks` block. Budget: {attempts} attempt(s),
 {tokens:,} tokens, {hours} h wall.
 This headless session exits once your turn ends and background jobs have run {bgwait} past it; anything
-still running is then killed. For long computations, stay in the foreground and poll, or record in {log}
-that the task needs a longer `budget.max_bg_wait_minutes` (over 12 h needs Omri).{stmt}"""
+still running is then killed. For anything that may run longer than a few minutes (lake build, check_done.py,
+a test suite, an LP or certificate run) submit it as a JOB instead of running it here:
+  {scr} job submit --task {id} --name <short-name> --timeout 4h -- <command and arguments>
+then append the line `WAITING: job <J-id>` as the LAST line of {log} and END YOUR TURN. The watcher runs the
+job outside this session (its log: {scr} job tail <J-id>), frees your slot meanwhile, and resumes THIS session
+with the result when the job ends. Never background a long command inside this session.{stmt}"""
 
 
 def brief_for(root: Path, store: Store, t: Task) -> str:
@@ -33,7 +37,8 @@ def brief_for(root: Path, store: Store, t: Task) -> str:
     except ValueError:
         bg = "default (600 s)"
     bg = "10 min (the default)" if bg.startswith("default") else bg
+    scr = root / ".venv" / "Scripts" / "scr.exe"
     return BRIEF_TEMPLATE.format(
-        id=t.id, title=t.rec.get("title", ""), spec=(d / "spec.md").resolve(), worktree=wt_abs,
+        id=t.id, title=t.rec.get("title", ""), spec=(d / "spec.md").resolve(), worktree=wt_abs, scr=scr if scr.exists() else "scr",
         log=(d / "log.md").resolve(), report=(d / "report.md").resolve(),
         attempts=b.get("max_attempts", 3), tokens=int(b.get("max_tokens", 0)), hours=b.get("max_wall_hours", 6), bgwait=bg, stmt=stmt)
