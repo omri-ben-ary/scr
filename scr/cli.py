@@ -281,7 +281,7 @@ def cmd_dispatch(args):
     limits = store.config("limits")
     g = Graph.build(store.load_all())
     # the slot-holders: the same set as scr.watch.SLOT_STATUSES; `escalated` and `returned` never count (T-0092)
-    running = [t.id for t in g.tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"}]
+    running = [t.id for t in g.tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"}]   # never `waiting` (scr/jobs.py)
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")
     ranked = [r["task"] for r in rows]
@@ -625,6 +625,52 @@ def cmd_answer(args):
     _print(r["log"])
 
 
+def cmd_job(args):
+    """scr job submit|list|tail|kill|wait — long commands run detached under the watcher (scr/jobs.py)."""
+    root, store, log = _ctx(args)
+    from . import jobs
+    op = args.op
+    if op == "submit":
+        cmd = list(args.cmd or [])
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd:
+            raise RepoError("job submit: give the command after `--`, e.g. scr job submit --task T-0001 --name build -- lake build")
+        if args.task and args.task not in store.load_all():
+            raise RepoError(f"{args.task}: no such task")
+        try:
+            job = jobs.submit(root, cmd, task=args.task, name=args.name, cwd=args.cwd, timeout=args.timeout, session=args.session, actor=args.actor)
+        except ValueError as e:
+            raise RepoError(str(e)) from None
+        ev = {"name": "job_submitted", "actor": args.actor, "note": f"{job['id']} {job['name']}: {job['status']} ({job['timeout_min']} min): {' '.join(cmd)[:200]}"}
+        if job.get("task"):
+            ev["task"] = job["task"]
+        log.append("system", **ev)
+        print(f"{job['id']} {job['status']} (timeout {job['timeout_min']} min; log {job['log']})")
+        print(f"hand off: append `WAITING: job {job['id']}` as the last line of log.md and end your turn; the watcher resumes you when it ends")
+        return
+    if op == "list":
+        rows = jobs.list_jobs(root, active_only=not args.all)
+        print("\n".join(jobs.describe(j) for j in rows) if rows else "no jobs" + ("" if args.all else " running or queued (--all for finished ones)"))
+        return
+    if not args.id:
+        raise RepoError(f"job {op}: a job id (J-xxxx) is required")
+    if op == "tail":
+        print(jobs.tail(root, args.id, args.n))
+    elif op == "kill":
+        job = jobs.kill_job(root, args.id, note=f"killed by {args.actor}")
+        if not job:
+            raise RepoError(f"{args.id}: no such job")
+        log.append("system", name="job_killed", actor=args.actor, note=f"{args.id} {job.get('name')}", **({"task": job["task"]} if job.get("task") else {}))
+        print(jobs.describe(job))
+    elif op == "wait":
+        job = jobs.wait(root, args.id, poll_seconds=args.poll)
+        if not job:
+            raise RepoError(f"{args.id}: no such job")
+        print(jobs.describe(job))
+        sys.exit(0 if job.get("status") == "done" else 1)
+
+
 def cmd_inbox(args):
     root, _, _ = _ctx(args)
     from .answers import add_inbox
@@ -782,6 +828,12 @@ def build_parser() -> argparse.ArgumentParser:
     an = sub.add_parser("answer", parents=[common], help="record Omri's answer to a decision / HELP / gate item (and run the Concierge)")
     an.add_argument("id"); an.add_argument("--kind", choices=["decision", "help", "gate"], default="decision"); an.add_argument("--text", required=True); an.add_argument("--no-concierge", action="store_true"); an.set_defaults(fn=cmd_answer)
     ib = sub.add_parser("inbox", parents=[common], help="add one idea line to the Inbox in queues/omri.md"); ib.add_argument("text"); ib.set_defaults(fn=cmd_inbox)
+    jb = sub.add_parser("job", parents=[common], help="long commands run detached under the watcher: submit (-- <cmd>) | list [--all] | tail <id> | kill <id> | wait <id>")
+    jb.add_argument("op", choices=["submit", "list", "tail", "kill", "wait"]); jb.add_argument("id", nargs="?")
+    jb.add_argument("--task"); jb.add_argument("--name"); jb.add_argument("--timeout", default=None, help="4h, 90m or minutes (default 240 min; over 12 h only --actor omri)")
+    jb.add_argument("--cwd"); jb.add_argument("--session", help="the Claude session id to resume when the job ends (default: the task's last scriber launch)")
+    jb.add_argument("--all", action="store_true"); jb.add_argument("-n", type=int, default=40); jb.add_argument("--poll", type=float, default=10.0)
+    jb.add_argument("cmd", nargs=argparse.REMAINDER, help="after `--`: the command and its arguments"); jb.set_defaults(fn=cmd_job)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
     nt = sub.add_parser("notify", parents=[common], help="push channel for needs-you cards (config/notify.yaml): --test sends one test message per enabled channel")
     nt.add_argument("--test", action="store_true"); nt.set_defaults(fn=cmd_notify)
@@ -802,7 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
 MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire",
-            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix"}
+            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix", "job"}
 
 
 def main(argv=None):
