@@ -629,15 +629,51 @@ def cmd_answer(args):
     _print(r["log"])
 
 
+JOB_OPTS = ("task", "name", "timeout", "cwd", "session")
+
+
+def job_args(args) -> tuple[argparse.Namespace, list[str]]:
+    """Split `scr job ...`'s trailing words into the job's own options and the command after `--`.
+
+    The `rest` positional is argparse.REMAINDER, which swallows EVERYTHING after `op` — including `--task T-0001`
+    (2026-10-11: J-0007 and J-0010 ran a program called `--task`, rc 127). So the words before `--` are re-parsed
+    here for the id and the options; the words after `--` are the command, verbatim."""
+    rest = list(getattr(args, "rest", None) or [])
+    opts, cmd = rest, []
+    if "--" in rest:
+        i = rest.index("--")
+        opts, cmd = rest[:i], rest[i + 1:]
+    sub = argparse.ArgumentParser(prog="scr job", add_help=False)
+    sub.add_argument("id", nargs="?")
+    for o in JOB_OPTS:
+        sub.add_argument("--" + o)
+    sub.add_argument("--all", action="store_true"); sub.add_argument("-n", type=int); sub.add_argument("--poll", type=float)
+    known, unknown = sub.parse_known_args(opts)
+    if unknown and cmd:
+        raise RepoError(f"job: unrecognized words before `--`: {' '.join(unknown)}")
+    if unknown and not cmd:                      # no `--`: whatever is left IS the command (a bare `scr job submit lake build`)
+        cmd = unknown
+    merged = argparse.Namespace(**vars(args))
+    merged.id = args.id or known.id
+    for o in JOB_OPTS:
+        if getattr(known, o, None) is not None:
+            setattr(merged, o, getattr(known, o))
+    if known.all:
+        merged.all = True
+    if known.n is not None:
+        merged.n = known.n
+    if known.poll is not None:
+        merged.poll = known.poll
+    return merged, cmd
+
+
 def cmd_job(args):
     """scr job submit|list|tail|kill|wait — long commands run detached under the watcher (scr/jobs.py)."""
     root, store, log = _ctx(args)
     from . import jobs
     op = args.op
+    args, cmd = job_args(args)
     if op == "submit":
-        cmd = list(args.rest or [])            # `rest`, not `cmd`: args.cmd is the subcommand name main() journals by
-        if cmd and cmd[0] == "--":
-            cmd = cmd[1:]
         if not cmd:
             raise RepoError("job submit: give the command after `--`, e.g. scr job submit --task T-0001 --name build -- lake build")
         if args.task and args.task not in store.load_all():

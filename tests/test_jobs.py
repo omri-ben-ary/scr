@@ -122,6 +122,14 @@ def test_resume_argv_continues_the_session(monkeypatch, tmp_path):
 def test_job_submit_argv_does_not_shadow_the_subcommand_name():
     """`scr job submit ... -- <cmd>`: the trailing arguments must not be parsed into `cmd`, which main() reads as the
     subcommand name for the journal step (2026-10-11: TypeError unhashable list after the job had already started)."""
-    from scr.cli import build_parser
-    a = build_parser().parse_args(["job", "submit", "--task", "T-0001", "--name", "t", "--", "python", "-m", "pytest"])
-    assert a.cmd == "job" and a.rest[-3:] == ["python", "-m", "pytest"]
+    from scr.cli import build_parser, job_args
+    a = build_parser().parse_args(["job", "submit", "--task", "T-0001", "--name", "t", "--timeout", "3h", "--", "python", "-m", "pytest"])
+    assert a.cmd == "job"
+    merged, cmd = job_args(a)
+    assert cmd == ["python", "-m", "pytest"], cmd                      # never `--task` as the program (J-0007, J-0010: rc 127)
+    assert merged.task == "T-0001" and merged.name == "t" and merged.timeout == "3h"
+    b = build_parser().parse_args(["job", "tail", "J-0010", "-n", "5"])
+    mb, cb = job_args(b)
+    assert mb.id == "J-0010" and mb.n == 5 and cb == []
+    c = build_parser().parse_args(["job", "list", "--all"])
+    assert job_args(c)[0].all is True
