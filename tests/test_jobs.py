@@ -117,3 +117,11 @@ def test_resume_argv_continues_the_session(monkeypatch, tmp_path):
     assert "--resume" in argv and argv[argv.index("--resume") + 1] == "sid-123" and "--session-id" not in argv
     fresh = run_mod.session_argv(tmp_path, root=tmp_path, session_id="sid-456")
     assert "--session-id" in fresh and "--resume" not in fresh
+
+
+def test_job_submit_argv_does_not_shadow_the_subcommand_name():
+    """`scr job submit ... -- <cmd>`: the trailing arguments must not be parsed into `cmd`, which main() reads as the
+    subcommand name for the journal step (2026-10-11: TypeError unhashable list after the job had already started)."""
+    from scr.cli import build_parser
+    a = build_parser().parse_args(["job", "submit", "--task", "T-0001", "--name", "t", "--", "python", "-m", "pytest"])
+    assert a.cmd == "job" and a.rest[-3:] == ["python", "-m", "pytest"]

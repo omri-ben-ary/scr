@@ -635,7 +635,7 @@ def cmd_job(args):
     from . import jobs
     op = args.op
     if op == "submit":
-        cmd = list(args.cmd or [])
+        cmd = list(args.rest or [])            # `rest`, not `cmd`: args.cmd is the subcommand name main() journals by
         if cmd and cmd[0] == "--":
             cmd = cmd[1:]
         if not cmd:
@@ -837,7 +837,7 @@ def build_parser() -> argparse.ArgumentParser:
     jb.add_argument("--task"); jb.add_argument("--name"); jb.add_argument("--timeout", default=None, help="4h, 90m or minutes (default 240 min; over 12 h only --actor omri)")
     jb.add_argument("--cwd"); jb.add_argument("--session", help="the Claude session id to resume when the job ends (default: the task's last scriber launch)")
     jb.add_argument("--all", action="store_true"); jb.add_argument("-n", type=int, default=40); jb.add_argument("--poll", type=float, default=10.0)
-    jb.add_argument("cmd", nargs=argparse.REMAINDER, help="after `--`: the command and its arguments"); jb.set_defaults(fn=cmd_job)
+    jb.add_argument("rest", nargs=argparse.REMAINDER, help="after `--`: the command and its arguments"); jb.set_defaults(fn=cmd_job)
     ak = sub.add_parser("ack", parents=[common], help="dismiss a system alarm (event hash) or a chore (chore:<id>) from the UI"); ak.add_argument("key"); ak.set_defaults(fn=cmd_ack)
     nt = sub.add_parser("notify", parents=[common], help="push channel for needs-you cards (config/notify.yaml): --test sends one test message per enabled channel")
     nt.add_argument("--test", action="store_true"); nt.set_defaults(fn=cmd_notify)
