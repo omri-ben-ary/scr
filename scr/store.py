@@ -13,9 +13,9 @@ from .canon import H, canon, sha256_bytes
 
 STATES = [
     "proposed", "triaged", "blocked", "ready", "dispatched", "in_progress",
-    "checkpoint", "submitted", "returned", "escalated", "omri_queue",
+    "checkpoint", "waiting", "submitted", "returned", "escalated", "omri_queue",
     "accepted", "merged", "rejected", "closed",
-]
+]   # waiting = a job runs for the task outside its session (scr/jobs.py, 2026-10-10); holds no concurrency slot
 OPEN_STATES = {s for s in STATES if s not in {"merged", "rejected", "closed"}}
 DONE_STATES = {"merged", "closed"}
 KINDS = ["prove", "audit", "refactor", "survey", "decide", "approve", "system", "milestone"]

@@ -133,3 +133,11 @@ def test_job_submit_argv_does_not_shadow_the_subcommand_name():
     assert mb.id == "J-0010" and mb.n == 5 and cb == []
     c = build_parser().parse_args(["job", "list", "--all"])
     assert job_args(c)[0].all is True
+
+
+def test_waiting_is_a_known_state_everywhere():
+    """2026-10-12: `scr verify` reported "T-0136: unknown status waiting" and the watcher went read-only for 12 h —
+    store.STATES is the verifier's list and must carry every lifecycle status."""
+    from scr.store import STATES, OPEN_STATES
+    assert "waiting" in STATES and "waiting" in OPEN_STATES
+    assert set(lifecycle.TRANSITIONS) <= set(STATES), set(lifecycle.TRANSITIONS) - set(STATES)
