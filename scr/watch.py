@@ -71,7 +71,7 @@ from .journal import journal
 from .lifecycle import requeue
 from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
-from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, session_argv, start_claude
+from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, service_argv, session_argv, start_claude
 from .state import State
 from .store import Store
 
