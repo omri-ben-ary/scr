@@ -217,6 +217,10 @@ def journal_note(root: Path, sha: str, changed: list[str], actor: str) -> str | 
     if not tool:
         return None
     tid = current(root)
+    if not tid and all(p.startswith("config/") for p in tool) and not (root / PENDING).exists():
+        # 2026-10-14: a config-only edit (limits.yaml, weights.yaml) is Omri turning a knob, not a tooling change;
+        # the journal commit is its record. Three hotfixes (T-0347, T-0356, T-0366) were opened for limits.yaml edits.
+        return None
     if not tid:
         pend = _take(root, PENDING) or {}
         who = pend.get("who") or (actor.split(":", 1)[-1] if actor.startswith("hotfix:") else actor)

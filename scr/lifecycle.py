@@ -51,6 +51,8 @@ def cascade(store, log, tid: str, status: str, actor: str = "scr") -> list[str]:
     made: list[str] = []
     for d in g.succ(g.blocks).get(tid, []):
         dt = g.tasks[d]
+        if dt.rec.get("parked"):
+            continue                        # parked by Omri (task set ... --note "parked: ..."): only he readies it
         if dt.status in {"triaged", "blocked"} and g.ready_now(d) and dt.rec.get("queue") == "scribers":
             was = dt.status
             apply(dt.rec, "ready")

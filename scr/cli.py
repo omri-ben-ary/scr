@@ -120,6 +120,10 @@ def cmd_task_set(args):
     lifecycle.apply(t.rec, args.status)
     if args.tokens:
         t.rec["tokens_used"] = int(t.rec.get("tokens_used", 0)) + args.tokens
+    if (args.note or "").lower().startswith("parked"):
+        t.rec["parked"] = True              # T-0232 was auto-readied by the cascade after Omri parked it (2026-10-13)
+    elif args.status == "ready":
+        t.rec.pop("parked", None)
     t.save()
     log.append("state", task=args.id, **{"from": old}, to=args.status, actor=args.actor, tokens=args.tokens or None,
                note=(args.note or "") + (" [forced]" if args.force else "") or None)
