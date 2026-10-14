@@ -353,6 +353,12 @@ def checkpoint(root: Path, tid: str, push: bool = False, wl_name: str | None = N
         return None
     if not g.dirty():
         return None
+    gitdir = g.run("rev-parse", "--git-dir").out.strip()
+    if gitdir and any((Path(gitdir) if Path(gitdir).is_absolute() else wt / gitdir).joinpath(f).exists() for f in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD")):
+        # 2026-10-14: a merge / rebase in progress (Omri resolving T-0291's PR conflict by hand) is never checkpointed:
+        # the commit would swallow MERGE_HEAD and turn the merge into a plain commit carrying the trunk's files as drift
+        _log(root).append("system", name="checkpoint_skipped", task=tid, actor=f"steward:{tid}", note="merge/rebase in progress in the worktree; not checkpointed")
+        return None
     c = scoped_commit(g, t, f"[checkpoint] {tid} {now_iso()}\n\nAutomatic checkpoint by the Steward watcher; content unreviewed.", tid)
     log = _log(root)
     if c.sha:
