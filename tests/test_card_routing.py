@@ -89,3 +89,16 @@ def test_additions_only_gate1_is_accepted_by_the_watcher(world):
     other = (root / "templates" / "review.md").read_text(encoding="utf-8").replace(
         "accepted | returned (feedback below) | escalated (Gate N, reason)", "escalated (Gate 1, 3 CHANGED statements need approval)")
     assert not additions_only_gate1(other)
+
+
+def test_additions_only_gate1_rejects_negated_prose():
+    """T-0367 review: a Decision line explaining why the diff is NOT additions-only, or that checks do not pass, never qualifies."""
+    from scr.review import additions_only_gate1
+    tpl = (Path(__file__).resolve().parent.parent / "templates" / "review.md").read_text(encoding="utf-8")
+    mk = lambda line: tpl.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", line)
+    assert additions_only_gate1(mk("escalated (Gate 1: 2 ADDED, 0 MODIFIED, 0 REMOVED; mechanical checks pass)"))
+    assert additions_only_gate1(mk("escalated (Gate 1: 4 Gate-1-approved decls, PROOF-ONLY vs d256396; recommend --force-accept and land)"))
+    assert not additions_only_gate1(mk("escalated (Gate 1: NOT additions-only - 1 MODIFIED; all mechanical checks pass)"))
+    assert not additions_only_gate1(mk("escalated (Gate 1: additions only; not all checks pass)"))
+    assert not additions_only_gate1(mk("escalated (Gate 1: additions only; check_done FAIL)"))
+    assert not additions_only_gate1(mk("escalated (Gate 2: additions only; checks pass)"))
