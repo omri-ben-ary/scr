@@ -960,8 +960,20 @@ class Watcher:
                 for line in res["out"]:
                     self.log(f"  land: {line}")
                 if not res["ok"]:
-                    self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed — see reports/steward_watch.log", t.id)
                     self.unflag(f"land:{t.id}")
+                    why = next((l.strip() for l in res["out"] if "merge failed" in l or "REFUSED" in l or "push failed" in l), "landing failed")
+                    if "merge failed" in why or "not mergeable" in why or "conflict" in why.lower():
+                        fix = (f"PR merge conflict with {wl.main}: in the worktree run `git fetch origin {wl.main} && git merge origin/{wl.main}`, "
+                               f"resolve every conflict (a TARGETS.md / ledger conflict: keep both sides' rows, a status cell takes the more "
+                               f"advanced value), `lake build` the touched modules, rerun check_done on the frozen decls, commit the merge, "
+                               f"then write report.md (add a 'Merge' line naming the resolved files) and resubmit. No new statements.")
+                    elif "REFUSED" in why:
+                        fix = (f"landing refused for out-of-scope paths ({why[:200]}): either widen scope.files in the record "
+                               f"(`scr task field {t.id} scope.files <list>`) when the task owns them, or revert the drift commit; then resubmit.")
+                    else:
+                        fix = f"landing failed ({why[:300]}); fix the branch and resubmit."
+                    if not self.autofix(t, "land", fix):
+                        self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed twice ({why[:160]}) — see reports/steward_watch.log", t.id)
                     continue
                 merged_now += 1
                 r = retire(self.root, t.id, execute=True)
@@ -1574,14 +1586,89 @@ class Watcher:
         line every tick, ONE land_failed event per branch tip (+ scope). Returns False."""
         why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
         nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
-        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
+        if res.get("reason") not in {"lost_worktree", "error"} and self.flag(key + ":autofix"):
+            tail = "\n".join(res["out"][-12:])[-1500:]
+            fix = (f"landing failed ({res.get('reason')}): {why[:300]}. Merge the trunk into the branch, make the full test suite pass "
+                   f"(`.venv\\Scripts\\python.exe -m pytest tests -q`, as a scr job if long), fix only what the failure names, commit, "
+                   f"then resubmit with report.md stating the test result.\nLanding output tail:\n{tail}")
+            if self.autofix(t, "land", fix):
+                for k in failed - {key}:
+                    self.unflag(k)
+                self.unflag(f"land:{t.id}")
+                return False
+        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
             self.unflag(k)
         if self.flag(key):
             self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
         self.unflag(f"land:{t.id}")
         return False
+
+    AUTOFIX_MAX = 2
+
+    def autofix(self, t, kind: str, note: str) -> bool:
+        """2026-10-14 (Omri: "the system should be resolving it by itself"). A task the system can send back to its own
+        scriber with a concrete fix note is sent back — accepted/escalated/submitted -> returned -> ready — instead of
+        becoming a Needs-you card. At most AUTOFIX_MAX times per task and kind (flags `autofix:<id>:<kind>:<n>`); the
+        third failure is Omri's. The note lands in log.md as a [steward] line (the scriber's brief reads it) and in a
+        `auto_fix` event. Returns True when the task was requeued."""
+        done = [k for k in self.flags if k.startswith(f"autofix:{t.id}:{kind}:")]
+        if len(done) >= self.AUTOFIX_MAX:
+            return False
+        n = len(done) + 1
+        line = f"auto-fix {n}/{self.AUTOFIX_MAX} ({kind}): {note}"
+        try:
+            with (t.dir / "log.md").open("a", encoding="utf-8") as f:
+                f.write(f"\n- {datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ} [steward] {line}\n")
+        except OSError as e:
+            self.log(f"{t.id} autofix: log.md not written: {e}")
+        if t.status != "returned":
+            if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--force", "--note", line[:300], "--quiet") is None:
+                return False
+        if self.scr(f"steward:{t.id}", "task", "set", t.id, "ready", "--note", f"auto-fix {n}: redispatched", "--quiet") is None:
+            return False
+        self.flags.add(f"autofix:{t.id}:{kind}:{n}")
+        self.unflag(f"review:{t.id}")
+        self.scr(f"steward:{t.id}", "event", "system", "--name", "auto_fix", "--task", t.id, "--note", line[:900], "--quiet")
+        self.log(f"{t.id} {line[:160]} -> ready")
+        self.events = None
+        return True
+
+    REVIEW_RETRIES = 2
+
+    def rerun_review(self, t, why: str) -> bool:
+        """A review that ended without a Decision is run again (up to REVIEW_RETRIES times per submission episode) instead
+        of escalating the task to Omri: review.md is archived as review-stale-<n>.md, `review:<id>` is cleared so the
+        tick relaunches the review, and the stale clock restarts from now (flag `review_retry:<id>:<n>:<stamp>`)."""
+        done = [k for k in self.flags if k.startswith(f"review_retry:{t.id}:")]
+        if len(done) >= self.REVIEW_RETRIES:
+            return False
+        n = len(done) + 1
+        rev = t.dir / "review.md"
+        if rev.exists():
+            try:
+                rev.replace(t.dir / f"review-stale-{n}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.md")
+            except OSError as e:
+                self.log(f"{t.id} review re-run: review.md not archived: {e}")
+                return False
+        self.flags.add(f"review_retry:{t.id}:{n}:{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}")
+        self.unflag(f"review:{t.id}")
+        self.scr(f"steward:{t.id}", "event", "system", "--name", "review_retry", "--task", t.id, "--note", f"review re-run {n}/{self.REVIEW_RETRIES}: {why}"[:600], "--quiet")
+        self.log(f"{t.id} review re-run {n}/{self.REVIEW_RETRIES}: {why[:140]}")
+        return True
+
+    def review_retry_since(self, tid: str) -> datetime | None:
+        """The newest review re-run stamp of `tid`, or None."""
+        stamps = [k.rsplit(":", 1)[1] for k in self.flags if k.startswith(f"review_retry:{tid}:")]
+        out = None
+        for s in stamps:
+            try:
+                d = datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            out = d if out is None or d > out else out
+        return out
 
     def waiting_job(self, t) -> str | None:
         """The job a task's scriber handed off to: a `WAITING: job J-xxxx` line among the last lines of log.md naming a
