@@ -950,42 +950,10 @@ class Watcher:
             for t in [t for t in tasks.values() if t.status == "accepted"]:
                 if task_frozen(self.store, t):          # T-0272: held for the thaw; `land:` stays unset
                     continue
-                if not self.flag(f"land:{t.id}"):
-                    continue
-                if is_scriptorium_task(self.root, self.store, t):
-                    if self.land_scriptorium_task(t):
-                        merged_now += 1
-                    continue
-                wl = workload_for(self.root, self.store, t)
-                self.log(f"{t.id} auto-land: commit/push/PR/merge")
-                try:
-                    res = land(self.root, t.id, merge=True)
-                except Exception as e:  # noqa: BLE001
-                    res = {"ok": False, "url": None, "out": [str(e)]}
-                for line in res["out"]:
-                    self.log(f"  land: {line}")
-                if not res["ok"]:
-                    self.unflag(f"land:{t.id}")
-                    why = next((l.strip() for l in res["out"] if "merge failed" in l or "REFUSED" in l or "push failed" in l), "landing failed")
-                    if "merge failed" in why or "not mergeable" in why or "conflict" in why.lower():
-                        fix = (f"PR merge conflict with {wl.main}: in the worktree run `git fetch origin {wl.main} && git merge origin/{wl.main}`, "
-                               f"resolve every conflict (a TARGETS.md / ledger conflict: keep both sides' rows, a status cell takes the more "
-                               f"advanced value), `lake build` the touched modules, rerun check_done on the frozen decls, commit the merge, "
-                               f"then write report.md (add a 'Merge' line naming the resolved files) and resubmit. No new statements.")
-                    elif "REFUSED" in why:
-                        fix = (f"landing refused for out-of-scope paths ({why[:200]}): either widen scope.files in the record "
-                               f"(`scr task field {t.id} scope.files <list>`) when the task owns them, or revert the drift commit; then resubmit.")
-                    else:
-                        fix = f"landing failed ({why[:300]}); fix the branch and resubmit."
-                    if not self.autofix(t, "land", fix):
-                        self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed twice ({why[:160]}) — see reports/steward_watch.log", t.id)
-                    continue
-                merged_now += 1
-                r = retire(self.root, t.id, execute=True)
-                for line in r["out"]:
-                    self.log(f"  retire: {line}")
-                if not r["ok"]:
-                    self.retire_refused(t.id, r["code"])
+                # 2026-10-14: a landing runs as a detached job (scr/jobs.py), never inside the tick: a 2 h test run used
+                # to freeze dispatch, reviews and the whole watcher for 2 h (T-0058 on 2026-10-14 15:51)
+                if self.land_via_job(t) == "merged":
+                    merged_now += 1
         self.retire_refused_needs(tasks)
 
         if ok:
@@ -1514,6 +1482,130 @@ class Watcher:
         decided.append({"task": t.id, "decision": verdict})
         return True
 
+    LAND_JOB_PREFIX = "land-"
+
+    def land_jobs(self, tid: str) -> list[dict]:
+        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)]
+
+    def land_via_job(self, t) -> str | None:
+        """The landing of an accepted task as a detached job: `scr --actor steward:<id> land <id> --merge` (ops.land_any:
+        the scriptorium landing with its test run, or the QI push/PR/merge), submitted once per attempt and applied when
+        it ends (apply_land_job). Returns "merged" when a finished job landed the task this tick, "submitted" when a job
+        was started, "failed" when a finished job was applied as a failure, None otherwise (job still running, nothing
+        to do, or the task is held back by a known-failed tip)."""
+        active = [j for j in self.land_jobs(t.id) if j["status"] in jobs.ACTIVE]
+        if active:
+            return None
+        pending = [j for j in self.land_jobs(t.id) if j["status"] in jobs.FINISHED and not j.get("applied")]
+        if pending:
+            return self.apply_land_job(t, pending[-1])
+        scriptorium = is_scriptorium_task(self.root, self.store, t)
+        wl = workload_for(self.root, self.store, t)
+        wt = task_worktree(wl, t)
+        tip, scope_sig, failed = None, "", set()
+        if scriptorium:
+            if not wt.exists():                 # no worktree: ops.land_any decides in-process, no tests (T-0158)
+                return "merged" if self.land_scriptorium_task(t) else None
+            sc = t.rec.get("scope") or {}
+            scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
+            failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
+            g, mg = Git(wt), Git(self.root)
+            tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
+            if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
+                if not [k for k in self.flags if k.startswith(f"autofix:{t.id}:land:")]:
+                    if self.autofix(t, "land", f"landing of task/{t.id} failed at {tip[:8]} (see the land_failed event); merge the trunk in, make the tests pass, commit, resubmit"):
+                        for k in failed:
+                            self.unflag(k)
+                        self.unflag(f"land:{t.id}")
+                        return "failed"
+                self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
+                self.unflag(f"land:{t.id}")
+                return None
+        elif not wt.exists():
+            self.need(f"auto_land_failed:{t.id}", f"{t.id} accepted but its worktree {wt} is missing — nothing to land", t.id)
+            return None
+        if not self.flag(f"land:{t.id}"):
+            return None
+        from .ops import land_test_timeout
+        minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
+        cmd = service_argv(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
+        try:
+            job = jobs.submit(self.root, cmd, task=t.id, name=f"{self.LAND_JOB_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"{t.id} landing job not submitted: {e}")
+            self.unflag(f"land:{t.id}")
+            return None
+        job["land_tip"], job["land_scope_sig"], job["land_scriptorium"] = tip, scope_sig, scriptorium
+        jobs.save(self.root, job)
+        self.log(f"{t.id} landing submitted as job {job['id']} ({'scriptorium: commit, merge trunk, tests, merge' if scriptorium else 'push, PR, merge'}; {minutes} min)")
+        return "submitted"
+
+    def apply_land_job(self, t, job: dict) -> str:
+        """A finished landing job: on rc 0 `scr land` already recorded the merge (status merged, events, cascade) and
+        the worktree is retired here; otherwise the job log's FAILED / REFUSED / merge-failed line is the reason and
+        the failure takes the same route as before (land_failed for the scriptorium, the QI conflict / scope / push
+        branches), i.e. auto-fix first, Omri third."""
+        job["applied"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        jobs.save(self.root, job)
+        try:
+            text = Path(job["log"]).read_text(encoding="utf-8", errors="replace") if job.get("log") else ""
+        except OSError:
+            text = ""
+        out = [l.rstrip() for l in text.splitlines() if l.strip()][-40:]
+        for line in out[-12:]:
+            self.log(f"  land[{job['id']}]: {line[:200]}")
+        scriptorium = bool(job.get("land_scriptorium"))
+        scope_sig = job.get("land_scope_sig") or ""
+        failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
+        if job["status"] == "done" and job.get("rc") == 0:
+            try:
+                st = self.store.get(t.id).status
+            except Exception:  # noqa: BLE001
+                st = None
+            if st != "merged":
+                self.log(f"{t.id} landing job {job['id']} exited 0 but the task is {st}; treated as a failure")
+            else:
+                for k in failed:
+                    self.unflag(k)
+                try:
+                    r = retire(self.root, t.id, execute=True)
+                except Exception as e:  # noqa: BLE001
+                    r = {"ok": False, "code": "error", "out": [str(e)]}
+                for line in r["out"]:
+                    self.log(f"  retire: {line}")
+                if not r["ok"]:
+                    self.retire_refused(t.id, r["code"])
+                self.log(f"{t.id} landed by job {job['id']} -> merged")
+                self.events = None
+                return "merged"
+        why = next((l for l in out if "FAILED" in l or "REFUSED" in l or "merge failed" in l or "push failed" in l), "")
+        if job["status"] == "timeout":
+            reason, why = "timeout", why or f"landing job {job['id']} hit its {job.get('timeout_min')} min deadline"
+        elif job["status"] == "killed":
+            reason, why = "killed", why or f"landing job {job['id']} was killed ({job.get('note') or 'no note'})"
+        else:
+            m = re.search(r"FAILED \((\w+)\)", why)
+            reason = m.group(1) if m else ("conflict" if "merge failed" in why or "conflict" in why.lower() else "scope" if "REFUSED" in why else "tests")
+        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": job.get("land_tip"), "sha": None}
+        if scriptorium:
+            self.land_failed(t, res, failed, scope_sig)
+            return "failed"
+        wl = workload_for(self.root, self.store, t)
+        self.unflag(f"land:{t.id}")
+        if reason == "conflict":
+            fix = (f"PR merge conflict with {wl.main}: in the worktree run `git fetch origin {wl.main} && git merge origin/{wl.main}`, "
+                   f"resolve every conflict (a TARGETS.md / ledger conflict: keep both sides' rows, a status cell takes the more "
+                   f"advanced value), `lake build` the touched modules, rerun check_done on the frozen decls, commit the merge, "
+                   f"then write report.md (add a 'Merge' line naming the resolved files) and resubmit. No new statements.")
+        elif reason == "scope":
+            fix = (f"landing refused for out-of-scope paths ({why[:200]}): either widen scope.files in the record "
+                   f"(`scr task field {t.id} scope.files <list>`) when the task owns them, or revert the drift commit; then resubmit.")
+        else:
+            fix = f"landing failed ({why[:300] or reason}); fix the branch and resubmit."
+        if not self.autofix(t, "land", fix):
+            self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed twice ({(why or reason)[:160]}) — see reports/steward_watch.log", t.id)
+        return "failed"
+
     def land_scriptorium_task(self, t) -> bool:
         """accepted scriptorium task -> merged (T-0078). No worktree: ops.land_any decides, as for `scr land`
         (T-0158) — a hotfix made in the checkout, whose commits the journal already put on the trunk, is merged
@@ -1758,7 +1850,7 @@ class Watcher:
             job["notified"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             jobs.save(self.root, job)
             self.log(f"job {note}")
-            if job["status"] != "done" and self.job_needs_omri(job):
+            if job["status"] != "done" and not str(job.get("name") or "").startswith(self.LAND_JOB_PREFIX) and self.job_needs_omri(job):
                 self.need(f"job:{job['id']}", f"job {job['id']} ({job.get('name')}) {job['status']}" + (f": {job['note']}" if job.get("note") else "")
                           + f" — log: scr job tail {job['id']}", job.get("task"))
         # resume: a waiting task whose jobs are all finished gets its session back, with the results as the prompt
