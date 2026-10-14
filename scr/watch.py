@@ -1941,7 +1941,7 @@ class Watcher:
         brief = (f"You are resuming Scriptorium task {t.id} after the job(s) you submitted finished. Results:\n{summary}\n"
                  f"Read the full log(s) if the tail is not enough, then continue the task exactly where you stopped: your brief, "
                  f"{t.dir / 'spec.md'}, {t.dir / 'log.md'} and {t.dir / 'report.md'} are unchanged. Submit further long "
-                 f"commands the same way ({self.root / '.venv' / 'Scripts' / 'scr.exe'} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
+                 f"commands the same way ({self.root / '.venv' / 'Scripts' / 'scr.exe'} --root {self.root.resolve()} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
                  f"line of log.md and end your turn).\n")
         bf = t.dir / f"resume-brief-{now:%Y%m%d-%H%M%S}.txt"
         bf.write_text(brief, encoding="utf-8")

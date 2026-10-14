@@ -155,10 +155,17 @@ def submit(root: Path, cmd: list[str], *, task: str | None = None, name: str | N
     minutes = parse_timeout(timeout)
     if minutes > AUTH_LIMIT_MINUTES and actor != "omri":
         raise ValueError(f"timeout {minutes} min is over {AUTH_LIMIT_MINUTES // 60} h; only Omri may submit that (--actor omri)")
+    if cmd[0].startswith("-") or (name or "").startswith("--"):
+        # J-0001 (2026-10-10): `scr job submit --root <live> ...` read `--root` as the job name and the flag list as the
+        # command (rc 127 in 0 s). A program never starts with `-`; global flags go BEFORE `job`.
+        raise ValueError(f"job submit: the command/name may not start with `-` (got {cmd[0] if cmd[0].startswith('-') else name!r}); "
+                         "put global flags before `job`: scr --root <live root> job submit --task <id> --name <n> -- <command>")
     root = Path(root)
     jid = next_id(root)
+    # cwd = the CALLER's directory (T-0335): a scriber submits from its worktree with `--root <live root>`; the job is
+    # recorded under the live root but must run where the scriber works, not in the scriptorium folder.
     job = {"id": jid, "task": task, "name": name or Path(cmd[0]).name, "cmd": list(cmd),
-           "cwd": str(Path(cwd).resolve() if cwd else root.resolve()), "log": str((jobs_dir(root) / f"{jid}.log").resolve()),
+           "cwd": str(Path(cwd or os.getcwd()).resolve()), "log": str((jobs_dir(root) / f"{jid}.log").resolve()),
            "timeout_min": minutes, "session": session, "submitted": now_iso(), "actor": actor,
            "status": "queued", "pid": None, "started": None, "deadline": None, "rc": None, "ended": None, "resumed": None}
     save(root, job)
