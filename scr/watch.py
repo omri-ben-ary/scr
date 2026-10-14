@@ -872,8 +872,11 @@ class Watcher:
                             self.unflag(key)                              # retried next tick
                         else:
                             requeued = self.requeue_no_work(t, sess, ckpt_now, dead)
-                    self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — " + ("it did no work: set back to ready once (T-0187)" if requeued
-                              else "returned; no relaunch from here"), t.id)
+                            if not requeued:
+                                requeued = self.relaunch_dead(t, dead)
+                    if not requeued:
+                        self.need(f"dead:{t.id}", f"{t.id} session died ({dead}) — returned; attempts spent ({t.rec.get('attempts')}/"
+                                  f"{(t.rec.get('budget') or {}).get('max_attempts', 3)}); raise budget.max_attempts and set ready, or decide", t.id)
             elif ok and t.status in {"in_progress", "checkpoint"}:
                 if t.status == "in_progress":
                     self.scr(f"steward:{t.id}", "task", "set", t.id, "checkpoint", "--quiet")
@@ -881,7 +884,8 @@ class Watcher:
             if idle >= self.stale and not dead and not tk:
                 flags.append(f"STALE {idle}m")
                 alive = f"pid {sess['pid']} is alive" if sess else "no recorded pid to check"
-                self.need(f"stale:{t.id}", f"{t.id} silent for {idle} min ({alive}) — is its session hung?", t.id)
+                if not sess:                # 2026-10-14: a live pid building Lean for an hour is not Omri's problem
+                    self.need(f"stale:{t.id}", f"{t.id} silent for {idle} min ({alive}) — is its session hung?", t.id)
                 if self.flag(f"stale:{t.id}"):                             # once per idle episode (see below)
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "stale", "--task", t.id, "--note",
                              f"silent for {idle} min (threshold {self.stale}); {alive}", "--quiet")
@@ -952,6 +956,7 @@ class Watcher:
                     if self.land_scriptorium_task(t):
                         merged_now += 1
                     continue
+                wl = workload_for(self.root, self.store, t)
                 self.log(f"{t.id} auto-land: commit/push/PR/merge")
                 try:
                     res = land(self.root, t.id, merge=True)
@@ -1165,6 +1170,16 @@ class Watcher:
         self.credits_seen(t.id, line, now)
         return done
 
+    def relaunch_dead(self, t, dead: str) -> bool:
+        """2026-10-14: a session that died (pid gone, no report) is relaunched from its checkpoint while the task has
+        attempts left (budget.max_attempts, default 3) — T-0288 died twice and sat `returned` for a day. The scriber's
+        brief reads log.md, where the [steward] line says it is a relaunch."""
+        attempts = int(t.rec.get("attempts") or 0)
+        max_attempts = int((t.rec.get("budget") or {}).get("max_attempts") or 3)
+        if attempts >= max_attempts:
+            return False
+        return self.autofix(t, "dead", f"session died ({dead[:200]}); relaunch from the branch's last checkpoint, attempt {attempts + 1}/{max_attempts}")
+
     def requeue_no_work(self, t, sess: dict, ckpt_now: bool, dead: str) -> bool:
         """A task just returned by a session death that did no work (no checkpoint commit since its launch, not this
         tick's either, and no `[scriber]` line after the launcher's) goes back to `ready` — once per episode: the flag
@@ -1323,12 +1338,16 @@ class Watcher:
                     if not rt["ended"]:
                         continue            # Omri is in the review (T-0274): no review_stale while it stands
                     since = max(since, _event_ts({"ts": rt["ended"]}) or since)   # the relaunched review's clock
+                if (retry := self.review_retry_since(t.id)) and since and retry > since:
+                    since = retry           # the clock of the re-run review (rerun_review), not of the submission
                 row = submitted_stale(t.status, text, since, review_h, now)
                 if not row:
                     continue
                 tr = self.newest_review_transcript(t)
                 if tr and credits_line(tr, tr.with_name(tr.name + ".err")):
                     continue                # the review never ran (T-0187): relaunched after the credit pause, not escalated
+                if self.rerun_review(t, f"no Decision after {row['age_h']} h (review_stale_hours {review_h:g})"):
+                    continue                # 2026-10-14: a review that died is run again, not handed to Omri
                 transcripts = sorted(p.name for p in t.dir.glob("review-session-*.txt"))
                 reason = (f"submitted for {row['age_h']} h with no Decision written in review.md "
                           f"(review_stale_hours {review_h:g}); the review did not finish")
@@ -1370,6 +1389,9 @@ class Watcher:
                 continue
             if self._escalate(t, row["since"], reason, action, transcripts):
                 n += 1
+        submitted = {t.id for t in tasks.values() if t.status == "submitted"}
+        for k in [k for k in self.flags if k.startswith("review_retry:") and k.split(":", 2)[1] not in submitted]:
+            self.unflag(k)
         return n
 
     def _escalate(self, t, since: datetime, reason: str, action: str, transcripts: list[str]) -> bool:
@@ -1460,6 +1482,8 @@ class Watcher:
         prior = next((e for e in self.read_events() if e.get("kind") == "state" and e.get("task") == t.id
                       and f"[review.md {digest}]" in (e.get("note") or "")), None)
         if prior:
+            if self.rerun_review(t, f"review.md is the review already applied ({prior.get('to')} at {prior.get('ts')})"):
+                return False            # 2026-10-14: archived; the tick relaunches the review
             self.need(f"decision_stale:{t.id}", f"{t.id} is submitted again but review.md is the review already applied "
                       f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed", t.id)
             return False
@@ -1707,7 +1731,7 @@ class Watcher:
             job["notified"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             jobs.save(self.root, job)
             self.log(f"job {note}")
-            if job["status"] != "done":
+            if job["status"] != "done" and self.job_needs_omri(job):
                 self.need(f"job:{job['id']}", f"job {job['id']} ({job.get('name')}) {job['status']}" + (f": {job['note']}" if job.get("note") else "")
                           + f" — log: scr job tail {job['id']}", job.get("task"))
         # resume: a waiting task whose jobs are all finished gets its session back, with the results as the prompt
@@ -1722,6 +1746,24 @@ class Watcher:
             if not pending:
                 continue
             self.resume_task(t, pending, now)
+
+    def job_needs_omri(self, job: dict) -> bool:
+        """2026-10-14: a failed job is Omri's only when nobody else acts on it — not one killed on purpose (`killed by`),
+        not one superseded by a later job of the same task and name, and not one of a task that is running or
+        waiting (its scriber gets the result on resume)."""
+        if "killed by" in (job.get("note") or ""):
+            return False
+        tid = job.get("task")
+        if not tid:
+            return True
+        later = [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and j.get("name") == job.get("name") and j["id"] > job["id"]]
+        if later:
+            return False
+        try:
+            st = self.store.get(tid).status
+        except Exception:  # noqa: BLE001
+            return True
+        return st not in RUNNING and st != "waiting"
 
     def resume_task(self, t, finished: list[dict], now: datetime) -> None:
         """`claude -p --resume <session>` for a waiting task whose jobs ended: the job results are the prompt. The
