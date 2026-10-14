@@ -797,17 +797,17 @@ def test_watch_returns_task_whose_session_pid_is_gone(world):
     root, _, t = _running_with_session(world, p.pid)
     res = Watcher(root, quiet=True).tick()
     assert res["ok"], res
-    assert Store(root).get("T-0001").status == "returned"
+    assert Store(root).get("T-0001").status == "ready"                      # returned, then relaunched (2026-10-14)
     assert res["rows"][0]["flags"].startswith(f"ckpt:") or "DEAD" in res["rows"][0]["flags"]
     dead = _named(root, "session_dead")
     assert len(dead) == 1 and f"pid {p.pid}" in dead[0]["note"], dead
     ret = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "state" and e.get("to") == "returned"]
     assert ret and ret[-1]["note"].startswith("session died:"), ret
-    assert any("session died" in n for n in res["needs"])
+    assert not any("session died" in n for n in res["needs"])                # relaunched, no card (2026-10-14)
     cards = [n for n in ui.state(root)["needs"] if n["type"] == "system" and n.get("name") == "session_dead"]
-    assert len(cards) == 1 and cards[0]["id"] == "T-0001" and cards[0]["key"].startswith("events:T-0001:session_dead:"), cards
-    Watcher(root, quiet=True).tick()                                        # a returned task is not looked at again
-    assert Store(root).get("T-0001").status == "returned" and len(_named(root, "session_dead")) == 1
+    assert cards == [], cards                                                # the event is logged, never a card (2026-10-14)
+    Watcher(root, quiet=True).tick()                                        # a ready task is not looked at again
+    assert Store(root).get("T-0001").status == "ready" and len(_named(root, "session_dead")) == 1
     assert git(root, "status", "--porcelain") == ""
 
 
@@ -822,7 +822,7 @@ def test_watch_returns_task_whose_transcript_err_says_terminated(world):
     sess = w.session_of(t)
     assert sess == {"pid": os.getpid(), "transcript": "session-20260916-195938.txt", "ts": sess["ts"]}
     res = w.tick()
-    assert res["ok"] and Store(root).get("T-0001").status == "returned"
+    assert res["ok"] and Store(root).get("T-0001").status == "ready"         # returned, then relaunched (2026-10-14)
     dead = _named(root, "session_dead")
     assert len(dead) == 1 and "claude terminated it: Background tasks still running after 600s" in dead[0]["note"], dead
     assert not _named(root, "stale")                                         # dead is not also stale
@@ -841,10 +841,11 @@ def test_watch_flags_alive_but_idle_session_as_stale_not_dead(world):
     assert res["ok"], res
     assert Store(root).get("T-0001").status == "in_progress"                 # alive but idle: never returned
     assert "STALE" in res["rows"][0]["flags"] and "DEAD" not in res["rows"][0]["flags"], res["rows"]
-    assert any("silent for" in n and f"pid {os.getpid()} is alive" in n for n in res["needs"]), res["needs"]
+    assert not any("silent for" in n for n in res["needs"]), res["needs"]    # 2026-10-14: a live pid is a log line, not a card
+    assert any("STALE" in r["flags"] for r in res["rows"]), res["rows"]
     assert len(_named(root, "stale")) == 1 and not _named(root, "session_dead")
     cards = [n for n in ui.state(root)["needs"] if n["type"] == "system" and n.get("name") == "stale"]
-    assert len(cards) == 1 and cards[0]["id"] == "T-0001" and "STALE" in cards[0]["title"], cards
+    assert cards == [], cards                                                # the stale event is logged, never a card (2026-10-14)
     # a second idle tick raises no second event; the scriber writing again clears the card by itself
     Watcher(root, stale_minutes=45, quiet=True).tick()
     assert len(_named(root, "stale")) == 1

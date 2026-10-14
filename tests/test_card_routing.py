@@ -1,0 +1,70 @@
+"""2026-10-14 card routing: only decisions reach Omri (docs/proposals/card-routing.md)."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from scr.store import Store
+from test_journal_ops import world, scr  # noqa: F401
+
+
+def test_parked_task_is_not_readied_by_the_cascade(world):
+    root, _, _ = world
+    scr(root, "--quiet", "task", "new", "Dependent", "--id", "T-0002", "--workload", "quantum-insertion", "--files", "QuantumInsertion/B.lean", "--origin", "omri")
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0002", "triaged")
+    scr(root, "--quiet", "edge", "add", "blocks", "T-0001", "T-0002")
+    scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0002", "blocked", "--note", "parked: superseded, do not auto-dispatch")
+    assert Store(root).get("T-0002").rec.get("parked") is True
+    for st in ("dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0001", "accepted", "--force-accept", "--note", "test")
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "merged", "--force")
+    assert Store(root).get("T-0002").status == "blocked"            # the cascade left it alone
+    scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0002", "triaged", "--force")
+    scr(root, "--quiet", "--actor", "omri", "task", "set", "T-0002", "ready")
+    assert Store(root).get("T-0002").status == "ready" and "parked" not in Store(root).get("T-0002").rec
+
+
+def test_config_only_edit_opens_no_hotfix(world):
+    from scr import hotfix
+    root, _, _ = world
+    assert hotfix.journal_note(root, "abc1234", ["config/limits.yaml"], "omri") is None
+    assert hotfix.current(root) is None
+    tid = hotfix.journal_note(root, "abc1235", ["config/limits.yaml", "scr/watch.py"], "omri")
+    assert tid and hotfix.current(root) == tid
+
+
+def test_job_card_only_when_nobody_else_acts(world):
+    from scr import jobs
+    from scr.watch import Watcher
+    root, _, _ = world
+    for st in ("dispatched", "in_progress"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    w = Watcher(root, quiet=True)
+    killed = {"id": "J-0001", "task": "T-0001", "name": "build", "status": "failed", "note": "killed by steward:T-0001"}
+    assert not w.job_needs_omri(killed)
+    (root / ".scr" / "jobs").mkdir(parents=True, exist_ok=True)
+    for j in ({"id": "J-0002", "task": "T-0001", "name": "build", "status": "failed", "rc": 1},
+              {"id": "J-0003", "task": "T-0001", "name": "build", "status": "running"}):
+        (root / ".scr" / "jobs" / f"{j['id']}.json").write_text(json.dumps(j), encoding="utf-8")
+    superseded = json.loads((root / ".scr" / "jobs" / "J-0002.json").read_text(encoding="utf-8"))
+    assert not w.job_needs_omri(superseded)                      # J-0003 (same task + name) came after it
+    lone = {"id": "J-0004", "task": "T-0001", "name": "suite", "status": "failed", "rc": 1}
+    assert not w.job_needs_omri(lone)                            # the task is in_progress: its scriber gets it
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "returned")
+    assert w.job_needs_omri(lone)                                # nobody is running it: Omri's
+    assert w.job_needs_omri({"id": "J-0005", "name": "x", "status": "failed"})
+
+
+def test_quiet_events_and_one_card_per_task(world):
+    from scr import ui
+    root, _, _ = world
+    for st in ("dispatched", "in_progress"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    scr(root, "--quiet", "--actor", "s", "event", "system", "--name", "scope_drift", "--task", "T-0001", "--note", "x.lean outside scope")
+    scr(root, "--quiet", "--actor", "s", "event", "system", "--name", "budget_wall", "--task", "T-0001", "--note", "over")
+    cards = [c for c in ui.needs_cards(root) if c.get("id") == "T-0001"]
+    assert [c.get("name") for c in cards] == ["budget_wall"], cards        # scope_drift never; budget_wall while no status card
+    scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "escalated", "--force")
+    cards = [c for c in ui.needs_cards(root) if c.get("id") == "T-0001"]
+    assert len(cards) == 1 and cards[0]["type"] == "gate", cards           # the status card carries it

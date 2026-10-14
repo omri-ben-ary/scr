@@ -362,11 +362,24 @@ def test_accepted_hotfix_without_worktree_is_merged_without_a_merge(tmp_path: Pa
     assert len(st) == 1 and "already on main (journal)" in st[0]["note"], st
 
 
-def test_merge_conflict_is_not_merged_and_raises_land_failed(tmp_path: Path, monkeypatch):
-    """DoD 3a: the trunk changed the same line the worktree changed. The task stays accepted, one
-    land_failed event names the file, the NEEDS-YOU line is there every tick, the worktree is left clean
-    (merge aborted), the trunk untouched; the attempt is not repeated while the branch tip is the same, and
-    is repeated — and lands — once the branch is fixed."""
+def _resubmit_fixed(root: Path, tid: str = "T-0007") -> None:
+    """The scriber's side of an auto-fix: the task went ready; it is run, resubmitted with a fresh accepting review."""
+    for st in ("dispatched", "in_progress", "submitted"):
+        sscr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    (Store(root).get(tid).dir / "review.md").write_text(accepted_review("| `pytest tests -q` | passed again |"), encoding="utf-8")
+    sscr(root, "--quiet", "--actor", "s", "task", "set", tid, "accepted")
+
+
+def _flags(root: Path) -> set[str]:
+    p = root / ".scr" / "watch.state.txt"
+    return set(p.read_text(encoding="utf-8").split()) if p.exists() else set()
+
+
+def test_merge_conflict_goes_back_to_the_scriber_not_to_omri(tmp_path: Path, monkeypatch):
+    """2026-10-14 (Omri: "I don't want to be resolving merges"). The trunk changed the same line the worktree
+    changed: the landing fails (one land_failed event, the merge aborted, the trunk untouched) and the task is
+    sent back to its scriber — accepted -> returned -> ready, an auto_fix event, the fix note in log.md — with no
+    NEEDS-YOU line. Once the scriber resolves and resubmits, the next tick lands it."""
     root, _, wt = _land_world(tmp_path, monkeypatch)
     (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
     sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk moved on tool.txt")
@@ -374,30 +387,40 @@ def test_merge_conflict_is_not_merged_and_raises_land_failed(tmp_path: Path, mon
     main_before = sgit(root, "rev-parse", "main")
     res = _tick(root)
     assert res["ok"], res
-    assert Store(root).get("T-0007").status == "accepted"
+    t = Store(root).get("T-0007")
+    assert t.status == "ready", t.status
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and "conflict" in ev[0]["note"] and "tool.txt" in ev[0]["note"], ev
-    assert any(n.startswith("T-0007 landing failed (conflict)") for n in res["needs"]), res["needs"]
+    fx = _events(root, "auto_fix", "T-0007")
+    assert len(fx) == 1 and fx[0]["note"].startswith("auto-fix 1/2 (land)"), fx
+    assert "auto-fix 1/2 (land)" in (t.dir / "log.md").read_text(encoding="utf-8")
+    assert not any("landing failed" in n for n in res["needs"]), res["needs"]
     assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "trunk edit"
     assert not (root / ".git" / "worktrees" / "T-0007" / "MERGE_HEAD").exists()
-    assert sgit(wt, "status", "--porcelain") == ""                                            # the work was committed on task/T-0007 ...
-    assert sgit(wt, "show", "HEAD:tool.txt").strip() == "ok" and not _events(root, "landed", "T-0007")
-    tip = sgit(wt, "rev-parse", "HEAD")
-    # second tick: same tip -> no second attempt, no second event, still a NEEDS-YOU line
-    res2 = _tick(root)
-    assert Store(root).get("T-0007").status == "accepted" and len(_events(root, "land_failed", "T-0007")) == 1
-    assert any("landing failed at " + tip[:8] in n for n in res2["needs"]), res2["needs"]
-    assert sgit(wt, "rev-parse", "HEAD") == tip
-    # the fix: resolve on the branch by hand (merge main in, keep "ok", commit: a new tip) -> the next tick lands it
+    assert sgit(wt, "status", "--porcelain") == ""
+    # the scriber resolves on the branch (merge main in, keep "ok", commit) and resubmits -> the next tick lands it
     m = subprocess.run(["git", "merge", "main"], cwd=wt, capture_output=True, text=True)
     assert m.returncode != 0 and "CONFLICT" in m.stdout + m.stderr
     (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
     sgit(wt, "add", "tool.txt"); sgit(wt, "commit", "-q", "-m", "resolve: keep ok")
+    _resubmit_fixed(root)
     res3 = _tick(root)
     assert Store(root).get("T-0007").status == "merged", res3["needs"]
     assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "landed", "T-0007")) == 1
     assert len(_events(root, "land_failed", "T-0007")) == 1
-    assert not any(k.startswith("land_failed:T-0007:") for k in (root / ".scr" / "watch.state.txt").read_text(encoding="utf-8").split())
+    assert not any(k.startswith("land_failed:T-0007:") for k in _flags(root))
+
+
+def test_third_landing_failure_is_omris(tmp_path: Path, monkeypatch):
+    """After AUTOFIX_MAX send-backs the landing failure is a NEEDS-YOU line and the task stays accepted."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    (root / ".scr").mkdir(exist_ok=True)
+    (root / ".scr" / "watch.state.txt").write_text("autofix:T-0007:land:1\nautofix:T-0007:land:2\n", encoding="utf-8")
+    (wt / "tool.txt").write_text("broken\n", encoding="utf-8")
+    res = _tick(root)
+    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    assert any("landing failed (tests)" in n for n in res["needs"]), res["needs"]
+    assert not _events(root, "auto_fix", "T-0007")
 
 
 def test_landing_test_timeout_comes_from_limits_yaml(tmp_path: Path, monkeypatch):
@@ -420,27 +443,29 @@ def test_landing_test_timeout_comes_from_limits_yaml(tmp_path: Path, monkeypatch
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and "tests" in ev[0]["note"], ev
     assert "timed out after 5s" in ev[0]["note"] and "land_test_timeout_seconds" in ev[0]["note"], ev
-    assert Store(root).get("T-0007").status == "accepted" and sgit(root, "rev-parse", "main") == main_before
+    assert Store(root).get("T-0007").status == "ready" and sgit(root, "rev-parse", "main") == main_before   # back to the scriber (2026-10-14)
 
 
-def test_failing_tests_are_not_merged_and_raise_land_failed(tmp_path: Path, monkeypatch):
-    """DoD 3b: the merge is clean but the workload's tests fail on the result: not merged, land_failed says
-    `tests`, the trunk untouched. The tests ran in the worktree, on task/<id> with the trunk merged in, so
-    the failing tree never reached the checkout. A fix on the branch (still uncommitted) lands next tick."""
+def test_failing_tests_go_back_to_the_scriber_not_to_omri(tmp_path: Path, monkeypatch):
+    """DoD 3b, 2026-10-14 reading: the merge is clean but the workload's tests fail on the result: not merged,
+    land_failed says `tests`, the trunk untouched — and the task is sent back to its scriber (ready, auto_fix event,
+    the failure tail in log.md), not to Omri. The scriber's fix, resubmitted, lands next tick."""
     root, _, wt = _land_world(tmp_path, monkeypatch)
     (wt / "tool.txt").write_text("broken\n", encoding="utf-8")
     main_before = sgit(root, "rev-parse", "main")
     res = _tick(root)
-    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    assert res["ok"], res
+    t = Store(root).get("T-0007")
+    assert t.status == "ready", t.status
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and ev[0]["note"].startswith("FAILED (tests)") and "check.py" in ev[0]["note"], ev
-    assert any("landing failed (tests)" in n for n in res["needs"]), res["needs"]
+    assert not any("landing failed" in n for n in res["needs"]), res["needs"]
+    log = (t.dir / "log.md").read_text(encoding="utf-8")
+    assert "auto-fix 1/2 (land)" in log and "landing failed (tests)" in log and "landed:" not in log
     assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "base"
     assert sgit(wt, "status", "--porcelain") == "" and sgit(wt, "merge-base", "--is-ancestor", "main", "HEAD") == ""   # trunk merged INTO the branch
-    log = (Store(root).get("T-0007").dir / "log.md").read_text(encoding="utf-8")
-    assert "landed:" not in log
-    # the scriber (or Omri) fixes the branch; the fix is uncommitted again, the next tick commits and lands it
     (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    _resubmit_fixed(root)
     res2 = _tick(root)
     assert Store(root).get("T-0007").status == "merged", res2["needs"]
     assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "land_failed", "T-0007")) == 1
@@ -554,10 +579,10 @@ def test_record_conflict_next_to_a_tool_conflict_still_aborts(tmp_path: Path, mo
     main_before = sgit(root, "rev-parse", "main")
     res = _tick(root)
     assert res["ok"], res
-    assert Store(root).get("T-0007").status == "accepted"
+    assert Store(root).get("T-0007").status == "ready"               # back to the scriber with the conflict (2026-10-14)
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and "conflict" in ev[0]["note"] and "tool.txt" in ev[0]["note"], ev
-    assert any(n.startswith("T-0007 landing failed (conflict)") for n in res["needs"]), res["needs"]
+    assert len(_events(root, "auto_fix", "T-0007")) == 1 and not any("landing failed" in n for n in res["needs"]), res["needs"]
     assert sgit(root, "rev-parse", "main") == main_before and sgit(root, "show", "main:tool.txt").strip() == "trunk edit"
     assert not (root / ".git" / "worktrees" / "T-0007" / "MERGE_HEAD").exists()
     assert sgit(wt, "status", "--porcelain") == "" and not _events(root, "landed", "T-0007")
@@ -942,6 +967,15 @@ def test_read_decision_names_a_malformed_or_ambiguous_line():
     assert v is None and "unreadable" in problem
 
 
+def _exhaust_review_retries(root: Path, tid: str = "T-0001") -> None:
+    """2026-10-14: a stale review is re-run twice before the task is escalated; these tests are about the
+    escalation itself, so the two re-runs are recorded as already spent (old stamps: the clock is the submission)."""
+    p = root / ".scr" / "watch.state.txt"
+    p.parent.mkdir(exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(f"review_retry:{tid}:1:20200101T000000Z\nreview_retry:{tid}:2:20200101T000000Z\n")
+
+
 def _submit(root: Path, tid: str = "T-0001") -> None:
     for st in ("dispatched", "in_progress", "submitted"):
         scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
@@ -1074,8 +1108,11 @@ def test_same_review_is_never_applied_twice(world):
     res = Watcher(root, quiet=True, auto_decide=True).tick()
     assert Store(root).get("T-0001").status == "submitted" and len(_state_events(root, "T-0001")) == n_before
     assert not res["decided"] and res["review"] == ["T-0001"]
-    needs = [n for n in res["needs"] if n.startswith("T-0001 ")]
-    assert len(needs) == 1 and "already applied" in needs[0] and "returned" in needs[0] and "fresh review" in needs[0], res["needs"]
+    # 2026-10-14: the stale review.md is archived and the review re-run; no card for Omri
+    d = Store(root).get("T-0001").dir
+    assert not (d / "review.md").exists() and list(d.glob("review-stale-1-*.md")), sorted(x.name for x in d.iterdir())
+    assert len([e for e in _events(root, "review_retry", "T-0001")]) == 1
+    assert not [n for n in res["needs"] if n.startswith("T-0001 ")], res["needs"]
     # Omri (or the Steward) rewrites the review: applied
     _write_review(root, "T-0001", _review(decision="escalated (Gate 1, the statement changed)"))
     res = Watcher(root, quiet=True, auto_decide=True).tick()
@@ -1225,6 +1262,7 @@ def test_stuck_submitted_is_escalated_and_the_slot_refilled_on_the_same_tick(wor
     _submit(root)
     _write_review(root, "T-0001", TEMPLATE)                                                  # the review died before writing anything
     (Store(root).get("T-0001").dir / "review-session-20260919-161106.txt").write_text("killed\n", encoding="utf-8")
+    _exhaust_review_retries(root)
     _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
     launches = _record_launches(monkeypatch)
     calls = _spy_scr(monkeypatch)
@@ -1262,6 +1300,7 @@ def test_stuck_escalation_frees_a_full_cap(world, monkeypatch):
     root, _, _ = world
     _set_limit(root, "concurrency", 1); _set_limit(root, "review_stale_hours", 0)
     _submit(root)
+    _exhaust_review_retries(root)
     _ready_task(root, "T-0002", "QuantumInsertion/B.lean")
     _record_launches(monkeypatch)
     assert "running: 1, cap 1" in scr(root, "dispatch", "--dry-run").stdout
@@ -1658,6 +1697,7 @@ def test_escalating_a_submitted_task_never_kills(world, monkeypatch):
     root, _, _ = world
     _set_limit(root, "review_stale_hours", 0)
     _submit(root)
+    _exhaust_review_retries(root)
     _launched(root)
     calls = _mock_session(monkeypatch, alive=True)
     Watcher(root, quiet=True, auto_decide=True).tick()
@@ -1781,9 +1821,10 @@ def test_session_dead_on_reused_pid(world, monkeypatch):
     calls = _mock_session(monkeypatch, alive=True)
     _mock_created(monkeypatch, 132000000000000002)
     res = Watcher(root, quiet=True, auto_decide=True).tick()
-    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
+    assert res["ok"] and Store(root).get("T-0001").status == "ready", res        # returned, then relaunched (2026-10-14)
     dead = _events(root, "session_dead", "T-0001")
     assert len(dead) == 1 and "pid 4242 was reused by another process" in dead[0]["note"], dead
+    assert len(_events(root, "auto_fix", "T-0001")) == 1
     assert not _events(root, "stale", "T-0001") and not [c for c in calls if c[0] == "kill"], calls
 
 
@@ -2241,6 +2282,7 @@ def test_watch_need_is_one_live_card_with_a_stable_key(world, monkeypatch):
     _set_limit(root, "review_stale_hours", 0)
     _submit(root)
     _write_review(root, "T-0001", TEMPLATE)
+    _exhaust_review_retries(root)
     _refuse_escalation(monkeypatch)
     res = Watcher(root, quiet=True, auto_decide=True).tick()
     assert Store(root).get("T-0001").status == "submitted"
@@ -2264,6 +2306,7 @@ def test_watch_need_card_is_acked_like_any_card(world, monkeypatch):
     _set_limit(root, "review_stale_hours", 0)
     _submit(root)
     _write_review(root, "T-0001", TEMPLATE)
+    _exhaust_review_retries(root)
     _refuse_escalation(monkeypatch)
     Watcher(root, quiet=True, auto_decide=True).tick()
     [c] = _watch_cards(root)
@@ -2290,6 +2333,7 @@ def test_watch_land_failed_need_is_the_land_failed_card_only(world):
     root, _, _ = world
     _accepted(root)
     w = Watcher(root, quiet=True)
+    w.flags |= {"autofix:T-0001:land:1", "autofix:T-0001:land:2"}      # 2026-10-14: the first two go back to the scriber
     w.land_failed(Store(root).get("T-0001"), {"ok": False, "reason": "conflict", "out": ["FAILED (conflict): A.lean"], "tip": "abc123"}, set(), "0000")
     w.publish_needs(datetime.now(timezone.utc))
     assert [n["key"] for n in _needs_file(root)["needs"]] == ["land_failed:T-0001"]
@@ -2509,9 +2553,9 @@ def test_tick_returns_a_dead_session_that_left_an_unfinished_report(world):
     (t.dir / "report.md").write_text("# report\n\n## Result\n\nFULL_SUITE_PLACEHOLDER\n", encoding="utf-8")
     w = Watcher(root, quiet=True)
     res = w.tick()
-    assert res["ok"] and Store(root).get("T-0001").status == "returned", res
+    assert res["ok"] and Store(root).get("T-0001").status == "ready", res         # returned, then relaunched (2026-10-14)
     assert len(_named(root, "session_dead")) == 1
-    assert any(n["key"] == "report:T-0001" for n in w.need_items) and any(n["key"] == "dead:T-0001" for n in w.need_items)
+    assert any(n["key"] == "report:T-0001" for n in w.need_items) and not any(n["key"] == "dead:T-0001" for n in w.need_items)
 
 
 # ---- T-0188: retire measures a workload branch against origin/<main>, not the local main ------------------------
@@ -2778,8 +2822,16 @@ def test_no_work_death_is_ready_once_per_episode(world, monkeypatch):
     _dying(root, pid=4343, transcript="")
     res = Watcher(root, quiet=True, auto_decide=True).tick()
     t = Store(root).get("T-0001")
-    assert res["ok"] and t.status == "returned" and int(t.rec["attempts"]) == 2, res
-    assert len(_events(root, "session_dead", "T-0001")) == 2
+    # 2026-10-14: the no-work path is spent, but the task still has attempts: relaunched by autofix (auto_fix event)
+    assert res["ok"] and t.status == "ready" and int(t.rec["attempts"]) == 2, res
+    assert len(_events(root, "session_dead", "T-0001")) == 2 and len(_events(root, "auto_fix", "T-0001")) == 1
+    # attempts spent: it stays returned and is Omri's
+    t.rec["attempts"] = 3; t.save()
+    _dying(root, pid=4444, transcript="")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "returned", res
+    assert any(n.startswith("T-0001 session died") and "attempts spent" in n for n in res["needs"]), res["needs"]
 
 
 @pytest.mark.parametrize("work", ["checkpoint", "scriber", "report", "no_transcript"])
@@ -2797,7 +2849,8 @@ def test_death_with_real_work_is_unchanged(world, monkeypatch, work):
     _dead_pids(monkeypatch)
     res = Watcher(root, quiet=True, auto_decide=True).tick()
     t = Store(root).get("T-0001")
-    assert res["ok"] and t.status == "returned" and int(t.rec["attempts"]) == 1, res
+    assert res["ok"] and t.status == "ready" and int(t.rec["attempts"]) == 1, res     # returned -> relaunched (2026-10-14)
+    assert [e["to"] for e in _state_events(root, "T-0001")][-2:] == ["returned", "ready"]
     assert len(_events(root, "session_dead", "T-0001")) == 1 and not _sys_events(root, "credits_exhausted")
     if work == "checkpoint":
         assert _events(root, "checkpoint_commit", "T-0001")
@@ -3834,6 +3887,7 @@ def test_a_scriber_takeover_does_not_hold_the_review(world, monkeypatch):
     reviews: list[str] = []
     monkeypatch.setattr(Watcher, "start_review", lambda self, t: reviews.append(t.id))
     _backdate(root, "T-0001", "submitted", 300)
+    _exhaust_review_retries(root)
     assert review_takeover(EventLog(root / "events" / "events.jsonl").read(), "T-0001") is None
     res = Watcher(root, quiet=True, auto_review=True, auto_decide=True).tick()
     assert reviews == ["T-0001"] and res["escalated"] and Store(root).get("T-0001").status == "escalated"
@@ -3848,3 +3902,25 @@ def test_intake_brief_is_a_file_on_stdin(world, monkeypatch):
     assert len(calls) == 1 and calls[0]["stdin_is_file"], calls
     briefs = sorted((root / "reports").glob("intake-*.brief.txt"))
     assert briefs and "You are Intake" in briefs[-1].read_text(encoding="utf-8")
+
+
+def test_stale_review_is_rerun_twice_before_escalating(world, monkeypatch):
+    """2026-10-14: a submitted task whose review ended with no Decision gets its review re-run (review.md archived,
+    `review:<id>` cleared, a review_retry event, the stale clock restarted) — twice; the third time it is escalated."""
+    root, _, _ = world
+    _set_limit(root, "review_stale_hours", 0)
+    _submit(root)
+    _write_review(root, "T-0001", TEMPLATE)
+    d = Store(root).get("T-0001").dir
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"] and Store(root).get("T-0001").status == "submitted" and not res["escalated"], res
+    assert not (d / "review.md").exists() and len(list(d.glob("review-stale-1-*.md"))) == 1
+    assert len(_events(root, "review_retry", "T-0001")) == 1 and "review:T-0001" not in _flags(root)
+    assert not [n for n in res["needs"] if n.startswith("T-0001 ")], res["needs"]
+    _write_review(root, "T-0001", TEMPLATE)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "submitted" and len(_events(root, "review_retry", "T-0001")) == 2
+    _write_review(root, "T-0001", TEMPLATE)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated" and len(_events(root, "slot_freed", "T-0001")) == 1
+    assert "review_retry:T-0001" not in " ".join(_flags(root))

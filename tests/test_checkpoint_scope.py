@@ -205,21 +205,20 @@ def test_land_scriptorium_refuses_out_of_scope_paths_and_retries_when_the_scope_
     (wt / "extra.txt").write_text("not mine\n", encoding="utf-8")
     main_before = sgit(root, "rev-parse", "main")
     res = _tick(root)
-    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    assert res["ok"] and Store(root).get("T-0007").status == "ready", res      # 2026-10-14: back to the scriber with the refusal
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and "FAILED (scope)" in ev[0]["note"] and "extra.txt" in ev[0]["note"] and "tool.txt" not in ev[0]["note"].split("scope:")[1], ev
-    assert any("landing failed (scope)" in n for n in res["needs"]), res["needs"]
+    assert not any("landing failed" in n for n in res["needs"]), res["needs"]
+    assert "landing failed (scope)" in (Store(root).get("T-0007").dir / "log.md").read_text(encoding="utf-8")
     assert sgit(root, "rev-parse", "main") == main_before
     log = sgit(wt, "log", "--format=%s", "main..HEAD").splitlines()
     assert log[0].startswith("[checkpoint-drift] T-0007") and log[1].startswith("[T-0007] Tooling"), log
     assert sgit(wt, "show", "--name-only", "--format=", "HEAD~1").strip() == "tool.txt"
     assert sgit(wt, "status", "--porcelain") == ""
-    # same tip, same scope: no second attempt, no second event
-    res2 = _tick(root)
-    assert len(_events(root, "land_failed", "T-0007")) == 1 and Store(root).get("T-0007").status == "accepted"
-    assert any("a wider scope retries" in n for n in res2["needs"]), res2["needs"]
-    # the Steward widens the record: the next tick retries and lands, drift commit included
+    # the Steward widens the record at the next review and accepts: the next tick lands, drift commit included
     sscr(root, "--quiet", "--actor", "omri", "task", "field", "T-0007", "scope.files", '["tool.txt", "extra.txt"]')
+    from test_watch import _resubmit_fixed
+    _resubmit_fixed(root)
     res3 = _tick(root)
     assert Store(root).get("T-0007").status == "merged", res3["needs"]
     assert sgit(root, "show", "main:extra.txt").strip() == "not mine" and sgit(root, "show", "main:tool.txt").strip() == "ok"

@@ -1178,7 +1178,7 @@ class Watcher:
         max_attempts = int((t.rec.get("budget") or {}).get("max_attempts") or 3)
         if attempts >= max_attempts:
             return False
-        return self.autofix(t, "dead", f"session died ({dead[:200]}); relaunch from the branch's last checkpoint, attempt {attempts + 1}/{max_attempts}")
+        return self.autofix(t, "dead", f"session died ({dead[:200]}); relaunch from the branch's last checkpoint, attempt {attempts + 1}/{max_attempts}", returned=True)
 
     def requeue_no_work(self, t, sess: dict, ckpt_now: bool, dead: str) -> bool:
         """A task just returned by a session death that did no work (no checkpoint commit since its launch, not this
@@ -1420,6 +1420,8 @@ class Watcher:
             return False
         self.flags.add(key)
         self.unflag(f"review:{t.id}")          # it left `submitted`: a later re-submission gets a fresh review
+        for k in [k for k in self.flags if k.startswith(f"review_retry:{t.id}:")]:
+            self.unflag(k)
         card = (f"ACTION for Omri: {action}. Why: {reason}. Its slot is free (escalated never counts against the cap); "
                 f"{where}. Transcript: {tr}")
         self.scr(f"steward:{t.id}", "event", "system", "--name", "slot_freed", "--task", t.id, "--note", card[:900], "--quiet")
@@ -1606,32 +1608,32 @@ class Watcher:
         return new
 
     def land_failed(self, t, res: dict, failed: set, scope_sig: str) -> bool:
-        """A refused landing (land_scriptorium or the no-worktree land_any): the task stays accepted, a NEEDS-YOU
-        line every tick, ONE land_failed event per branch tip (+ scope). Returns False."""
+        """A refused landing (land_scriptorium or the no-worktree land_any): ONE land_failed event per branch tip
+        (+ scope), then — 2026-10-14 — the task goes back to its scriber with the failure (autofix, at most
+        AUTOFIX_MAX times); only after that does the task stay accepted with a NEEDS-YOU line every tick. A lost
+        worktree or an internal error is Omri's at once. Returns False."""
         why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
         nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
         key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
-        if res.get("reason") not in {"lost_worktree", "error"} and self.flag(key + ":autofix"):
-            tail = "\n".join(res["out"][-12:])[-1500:]
-            fix = (f"landing failed ({res.get('reason')}): {why[:300]}. Merge the trunk into the branch, make the full test suite pass "
-                   f"(`.venv\\Scripts\\python.exe -m pytest tests -q`, as a scr job if long), fix only what the failure names, commit, "
-                   f"then resubmit with report.md stating the test result.\nLanding output tail:\n{tail}")
-            if self.autofix(t, "land", fix):
-                for k in failed - {key}:
-                    self.unflag(k)
-                self.unflag(f"land:{t.id}")
-                return False
-        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
             self.unflag(k)
         if self.flag(key):
             self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
         self.unflag(f"land:{t.id}")
+        if res.get("reason") not in {"lost_worktree", "error", "trunk", "busy"}:    # those are the checkout's, not the branch's
+            tail = "\n".join(res["out"][-12:])[-1500:]
+            fix = (f"landing failed ({res.get('reason')}): {why[:300]}. Merge the trunk into the branch, make the full test suite pass "
+                   f"(`.venv\\Scripts\\python.exe -m pytest tests -q`, as a scr job if long), fix only what the failure names, commit, "
+                   f"then resubmit with report.md stating the test result.\nLanding output tail:\n{tail}")
+            if self.autofix(t, "land", fix):
+                self.unflag(key)
+                return False
+        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         return False
 
     AUTOFIX_MAX = 2
 
-    def autofix(self, t, kind: str, note: str) -> bool:
+    def autofix(self, t, kind: str, note: str, returned: bool = False) -> bool:
         """2026-10-14 (Omri: "the system should be resolving it by itself"). A task the system can send back to its own
         scriber with a concrete fix note is sent back — accepted/escalated/submitted -> returned -> ready — instead of
         becoming a Needs-you card. At most AUTOFIX_MAX times per task and kind (flags `autofix:<id>:<kind>:<n>`); the
@@ -1647,7 +1649,7 @@ class Watcher:
                 f.write(f"\n- {datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ} [steward] {line}\n")
         except OSError as e:
             self.log(f"{t.id} autofix: log.md not written: {e}")
-        if t.status != "returned":
+        if t.status != "returned" and not returned:
             if self.scr(f"steward:{t.id}", "task", "set", t.id, "returned", "--force", "--note", line[:300], "--quiet") is None:
                 return False
         if self.scr(f"steward:{t.id}", "task", "set", t.id, "ready", "--note", f"auto-fix {n}: redispatched", "--quiet") is None:
