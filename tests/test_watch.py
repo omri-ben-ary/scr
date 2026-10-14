@@ -3521,6 +3521,101 @@ def test_stuck_over_wall_under_takeover_is_held(world):
     assert any(n.startswith("T-0001 over wall budget") for n in res["needs"]) and not _events(root, "slot_freed", "T-0001")
 
 
+# ---- T-0342: the wall is running time; a `waiting` span (a job running detached) is not charged ---------------
+# 2026-10-12: T-0136 was escalated "13.3 h in progress" 27 s after its resume from J-0015; almost all of it was
+# `waiting`. The wall age is now the sum of the in_progress/checkpoint spans since the dispatched -> in_progress start.
+from scr.watch import running_hours, running_wall  # noqa: E402
+
+
+def _st(tid: str, frm: str, to: str, at: datetime) -> dict:
+    return {"kind": "state", "task": tid, "from": frm, "to": to, "ts": at.isoformat().replace("+00:00", "Z")}
+
+
+def test_running_wall_excludes_waiting_spans():
+    t0 = NOW - timedelta(hours=13.5)
+    evs = [_st("T-1", "ready", "dispatched", t0 - timedelta(minutes=1)), _st("T-1", "dispatched", "in_progress", t0),
+           _st("T-1", "in_progress", "waiting", t0 + timedelta(hours=1)), _st("T-1", "waiting", "in_progress", t0 + timedelta(hours=13)),
+           _st("T-2", "dispatched", "in_progress", t0 - timedelta(hours=40))]          # another task's clock is not ours
+    assert running_hours(evs, "T-1", NOW) == 1.5
+    assert running_wall(evs, "T-1", 2.0, NOW) is None
+    later = NOW + timedelta(hours=1)                                                    # t0 + 14.5 h: 2.5 h running
+    assert running_wall(evs, "T-1", 2.0, later) == {"since": t0, "age_h": 2.5}
+    assert running_hours(evs, "T-1", later) == 2.5
+    assert running_wall(evs, "T-3", 0.0, NOW) is None and running_hours(evs, "T-3", NOW) is None   # never started
+    # while still waiting, the clock is stopped at the 1 h it ran
+    assert running_hours(evs[:3], "T-1", NOW) == 1.0
+
+
+def test_running_wall_heartbeats_neither_reset_nor_double_count():
+    t0 = NOW - timedelta(hours=3)
+    h = lambda x: t0 + timedelta(hours=x)  # noqa: E731
+    evs = [_st("T-1", "dispatched", "in_progress", t0), _st("T-1", "in_progress", "checkpoint", h(0.5)),
+           _st("T-1", "checkpoint", "in_progress", h(1)), _st("T-1", "in_progress", "checkpoint", h(1.5)),
+           _st("T-1", "checkpoint", "in_progress", h(2)), _st("T-1", "in_progress", "in_progress", h(2.2)),
+           _st("T-1", "in_progress", "checkpoint", h(2.5))]
+    assert running_hours(evs, "T-1", NOW) == 3.0                                        # all 3 h, counted once
+    # checkpoint -> waiting -> in_progress: the waiting hour drops out, the checkpoint spans stay
+    evs2 = evs[:4] + [_st("T-1", "checkpoint", "waiting", h(1.5)), _st("T-1", "waiting", "in_progress", h(2.5))]
+    assert running_hours(evs2, "T-1", NOW) == 2.0
+    # a new dispatched -> in_progress starts a new episode at zero
+    evs3 = evs + [_st("T-1", "checkpoint", "returned", h(2.8)), _st("T-1", "ready", "dispatched", h(2.9)),
+                  _st("T-1", "dispatched", "in_progress", h(2.9))]
+    assert running_wall(evs3, "T-1", 0.0, NOW) == {"since": h(2.9), "age_h": 0.1}
+
+
+def _set_state_times(root: Path, tid: str, minutes_ago: list[float]) -> None:
+    """Date the last len(minutes_ago) state events of `tid` that many minutes before now, re-chaining after them."""
+    p = root / "events" / "events.jsonl"
+    evs = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    idx = [i for i, e in enumerate(evs) if e.get("kind") == "state" and e.get("task") == tid][-len(minutes_ago):]
+    now = datetime.now(timezone.utc)
+    for i, m in zip(idx, minutes_ago):
+        evs[i]["ts"] = (now - timedelta(minutes=m)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    prev = evs[idx[0] - 1]["h"] if idx[0] else ZERO
+    for e in evs[idx[0]:]:
+        e["prev"] = prev
+        e["h"] = prev = event_hash(e)
+    p.write_text("\n".join(canon(e) for e in evs) + "\n", encoding="utf-8")
+    scr(root, "--quiet", "snapshot")
+
+
+def _waited(root: Path, running_min: float, tid: str = "T-0001") -> None:
+    """dispatched -> in_progress at t0, -> waiting at t0+1h, -> in_progress at t0+13h; now = t0+13h+running_min."""
+    _over_wall(root, tid, hours=2)
+    for st in ("waiting", "in_progress"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", tid, st)
+    _set_state_times(root, tid, [13 * 60 + running_min, 12 * 60 + running_min, running_min])
+
+
+def test_wall_waiting_on_a_job_is_not_charged(world):
+    """DoD: 1 h running, 12 h waiting, 0.5 h running with max_wall_hours 2 -> no escalation; wall age 1.5 h."""
+    root, _, _ = world
+    _waited(root, 30)
+    w = Watcher(root, quiet=True, auto_decide=True)
+    res = w.tick()
+    assert Store(root).get("T-0001").status in {"in_progress", "checkpoint"} and not res["escalated"], res
+    assert running_hours(w.read_events(), "T-0001", datetime.now(timezone.utc)) == 1.5
+    assert not _events(root, "budget_wall", "T-0001") and not _events(root, "slot_freed", "T-0001")
+    assert not any("over wall budget" in n for n in res["needs"]), res["needs"]
+
+
+def test_wall_running_time_over_budget_escalates_once_quoting_running_time(world):
+    """DoD: the same task 2.5 h running (14.5 h elapsed) is escalated once; the reason and the slot_freed card
+    quote 2.5 h of running time, not 14.5 h."""
+    root, _, _ = world
+    _waited(root, 90)
+    for _ in range(2):
+        Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "escalated"
+    last = _state_events(root, "T-0001")[-1]
+    assert "wall budget exhausted: 2.5 h running time" in last["note"] and "14.5" not in last["note"], last["note"]
+    assert "max_wall_hours 2" in last["note"], last["note"]
+    ev = _events(root, "slot_freed", "T-0001")
+    assert len(ev) == 1 and "2.5 h running time" in ev[0]["note"] and "14.5" not in ev[0]["note"], ev
+    bw = _events(root, "budget_wall", "T-0001")
+    assert len(bw) == 1 and bw[0]["note"] == "2.5 h", bw
+
+
 def test_wall_rule_is_written_in_the_agent_docs():
     text = (REPO / "agents" / "_common.md").read_text(encoding="utf-8")
     assert any("max_wall_hours" in l and "watcher" in l for l in text.splitlines())

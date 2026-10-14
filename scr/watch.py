@@ -35,7 +35,8 @@ Per tick:
   stuck         -> escalated + one slot_freed event (auto-decide; T-0092): a task that cannot progress is
                    escalated, never held — submitted > review_stale_hours with no Decision written, or
                    in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours, or
-                   in_progress/checkpoint past its own budget.max_wall_hours (T-0121); the
+                   in_progress/checkpoint past its own budget.max_wall_hours of running time (T-0121; waiting
+                   spans not counted, T-0342); the
                    escalated task no longer counts against the cap, so auto-dispatch below fills the slot
                    on the same tick. A running task's launched session is checkpointed, then stopped
                    (T-0124), so the refill never makes cap + 1 sessions
@@ -375,6 +376,48 @@ def wall_stale(started: datetime | None, hours: float, now: datetime) -> dict | 
     if age_h <= hours:
         return None
     return {"since": started, "age_h": age_h}
+
+
+RUNNING_STATUSES = ("in_progress", "checkpoint")
+
+
+def running_wall(events: list[dict], tid: str, hours: float, now: datetime) -> dict | None:
+    """{since, age_h} like `wall_stale`, but the age is the task's RUNNING time (T-0342): the sum of its
+    in_progress/checkpoint spans since the last `dispatched -> in_progress` start (`since`, which still names the
+    episode). A `waiting` span (a job running detached, the watcher not ticking) is not charged; a
+    checkpoint <-> in_progress heartbeat neither resets nor double-counts the clock. Seen 2026-10-12: T-0136 was
+    escalated for "13.3 h in progress" 27 s after its resume, almost all of it spent waiting on J-0015."""
+    since = run_from = None
+    total = 0.0
+    for e in events:
+        if e.get("kind") != "state" or e.get("task") != tid:
+            continue
+        ts = _event_ts(e)
+        if ts is None:
+            continue
+        if e.get("from") == "dispatched" and e.get("to") == "in_progress":
+            since, run_from, total = ts, ts, 0.0          # a new episode: the clock starts again
+        elif since is None:
+            continue
+        elif e.get("to") in RUNNING_STATUSES:
+            run_from = run_from or ts                     # waiting -> in_progress resumes; a heartbeat keeps the span
+        elif run_from is not None:
+            total += (ts - run_from).total_seconds()      # the span ends (waiting, submitted, returned, ...)
+            run_from = None
+    if since is None:
+        return None
+    if run_from is not None:
+        total += max((now - run_from).total_seconds(), 0.0)
+    age_h = round(total / 3600, 1)
+    if age_h <= hours:
+        return None
+    return {"since": since, "age_h": age_h}
+
+
+def running_hours(events: list[dict], tid: str, now: datetime) -> float | None:
+    """The running time `running_wall` charges, rounded to 0.1 h; None before the first dispatched -> in_progress."""
+    row = running_wall(events, tid, -1.0, now)
+    return row["age_h"] if row else None
 
 
 def help_stale(log_md: str, hours: float, now: datetime, seen: dict[str, datetime] | None = None,
@@ -796,18 +839,18 @@ class Watcher:
 
             hours = wall_hours(t.rec)
             started = self.started_at(t.id)
-            wall = round((now - started).total_seconds() / 3600, 1) if started else None
-            if wall_stale(started, hours, now):
+            wall = running_hours(self.read_events(), t.id, now)      # running time only, not waiting (T-0342)
+            if running_wall(self.read_events(), t.id, hours, now):
                 flags.append(f"OVER-WALL({wall}/{hours}h)")
                 # ONE diagnostic `budget_wall` per episode (the episode is this in_progress start, as for
                 # `slot_freed`); the enforcement is `escalation_checks` later this tick (T-0121), which escalates
                 # the task through `_escalate` unless the submission or dead branches below route it first.
                 if self.flag(f"wall:{t.id}:{started.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"):
-                    self.log(f"{t.id} wall budget exhausted: {wall} h > {hours} h")
+                    self.log(f"{t.id} wall budget exhausted: {wall} h running time > {hours} h")
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "budget_wall", "--task", t.id, "--note", f"{wall} h", "--quiet")
                 if not (self.auto_decide and ok) or takeover_of(self.read_events(), t.id):
                     # held (no auto-decide, or Omri's own takeover run): the line says so every tick
-                    self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
+                    self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h running time) — escalate or extend", t.id)
 
             rep = t.dir / "report.md"
             rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
@@ -1338,25 +1381,25 @@ class Watcher:
                 continue                            # under takeover Omri is in the session: his HELP lines and wall hold nothing
             elif t.status in {"in_progress", "checkpoint"} and str(t.rec.get("title", "")).startswith("hotfix:"):
                 continue                            # 2026-10-14: a hotfix record is open while Omri edits the checkout; no wall
-            elif t.status in {"in_progress", "checkpoint"} and (row := wall_stale(self.started_at(t.id), hours := wall_hours(t.rec), now)):
+            elif t.status in {"in_progress", "checkpoint"} and (row := running_wall(events, t.id, hours := wall_hours(t.rec), now)):
                 # T-0121: out of budget is stuck. The running loop raised this episode's `budget_wall` earlier this
                 # tick, so the trail reads budget_wall -> escalated -> slot_freed. `escalated` leaves only for
                 # omri_queue (scr/lifecycle.py), so the redispatch route needs --force (it is logged).
                 sess = self.session_of(t)
                 if len([k for k in self.flags if k.startswith(f"autofix:{t.id}:wall:")]) < self.AUTOFIX_MAX:
                     # 2026-10-14: the first two exhaustions extend the wall by the same budget and relaunch from the
-                    # checkpoint (the wall counts waiting time too, T-0342); the third is Omri's
+                    # checkpoint; the third is Omri's. The wall is running time only, waiting excluded (T-0342)
                     if sess:
                         wl = workload_for(self.root, self.store, t)
                         self.stop_session(t, sess["pid"], task_worktree(wl, t), t.rec.get("branch") or "task/" + t.id, created=sess.get("created"))
                     new_hours = hours * 2
                     self.scr(f"steward:{t.id}", "task", "field", t.id, "budget.max_wall_hours", str(new_hours), "--note", "auto-fix: wall extended", "--quiet")
-                    if self.autofix(t, "wall", f"wall budget exhausted ({row['age_h']} h > {hours:g} h); extended to {new_hours:g} h; "
+                    if self.autofix(t, "wall", f"wall budget exhausted ({row['age_h']} h running time > {hours:g} h); extended to {new_hours:g} h; "
                                               f"relaunch from the branch's last checkpoint and finish, or write report.md with what is done"):
                         continue
                 transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
-                reason = (f"wall budget exhausted: {row['age_h']} h in progress since "
-                          f"{row['since'].astimezone(timezone.utc):%Y-%m-%dT%H:%MZ} > max_wall_hours {hours:g}")
+                reason = (f"wall budget exhausted: {row['age_h']} h running time (in_progress/checkpoint, waiting not counted) "
+                          f"since {row['since'].astimezone(timezone.utc):%Y-%m-%dT%H:%MZ} > max_wall_hours {hours:g}")
                 action = (f"extend the wall with `scr task field {t.id} budget.max_wall_hours N`, then `scr task set {t.id} returned --force` "
                           "+ `ready` so it is redispatched, or decide in the gate card")
             elif t.status in {"in_progress", "checkpoint"}:
