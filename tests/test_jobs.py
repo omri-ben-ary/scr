@@ -110,6 +110,23 @@ def test_waiting_is_a_status_that_holds_no_slot():
     assert "waiting" not in watch_mod.SLOT_STATUSES
 
 
+def test_a_resume_costs_no_attempt():
+    """T-0342: attempts = scriber sessions started (T-0127). `waiting -> in_progress` resumes the same session and is
+    not charged; `dispatched -> in_progress` (a new session) still adds 1; a checkpoint heartbeat adds nothing."""
+    rec = {"status": "waiting", "attempts": 1}
+    lifecycle.apply(rec, "in_progress")
+    assert rec["status"] == "in_progress" and rec["attempts"] == 1
+    lifecycle.apply(rec, "checkpoint")
+    lifecycle.apply(rec, "in_progress")
+    assert rec["attempts"] == 1
+    lifecycle.apply(rec, "waiting")
+    lifecycle.apply(rec, "in_progress")
+    assert rec["attempts"] == 1
+    rec2 = {"status": "dispatched", "attempts": 1}
+    lifecycle.apply(rec2, "in_progress")
+    assert rec2["attempts"] == 2
+
+
 def test_resume_argv_continues_the_session(monkeypatch, tmp_path):
     monkeypatch.setattr(run_mod, "claude_bin", lambda: str(Path(sys.executable).with_name("claude.exe")))
     monkeypatch.setattr(run_mod, "permission_mode_for", lambda root: "auto")

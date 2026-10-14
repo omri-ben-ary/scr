@@ -3496,7 +3496,7 @@ def test_stuck_over_wall_auto_decide_off_holds(world):
     for _ in range(2):
         res = Watcher(root, quiet=True).tick()
         assert Store(root).get("T-0001").status in {"in_progress", "checkpoint"} and not res["escalated"]
-        assert any(n.startswith("T-0001 over wall budget (1.5 h of 1.0 h)") for n in res["needs"]), res["needs"]
+        assert any(n.startswith("T-0001 over wall budget (1.5 h of 1.0 h running time)") for n in res["needs"]), res["needs"]
     assert len(_events(root, "budget_wall", "T-0001")) == 1 and not _events(root, "slot_freed", "T-0001")
 
 
