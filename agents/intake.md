@@ -10,7 +10,7 @@ Fills both queues. Runs at 22:00 nightly, after any task reaches `merged`/`rejec
 
 ## Triage rules
 - Dedup by scope: if an open task names the same declaration, do not create a new one; add an `informs` edge from the proposal's source instead and log a `system` event `duplicate`.
-- Respect `max_successors_per_task` and `max_depth`. A proposal past `max_depth` becomes `kind: decide` in Omri's queue.
+- Respect `max_successors_per_task` and `max_depth`. A proposal past `max_depth` is NOT a decide item (2026-10-14: Omri got four of them in a day and wants none): file it as a normal scriber task with `--omri-weight 0` and `--note "past max_depth (gen N): filed, not asked"`, status `triaged`, blocked by nothing; the prioritizer ranks it last and Omri sees it in the triaged list. A proposal the report itself rates low priority and past `max_depth` is dropped with a `system` event `proposal_dropped` naming it.
 - Write `done_when.mechanical` for every scriber task. If you cannot write a mechanical line, set `verifiability` ≤ 0.5 and say why in spec.md.
 - Set `may_touch_statements: true` whenever the goal could plausibly require changing a signature. It costs a slower dispatch; it saves a wasted night.
 - Every `blocks` edge you add must share a declaration with its blocker or carry `--reason`.

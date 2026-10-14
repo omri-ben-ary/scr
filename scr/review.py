@@ -74,6 +74,39 @@ def _verdict(line: str, rx: re.Pattern) -> str | None:
     return None if others else m.group(1)
 
 
+ADDITIONS_ONLY_RE = re.compile(r"(ADDED[- ]only|additions[- ]only|\b0 (MODIFIED|CHANGED)\b.{0,40}\b0 REMOVED\b|\b0 REMOVED\b.{0,40}\b0 (MODIFIED|CHANGED)\b)", re.I)
+CHECKS_PASS_RE = re.compile(r"(all mechanical checks pass|mechanical checks pass|every mechanical check passes|all (checks|mechanical) (pass|PASS))", re.I)
+
+
+def decision_line(review_md: str) -> str:
+    """The text of the Decision the review states: the explicit `Decision:` line, else the first non-blank line
+    under `## Decision`. Empty when there is none."""
+    lines = _unfenced(review_md)
+    for l in lines:
+        n = _normalise(l)
+        if _DECISION_LINE.match(n):
+            return n.split(":", 1)[1].strip()
+    for i, line in enumerate(lines):
+        if _DECISION_HEADING.match(line):
+            for nxt in lines[i + 1:]:
+                if _ANY_HEADING.match(nxt):
+                    break
+                if nxt.strip():
+                    return nxt.strip()
+    return ""
+
+
+def additions_only_gate1(review_md: str) -> bool:
+    """2026-10-14 (card-routing rule 2): a Steward escalation whose Decision line says the statement diff is
+    additions-only and every mechanical check passes is accepted by the watcher, not by Omri: adding frozen,
+    approved declarations is not a statement change. All three signals must be on the Decision line."""
+    verdict, _ = read_decision(review_md)
+    if verdict != "escalated":
+        return False
+    line = decision_line(review_md)
+    return bool(ADDITIONS_ONLY_RE.search(line) and CHECKS_PASS_RE.search(line) and re.search(r"gate\s*1", line, re.I))
+
+
 def read_decision(review_md: str) -> tuple[str | None, str | None]:
     """(verdict, problem) from a review.md text. The verdict comes from the FIRST `Decision:` line at column
     zero (after `_normalise`: blockquoted, emphasised or lowercase labels read too, T-0208/T-0210) outside a code fence (the explicit form the review brief asks for) or, failing that, from the

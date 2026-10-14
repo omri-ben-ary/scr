@@ -113,7 +113,7 @@ _LINE_TS = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\
 # ---- the Decision written in review.md (T-0091) lives in scr/review.py since T-0081, so that ops.land and
 # `scr task set` read it the same way this watcher does; re-exported here so callers and tests keep working.
 from .review import (DECISION_NOTE, VERDICTS, _ANY_HEADING, _DECISION_HEADING, _DECISION_LINE, _DECISION_VERDICT, _FENCE,  # noqa: E402,F401
-                     _PLACEHOLDER, _SECTION_VERDICT, _unfenced, _verdict, acceptance_problem, decision_of, read_decision, review_digest)
+                     _PLACEHOLDER, _SECTION_VERDICT, _unfenced, _verdict, acceptance_problem, additions_only_gate1, decision_of, read_decision, review_digest)
 
 
 # ---- a half-written report.md is not a submission (T-0180) ---------------------------------------------------
@@ -1492,6 +1492,11 @@ class Watcher:
             return False
         if not verdict:
             return False
+        if verdict == "escalated" and additions_only_gate1(text):
+            verdict = "accepted"          # 2026-10-14 (rule 2): additions-only Gate 1 with all checks passing is an acceptance
+            extra = ["--force-accept"]
+        else:
+            extra = []
         digest = review_digest(text)
         note = f"{DECISION_NOTE} [review.md {digest}]"
         prior = next((e for e in self.read_events() if e.get("kind") == "state" and e.get("task") == t.id
@@ -1502,7 +1507,7 @@ class Watcher:
             self.need(f"decision_stale:{t.id}", f"{t.id} is submitted again but review.md is the review already applied "
                       f"({prior.get('to')} at {prior.get('ts')}) — a fresh review is needed", t.id)
             return False
-        if self.scr(f"steward:{t.id}", "task", "set", t.id, verdict, "--note", note, "--quiet") is None:
+        if self.scr(f"steward:{t.id}", "task", "set", t.id, verdict, "--note", note, *extra, "--quiet") is None:
             self.need(f"decision_unapplied:{t.id}", f"{t.id} decision {verdict} from review.md could not be applied — see reports/steward_watch.log", t.id)
             return False
         self.log(f"{t.id} decision applied: {verdict}")
@@ -1545,6 +1550,13 @@ class Watcher:
         g, mg = Git(wt), Git(self.root)
         tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
         if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
+            if not [k for k in self.flags if k.startswith(f"autofix:{t.id}:land:")]:
+                # 2026-10-14: a landing that failed before auto-fix existed gets its send-back now
+                if self.autofix(t, "land", f"landing of task/{t.id} failed at {tip[:8]} (see the land_failed event); merge the trunk in, make the tests pass, commit, resubmit"):
+                    for k in failed:
+                        self.unflag(k)
+                    self.unflag(f"land:{t.id}")
+                    return False
             self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
             self.unflag(f"land:{t.id}")
             return False

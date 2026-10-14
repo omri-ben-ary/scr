@@ -139,7 +139,7 @@ _CHORE_CACHE: dict = {"ts": 0.0, "items": []}
 # the task last became accepted, so a task returned for a rebase (or merged) drops the card without an ack.
 ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale", "slot_freed",
                 "land_failed"}
-QUIET_EVENTS = {"scope_drift", "stale", "session_dead", "checkpoint_skipped"}   # 2026-10-14: never a card of their own
+QUIET_EVENTS = {"scope_drift", "stale", "session_dead", "checkpoint_skipped", "budget_wall", "blocker_rejected"}   # 2026-10-14: never a card of their own
 ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent",
                 "slot_freed": "escalated: a stuck task left its slot — one action for you",
                 "land_failed": "landing failed — code accepted but not on main"}

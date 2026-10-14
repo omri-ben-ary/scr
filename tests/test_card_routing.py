@@ -62,9 +62,30 @@ def test_quiet_events_and_one_card_per_task(world):
     for st in ("dispatched", "in_progress"):
         scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
     scr(root, "--quiet", "--actor", "s", "event", "system", "--name", "scope_drift", "--task", "T-0001", "--note", "x.lean outside scope")
-    scr(root, "--quiet", "--actor", "s", "event", "system", "--name", "budget_wall", "--task", "T-0001", "--note", "over")
+    scr(root, "--quiet", "--actor", "s", "event", "system", "--name", "leak", "--task", "T-0001", "--note", "leak")
     cards = [c for c in ui.needs_cards(root) if c.get("id") == "T-0001"]
-    assert [c.get("name") for c in cards] == ["budget_wall"], cards        # scope_drift never; budget_wall while no status card
+    assert [c.get("name") for c in cards] == ["leak"], cards        # scope_drift / budget_wall never; a leak while no status card
     scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "escalated", "--force")
     cards = [c for c in ui.needs_cards(root) if c.get("id") == "T-0001"]
     assert len(cards) == 1 and cards[0]["type"] == "gate", cards           # the status card carries it
+
+
+def test_additions_only_gate1_is_accepted_by_the_watcher(world):
+    """Rule 2: a Steward escalation reading 'Gate 1 ... N ADDED / 0 MODIFIED / 0 REMOVED ... all mechanical checks pass'
+    is applied as accepted (accept_override by the watcher); any other escalation stays escalated."""
+    from scr.watch import Watcher
+    from scr.review import additions_only_gate1
+    root, _, _ = world
+    for st in ("dispatched", "in_progress", "submitted"):
+        scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
+    d = Store(root).get("T-0001").dir
+    rev = (root / "templates" / "review.md").read_text(encoding="utf-8").replace(
+        "accepted | returned (feedback below) | escalated (Gate N, reason)",
+        "escalated (Gate 1, statement_diff non-empty: 12 ADDED / 0 MODIFIED / 0 REMOVED; all mechanical checks pass; recommend force-accept)")
+    assert additions_only_gate1(rev)
+    (d / "review.md").write_text(rev, encoding="utf-8")
+    Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "accepted"
+    other = (root / "templates" / "review.md").read_text(encoding="utf-8").replace(
+        "accepted | returned (feedback below) | escalated (Gate N, reason)", "escalated (Gate 1, 3 CHANGED statements need approval)")
+    assert not additions_only_gate1(other)

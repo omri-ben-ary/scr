@@ -106,12 +106,18 @@ def cmd_task_set(args):
         # T-0128: on every route into accepted, whatever the previous status and even under --force
         # (--force overrides the lifecycle table above, never the review); omri_queue -> accepted is
         # the gate click, where Omri's decision is the review.
-        from .review import acceptance_problem
+        from .review import acceptance_problem, additions_only_gate1
         problem = acceptance_problem(t.dir)
         if problem:
             if getattr(args, "force_accept", False) and args.actor == "omri":
                 log.append("system", name="accept_override", task=args.id, actor=args.actor,
                            note=f"{problem}; accepted anyway by Omri (--force-accept)" + (f": {args.note}" if args.note else ""))
+            elif getattr(args, "force_accept", False) and args.actor.startswith("steward") and \
+                    (t.dir / "review.md").exists() and additions_only_gate1((t.dir / "review.md").read_text(encoding="utf-8", errors="replace")):
+                # 2026-10-14 (card-routing rule 2): the Steward's own "Gate 1, additions only, all checks pass" escalation
+                # is the acceptance; the watcher applies it. Any other steward --force-accept is refused below.
+                log.append("system", name="accept_override", task=args.id, actor=args.actor,
+                           note=f"{problem}; Gate 1 additions-only, all mechanical checks pass: accepted by the watcher (card-routing rule 2)")
             elif getattr(args, "force_accept", False):
                 raise RepoError(f"{args.id}: {old} -> accepted refused — {problem}; --force-accept is Omri's alone (--actor omri)")
             else:
