@@ -139,6 +139,7 @@ _CHORE_CACHE: dict = {"ts": 0.0, "items": []}
 # the task last became accepted, so a task returned for a rebase (or merged) drops the card without an ack.
 ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale", "slot_freed",
                 "land_failed"}
+QUIET_EVENTS = {"scope_drift", "stale", "session_dead", "checkpoint_skipped"}   # 2026-10-14: never a card of their own
 ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent",
                 "slot_freed": "escalated: a stuck task left its slot — one action for you",
                 "land_failed": "landing failed — code accepted but not on main"}
@@ -303,11 +304,16 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
     flags = _watch_flags(root)
     recent = _events(root, None, 2000)
     accepted_seq = {e.get("task") or "-": e.get("seq") or 0 for e in recent if e.get("kind") == "state" and e.get("to") == "accepted"}
+    carded = {c["id"] for c in needs if c.get("id")}       # tasks that already have a decision / gate / help card
     for e in recent:
         age = _age_h(e.get("ts"))
         if age is not None and age > 24 * 7:
             continue
         if e.get("kind") != "system" or e.get("name") not in ALARM_EVENTS:
+            continue
+        if e.get("name") in QUIET_EVENTS:                   # 2026-10-14: informational; the watcher acts on them itself
+            continue
+        if e.get("task") in carded:                         # one card per task: the status card carries it
             continue
         if e.get("name") == "slot_freed":   # its note is the body of the task:<id>:escalated card (T-0109), never a card of its own
             continue

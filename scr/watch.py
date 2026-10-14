@@ -1763,7 +1763,7 @@ class Watcher:
             st = self.store.get(tid).status
         except Exception:  # noqa: BLE001
             return True
-        return st not in RUNNING and st != "waiting"
+        return st not in DEAD_CHECK_STATUSES | {"dispatched", "waiting", "submitted"}
 
     def resume_task(self, t, finished: list[dict], now: datetime) -> None:
         """`claude -p --resume <session>` for a waiting task whose jobs ended: the job results are the prompt. The
