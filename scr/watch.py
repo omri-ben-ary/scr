@@ -71,7 +71,7 @@ from .journal import journal
 from .lifecycle import requeue
 from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
-from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, service_argv, session_argv, start_claude
+from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_exe, session_argv, start_claude
 from .state import State
 from .store import Store
 
@@ -1528,7 +1528,7 @@ class Watcher:
             return None
         from .ops import land_test_timeout
         minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
-        cmd = service_argv(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
+        cmd = scr_exe(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
         try:
             job = jobs.submit(self.root, cmd, task=t.id, name=f"{self.LAND_JOB_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
         except Exception as e:  # noqa: BLE001
