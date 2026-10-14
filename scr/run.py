@@ -206,13 +206,18 @@ def start_claude(cwd: Path, brief_file: Path, transcript: Path, permission_mode:
 
 
 def start_detached(args: list[str], cwd: Path, log: Path | None = None) -> int:
-    """Start a long-running helper (the watcher, the UI) detached from this process."""
+    """Start a long-running helper (the watcher, the UI, a job wrapper) detached from this process. The child
+    can always import this `scr` package (PYTHONPATH carries its parent): a `python -m scr...` wrapper started
+    from a cwd outside the checkout (a test world, 2026-10-14) failed silently without it."""
     flags = 0
     if os.name == "nt":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]  (+ CREATE_NO_WINDOW from scr/__init__)
     out = log.open("ab") if log else subprocess.DEVNULL
+    env = dict(os.environ)
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = pkg_parent + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     p = subprocess.Popen(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                         creationflags=flags, start_new_session=(os.name != "nt"))
+                         creationflags=flags, start_new_session=(os.name != "nt"), env=env)
     return p.pid
 
 

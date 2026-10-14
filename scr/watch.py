@@ -947,11 +947,24 @@ class Watcher:
 
         merged_now = 0
         if self.auto_land and ok:
+            # 2026-10-14: a landing runs as a detached job (scr/jobs.py), never inside the tick: a 2 h test run used
+            # to freeze dispatch, reviews and the whole watcher for 2 h (T-0058 on 2026-10-14 15:51). First the
+            # finished landing jobs are applied (the task may already be `merged`: `scr land` records that itself),
+            # then every accepted task without a running landing gets one.
+            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)
+                        and j.get("status") in jobs.FINISHED and not j.get("applied") and j.get("task")]:
+                t = tasks.get(job["task"])
+                if t is None:
+                    try:
+                        t = self.store.get(job["task"])
+                    except Exception:  # noqa: BLE001
+                        job["applied"] = "orphan"; jobs.save(self.root, job); continue
+                if self.apply_land_job(t, job) == "merged":
+                    merged_now += 1
+            tasks = self.store.load_all()
             for t in [t for t in tasks.values() if t.status == "accepted"]:
                 if task_frozen(self.store, t):          # T-0272: held for the thaw; `land:` stays unset
                     continue
-                # 2026-10-14: a landing runs as a detached job (scr/jobs.py), never inside the tick: a 2 h test run used
-                # to freeze dispatch, reviews and the whole watcher for 2 h (T-0058 on 2026-10-14 15:51)
                 if self.land_via_job(t) == "merged":
                     merged_now += 1
         self.retire_refused_needs(tasks)
@@ -1493,12 +1506,8 @@ class Watcher:
         it ends (apply_land_job). Returns "merged" when a finished job landed the task this tick, "submitted" when a job
         was started, "failed" when a finished job was applied as a failure, None otherwise (job still running, nothing
         to do, or the task is held back by a known-failed tip)."""
-        active = [j for j in self.land_jobs(t.id) if j["status"] in jobs.ACTIVE]
-        if active:
-            return None
-        pending = [j for j in self.land_jobs(t.id) if j["status"] in jobs.FINISHED and not j.get("applied")]
-        if pending:
-            return self.apply_land_job(t, pending[-1])
+        if any(j["status"] in jobs.ACTIVE for j in self.land_jobs(t.id)):
+            return None                                 # its landing is running; the tick applies it when it ends
         scriptorium = is_scriptorium_task(self.root, self.store, t)
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
@@ -1510,9 +1519,9 @@ class Watcher:
             scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
             failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
             g, mg = Git(wt), Git(self.root)
-            tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
-            if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
-                if not [k for k in self.flags if k.startswith(f"autofix:{t.id}:land:")]:
+            tip = g.head() if not g.dirty() else None
+            if tip and f"land_failed:{t.id}:{tip}+{scope_sig}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
+                if f"landhold:{t.id}" not in self.flags and not [k for k in self.flags if k.startswith(f"autofix:{t.id}:land:")]:
                     if self.autofix(t, "land", f"landing of task/{t.id} failed at {tip[:8]} (see the land_failed event); merge the trunk in, make the tests pass, commit, resubmit"):
                         for k in failed:
                             self.unflag(k)
@@ -1567,6 +1576,7 @@ class Watcher:
             else:
                 for k in failed:
                     self.unflag(k)
+                self.unflag(f"landhold:{t.id}")
                 try:
                     r = retire(self.root, t.id, execute=True)
                 except Exception as e:  # noqa: BLE001
@@ -1586,7 +1596,16 @@ class Watcher:
         else:
             m = re.search(r"FAILED \((\w+)\)", why)
             reason = m.group(1) if m else ("conflict" if "merge failed" in why or "conflict" in why.lower() else "scope" if "REFUSED" in why else "tests")
-        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": job.get("land_tip"), "sha": None}
+        tip = job.get("land_tip")
+        if scriptorium:
+            try:                                    # the landing commits the dirty tree first: the tip that failed is the one after it
+                wt = task_worktree(workload_for(self.root, self.store, t), t)
+                if wt.exists():
+                    g = Git(wt)
+                    tip = g.head() if not g.dirty() else tip
+            except Exception:  # noqa: BLE001
+                pass
+        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": tip, "sha": None}
         if scriptorium:
             self.land_failed(t, res, failed, scope_sig)
             return "failed"
@@ -1734,10 +1753,14 @@ class Watcher:
         key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
         for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
             self.unflag(k)
+        if failed - {key}:
+            self.unflag(f"landhold:{t.id}")                             # a new tip: the hold belonged to the old one
         if self.flag(key):
             self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
         self.unflag(f"land:{t.id}")
-        if res.get("reason") not in {"lost_worktree", "error", "trunk", "busy"}:    # those are the checkout's, not the branch's
+        if res.get("reason") in self.OMRI_LAND_REASONS:          # the checkout's problem, not the branch's: never sent to a scriber
+            self.flags.add(f"landhold:{t.id}")
+        else:
             tail = "\n".join(res["out"][-12:])[-1500:]
             fix = (f"landing failed ({res.get('reason')}): {why[:300]}. Merge the trunk into the branch, make the full test suite pass "
                    f"(`.venv\\Scripts\\python.exe -m pytest tests -q`, as a scr job if long), fix only what the failure names, commit, "
@@ -1747,6 +1770,8 @@ class Watcher:
                 return False
         self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         return False
+
+    OMRI_LAND_REASONS = {"lost_worktree", "error", "trunk", "busy"}
 
     AUTOFIX_MAX = 2
 

@@ -303,9 +303,25 @@ def _land_world(tmp_path: Path, monkeypatch, journal: bool = False) -> tuple[Pat
     return root, origin, wt
 
 
-def _tick(root: Path) -> dict:
+def _tick(root: Path, wait: float = 180.0) -> dict:
+    """One auto-land tick — and, since 2026-10-14 landings run as detached jobs, the wait for any landing job the
+    tick submitted plus the tick that applies its result, so a test sees the landing's outcome as one step."""
+    import time
+    from scr import jobs
     from scr.watch import Watcher
-    return Watcher(root, quiet=True, auto_land=True).tick()
+    res = Watcher(root, quiet=True, auto_land=True).tick()
+    t0 = time.time()
+    while True:
+        mine = [j for j in jobs.list_jobs(root) if str(j.get("name") or "").startswith("land-")]
+        if not mine:
+            return res
+        if any(j["status"] in jobs.ACTIVE for j in mine):
+            assert time.time() - t0 < wait, f"landing job still running after {wait}s: {mine}"
+            time.sleep(1)
+            continue
+        if all(j.get("applied") for j in mine):
+            return res
+        res = Watcher(root, quiet=True, auto_land=True).tick()
 
 
 def test_accepted_scriptorium_worktree_is_committed_merged_and_tested(tmp_path: Path, monkeypatch):
@@ -598,13 +614,14 @@ def test_record_report_written_in_worktree_fails_the_landing_by_name(tmp_path: P
     (wt / rel).write_text("# Report\n\nwritten in the worktree by mistake\n", encoding="utf-8")
     main_before = sgit(root, "rev-parse", "main")
     res = _tick(root)
-    assert res["ok"] and Store(root).get("T-0007").status == "accepted", res
+    assert res["ok"] and Store(root).get("T-0007").status == "ready", res      # back to the scriber (2026-10-14)
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and "records" in ev[0]["note"] and "report.md" in ev[0]["note"] and "live root" in ev[0]["note"], ev
-    assert any("landing failed (records)" in n for n in res["needs"]), res["needs"]
+    assert not any("landing failed" in n for n in res["needs"]), res["needs"]
     assert sgit(root, "rev-parse", "main") == main_before and not _events(root, "landed", "T-0007")
-    # the Steward moved the text to the live root; the branch takes main's copy back -> lands
+    # the scriber moved the text to the live root; the branch takes main's copy back, resubmits -> lands
     sgit(wt, "checkout", "main", "--", rel)
+    _resubmit_fixed(root)
     res2 = _tick(root)
     assert Store(root).get("T-0007").status == "merged", res2["needs"]
     assert sgit(root, "show", "main:tool.txt").strip() == "ok" and len(_events(root, "land_failed", "T-0007")) == 1
@@ -2215,6 +2232,8 @@ def test_land_failed_conflict_is_one_card_with_the_note_until_acked(tmp_path: Pa
     (root / "tool.txt").write_text("trunk edit\n", encoding="utf-8")
     sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] the trunk moved on tool.txt")
     (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
+    (root / ".scr").mkdir(exist_ok=True)
+    (root / ".scr" / "watch.state.txt").write_text("autofix:T-0007:land:1\nautofix:T-0007:land:2\n", encoding="utf-8")   # the two send-backs are spent (2026-10-14)
     _tick(root)
     ev = _events(root, "land_failed", "T-0007")
     assert len(ev) == 1 and Store(root).get("T-0007").status == "accepted"
@@ -3722,7 +3741,7 @@ def test_frozen_workload_task_is_not_auto_dispatched_and_another_is(world, monke
 
 
 def test_frozen_workload_gets_no_auto_review_and_no_auto_land(world, monkeypatch):
-    root, _, _ = world
+    root, repo, _ = world
     _set_frozen(root, "quantum-insertion", True)
     _submit(root)
     reviews: list[str] = []
@@ -3734,11 +3753,14 @@ def test_frozen_workload_gets_no_auto_review_and_no_auto_land(world, monkeypatch
     _write_review(root, "T-0001", accepted_review())
     scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", "accepted")
     lands: list[str] = []
-    monkeypatch.setattr(watch_mod, "land", lambda root, tid, merge=True: lands.append(tid) or {"ok": False, "url": None, "out": []})
+    (repo / ".worktrees" / "T-0001").mkdir(parents=True, exist_ok=True)          # a landing needs a worktree to land from
+    from scr import jobs as jobs_mod
+    monkeypatch.setattr(jobs_mod, "submit", lambda root, cmd, **kw: lands.append(kw.get("task")) or {"id": "J-9999", "task": kw.get("task"), "name": kw.get("name"), "status": "running"})
+    monkeypatch.setattr(jobs_mod, "save", lambda root, job: None)
     Watcher(root, quiet=True, auto_land=True).tick()
     assert lands == [] and "land:T-0001" not in _flags(root) and Store(root).get("T-0001").status == "accepted"
 
-    _set_frozen(root, "quantum-insertion", False)                        # the thaw: landing resumes on the next tick
+    _set_frozen(root, "quantum-insertion", False)                        # the thaw: the landing job is submitted on the next tick
     Watcher(root, quiet=True, auto_land=True).tick()
     assert lands == ["T-0001"]
 
