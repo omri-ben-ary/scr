@@ -3390,10 +3390,29 @@ def test_ui_offers_take_over_for_a_recorded_session(world, monkeypatch):
 from scr.watch import wall_hours, wall_stale  # noqa: E402
 
 
-def _over_wall(root: Path, tid: str = "T-0001", hours: float = 1, minutes: float = 90) -> None:
+def _over_wall(root: Path, tid: str = "T-0001", hours: float = 1, minutes: float = 90, spent: bool = True) -> None:
     _running(root, tid)
     scr(root, "--quiet", "--actor", "s", "task", "field", tid, "budget.max_wall_hours", str(hours))
     _backdate(root, tid, "in_progress", minutes)
+    if spent:                                   # 2026-10-14: the first two exhaustions extend the wall; these tests are about the third
+        p = root / ".scr" / "watch.state.txt"
+        p.parent.mkdir(exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(f"autofix:{tid}:wall:1\nautofix:{tid}:wall:2\n")
+
+
+def test_over_wall_is_extended_and_relaunched_twice_before_escalating(world, monkeypatch):
+    """2026-10-14: the first wall exhaustion doubles budget.max_wall_hours and relaunches the task from its
+    checkpoint (returned -> ready, auto_fix event); no card. The third one is escalated as before."""
+    root, _, _ = world
+    _over_wall(root, spent=False)
+    _mock_session(monkeypatch, alive=False)
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    t = Store(root).get("T-0001")
+    assert res["ok"] and t.status == "ready" and not res["escalated"], res
+    assert t.rec["budget"]["max_wall_hours"] == 2.0
+    assert len(_events(root, "auto_fix", "T-0001")) == 1 and not _events(root, "slot_freed", "T-0001")
+    assert not [n for n in res["needs"] if n.startswith("T-0001 ")], res["needs"]
 
 
 def test_stuck_wall_stale_is_a_pure_function_of_the_start_and_the_budget():

@@ -1355,11 +1355,24 @@ class Watcher:
                           f"delete `review:{t.id}` from .scr/watch.state.txt after `scr task set {t.id} returned` + `ready`")
             elif t.status in {"in_progress", "checkpoint"} and takeover_of(events, t.id):
                 continue                            # under takeover Omri is in the session: his HELP lines and wall hold nothing
+            elif t.status in {"in_progress", "checkpoint"} and str(t.rec.get("title", "")).startswith("hotfix:"):
+                continue                            # 2026-10-14: a hotfix record is open while Omri edits the checkout; no wall
             elif t.status in {"in_progress", "checkpoint"} and (row := wall_stale(self.started_at(t.id), hours := wall_hours(t.rec), now)):
                 # T-0121: out of budget is stuck. The running loop raised this episode's `budget_wall` earlier this
                 # tick, so the trail reads budget_wall -> escalated -> slot_freed. `escalated` leaves only for
                 # omri_queue (scr/lifecycle.py), so the redispatch route needs --force (it is logged).
                 sess = self.session_of(t)
+                if len([k for k in self.flags if k.startswith(f"autofix:{t.id}:wall:")]) < self.AUTOFIX_MAX:
+                    # 2026-10-14: the first two exhaustions extend the wall by the same budget and relaunch from the
+                    # checkpoint (the wall counts waiting time too, T-0342); the third is Omri's
+                    if sess:
+                        wl = workload_for(self.root, self.store, t)
+                        self.stop_session(t, sess["pid"], task_worktree(wl, t), t.rec.get("branch") or "task/" + t.id, created=sess.get("created"))
+                    new_hours = hours * 2
+                    self.scr(f"steward:{t.id}", "task", "field", t.id, "budget.max_wall_hours", str(new_hours), "--note", "auto-fix: wall extended", "--quiet")
+                    if self.autofix(t, "wall", f"wall budget exhausted ({row['age_h']} h > {hours:g} h); extended to {new_hours:g} h; "
+                                              f"relaunch from the branch's last checkpoint and finish, or write report.md with what is done"):
+                        continue
                 transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
                 reason = (f"wall budget exhausted: {row['age_h']} h in progress since "
                           f"{row['since'].astimezone(timezone.utc):%Y-%m-%dT%H:%MZ} > max_wall_hours {hours:g}")
