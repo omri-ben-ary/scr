@@ -198,7 +198,7 @@ def acked_keys(root: Path) -> set[str]:
     return set(_read(root / "reports" / "ui.acks.txt").split())
 
 
-def watch_cards(root: Path, tasks: dict, acked: set[str], now: datetime | None = None) -> list[dict]:
+def watch_cards(root: Path, tasks: dict, acked: set[str], now: datetime | None = None, carded: set[str] | None = None) -> list[dict]:
     """One `watch` card per line of the watcher's last published needs list. Live: a line the next tick does not raise
     is gone from the file and so from the page. The key `need:<line key>:<since>` holds across the ticks that raise
     the line, so `scr ack` and the push dedup (`notified:<key>`) work as for other cards; a later episode of the same
@@ -216,6 +216,8 @@ def watch_cards(root: Path, tasks: dict, acked: set[str], now: datetime | None =
         key = str(n.get("key") or "")
         kind = key.split(":", 1)[0]
         if not key or kind in WATCH_OWN_CARD:
+            continue
+        if carded and n.get("task") in carded:              # one card per task (2026-10-14)
             continue
         since = str(n.get("since") or doc["ts"])
         ck = f"need:{key}:{re.sub(r'[^0-9TZ]', '', since)}"
@@ -339,7 +341,7 @@ def needs_cards(root: Path, tasks: dict | None = None) -> list[dict]:
             grp["title"] = f"{grp['title']} ×{grp['count']}"
         grp["key"] = grp["h"] = f"events:{task}:{name}:{grp['ts']}"
         needs.append(grp)
-    needs += watch_cards(root, tasks, acked)
+    needs += watch_cards(root, tasks, acked, carded={c["id"] for c in needs if c.get("id")})
     needs += chore_cards(root, acked)
     from . import hotfix as _hx
     hx = _hx.status(root)
