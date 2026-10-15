@@ -157,3 +157,16 @@ def test_landing_jobs_have_their_own_lane(tmp_path, monkeypatch):
         (root / ".scr" / "jobs" / f"{jid}.json").write_text(json.dumps({"id": jid, "name": name, "status": st, "cmd": ["x"], "pid": 1 if st == "running" else None, "timeout_min": 60}), encoding="utf-8")
     jobs.poll(root, datetime.now(timezone.utc))
     assert started == ["J-0003"]          # the landing lane; J-0002 waits for jobs_concurrency, J-0004 for the lane
+
+
+def test_event_appends_from_many_processes_never_fork(tmp_path):
+    """T-0333 (done 2026-10-15): 8 processes appending 25 events each through EventLog.append leave one unbroken chain."""
+    import subprocess, sys
+    from scr.events import EventLog
+    log = tmp_path / "events.jsonl"
+    code = ("import sys; from pathlib import Path; from scr.events import EventLog\n"
+            "l = EventLog(Path(sys.argv[1]))\n"
+            "for i in range(25): l.append('system', name='probe', actor=sys.argv[2], note=str(i))\n")
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(log), f"p{i}"], cwd=str(Path(__file__).resolve().parent.parent)) for i in range(8)]
+    assert all(p.wait() == 0 for p in procs)
+    assert EventLog(log).verify_chain() == [] and len(EventLog(log).read()) == 200
