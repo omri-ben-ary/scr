@@ -151,13 +151,16 @@ def test_spawn_checkpoint_land_retire(world):
     assert "task/T-0001" in git(repo, "branch", "-r")                      # pushed to origin
     assert Store(root).get("T-0001").status == "accepted"
     assert "[T-0001] Prove a" in git(wt, "log", "-1", "--format=%s") or "checkpoint" in git(wt, "log", "-1", "--format=%s")
-    # merge by hand (gh is not here), then retire = quarantine
+    # merge by hand (gh is not here), record merged, then retire = delete (T-0321); accepted is still live work
     git(repo, "merge", "-q", "task/T-0001"); git(repo, "push", "-q", "origin", "master")
+    assert retire(root, "T-0001", execute=True)["code"] == 4 and wt.exists()
+    _set_status(root, "T-0001", "merged")
     res = retire(root, "T-0001", execute=True)
     assert res["ok"], res["out"]
-    assert not wt.exists()
-    quarantine = list((repo.parent / "quantum-insertion-RETIRED").glob("*-T-0001/worktree/QuantumInsertion/A.lean"))
-    assert quarantine
+    assert not wt.exists() and git(repo, "rev-parse", "--verify", "task/T-0001")
+    # build.log is untracked and outside the regenerable set: copied out before the delete, never lost
+    kept = list((repo.parent / "quantum-insertion-RETIRED").glob("*-T-0001-kept/build.log"))
+    assert kept and kept[0].read_text() == "noise\n"
 
 
 def test_retire_refuses_unmerged(world):
@@ -166,8 +169,219 @@ def test_retire_refuses_unmerged(world):
     spawn(root, ["T-0001"], lake=False)
     wt = repo / ".worktrees" / "T-0001"
     (wt / "new.txt").write_text("x\n"); checkpoint_commit(root, "T-0001")
+    _set_status(root, "T-0001", "merged")
     res = retire(root, "T-0001", execute=True)
     assert not res["ok"] and res["code"] == 2 and wt.exists()
+
+
+# ---- T-0321: delete a finished task's worktree, quarantine a live one ------------------------------
+# 2026-10-10: C: at 0 bytes free, 55 worktrees x ~600 MB .lake/build; Omri deleted 13 merged trees by hand.
+def _set_status(root: Path, tid: str, status: str) -> None:
+    t = Store(root).get(tid)
+    t.rec["status"] = status; t.save()
+
+
+def _events(root: Path, name: str) -> list[dict]:
+    return [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("kind") == "system" and e.get("name") == name]
+
+
+def _files(top: Path) -> list[str]:
+    """Every file under top, links not followed (what a quarantine must still hold)."""
+    from scr.ops import _scan
+    return sorted(rel for rel, _ in _scan(top)[0])
+
+
+def _link(link: Path, target: Path) -> None:
+    """A directory junction on Windows (what spawn's `venv: link` makes), a symlink elsewhere."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _spawned(world, status: str, merged: bool = True):
+    """T-0001 spawned with one committed file; merged into origin/master when `merged`; record set to `status`."""
+    root, repo, origin = world
+    scr(root, "--actor", "s", "task", "set", "T-0001", "dispatched")
+    spawn(root, ["T-0001"], lake=False)
+    wt = repo / ".worktrees" / "T-0001"
+    (wt / "n1.txt").write_text("1\n"); checkpoint_commit(root, "T-0001")
+    if merged:
+        git(repo, "merge", "-q", "task/T-0001"); git(repo, "push", "-q", "origin", "master")
+    _set_status(root, "T-0001", status)
+    return root, repo, wt
+
+
+def _norm(p) -> str:
+    return str(p).replace("\\", "/").lower()
+
+
+@pytest.mark.parametrize("status,merged", [("merged", True), ("closed", False), ("rejected", False)])
+def test_retire_deletes_a_finished_worktree(world, status, merged):
+    """DoD 1-2: merged (branch in the trunk), closed, rejected -> the directory is gone, `git worktree list` no longer
+    lists it, task/<id> still resolves to its commit, one worktree_deleted event names the path and the bytes."""
+    root, repo, wt = _spawned(world, status, merged)
+    tip = git(wt, "rev-parse", "HEAD")
+    assert _norm(wt.resolve()) in _norm(git(repo, "worktree", "list"))
+    dry = retire(root, "T-0001")
+    assert dry["ok"] and dry["out"][-1] == "DRY RUN — nothing deleted" and wt.exists() and not _events(root, "worktree_deleted")
+    res = retire(root, "T-0001", execute=True)
+    assert res["ok"] and res["mode"] == "delete", res["out"]
+    assert not wt.exists()
+    assert _norm(wt.resolve()) not in _norm(git(repo, "worktree", "list"))
+    assert git(repo, "rev-parse", "task/T-0001") == tip
+    ev = _events(root, "worktree_deleted")
+    assert len(ev) == 1 and ev[0]["data"]["path"] == str(wt) and ev[0]["data"]["bytes"] == res["bytes"] > 0
+    assert str(wt) in ev[0]["note"] and f"{res['bytes']} bytes" in ev[0]["note"] and ev[0]["data"]["kept"] == []
+    assert not (repo.parent / "quantum-insertion-RETIRED").exists()                 # nothing kept, nothing quarantined
+
+
+@pytest.mark.parametrize("status", ["returned", "escalated", "omri_queue"])
+def test_retire_quarantines_a_live_worktree_without_lake_build(world, status):
+    """DoD 3: a returned / escalated / omri_queue task's tree is moved to <repo>-RETIRED/ as before, minus .lake/build;
+    every other file (tracked, untracked, the rest of .lake) is still there, counted back."""
+    root, repo, wt = _spawned(world, status, merged=False)
+    for rel in (".lake/build/lib/A.olean", ".lake/build/ir/A.c", ".lake/packages/mathlib/M.lean", "notes/idea.md"):
+        (wt / rel).parent.mkdir(parents=True, exist_ok=True); (wt / rel).write_text(rel)
+    before = [f for f in _files(wt) if not f.startswith(".lake/build/")]
+    res = retire(root, "T-0001", execute=True)
+    assert res["ok"] and res["mode"] == "quarantine", res["out"]
+    q = list((repo.parent / "quantum-insertion-RETIRED").glob("*-T-0001/worktree"))
+    assert len(q) == 1 and not wt.exists()
+    assert not (q[0] / ".lake" / "build").exists() and (q[0] / ".lake" / "packages" / "mathlib" / "M.lean").exists()
+    assert _files(q[0]) == before and len(before) >= 4
+    assert len(_events(root, "worktree_retired")) == 1 and not _events(root, "worktree_deleted")
+    assert git(repo, "rev-parse", "--verify", "task/T-0001")
+
+
+@pytest.mark.parametrize("status", ["ready", "dispatched", "in_progress", "submitted", "accepted"])
+def test_retire_refuses_a_running_task(world, status):
+    root, repo, wt = _spawned(world, status)
+    res = retire(root, "T-0001", execute=True)
+    assert res["code"] == 4 and wt.exists() and not (repo.parent / "quantum-insertion-RETIRED").exists()
+
+
+def test_retire_unlinks_junctions_never_follows_them(world, tmp_path):
+    """DoD 4: .venv and .lake/packages are junctions (symlinks off Windows) to a fixture directory -> after the delete the
+    fixture and its files are intact; the same for a junction inside .lake/build when a live tree is quarantined."""
+    fx = tmp_path / "shared-store"
+    for rel in ("pkg/a.lean", "pkg/deep/b.lean", "Scripts/python.exe"):
+        (fx / rel).parent.mkdir(parents=True, exist_ok=True); (fx / rel).write_text(rel)
+    want = _files(fx)
+    root, repo, wt = _spawned(world, "merged")
+    _link(wt / ".venv", fx); _link(wt / ".lake" / "packages", fx)
+    assert (wt / ".venv" / "pkg" / "a.lean").exists()
+    res = retire(root, "T-0001", execute=True)
+    assert res["ok"], res["out"]
+    assert not wt.exists() and _files(fx) == want
+    ev = _events(root, "worktree_deleted")[-1]
+    assert ev["data"]["links"] == [".lake/packages", ".venv"] and ev["data"]["kept"] == []
+    # quarantine: .lake/build is dropped link-safely
+    git(repo, "worktree", "add", "-q", "-b", "task/T-0009", str(repo / ".worktrees" / "T-0009"), "master")
+    scr(root, "--quiet", "task", "new", "Other", "--id", "T-0009", "--files", "x", "--origin", "omri", journal_on=False)
+    _set_status(root, "T-0009", "returned")
+    w9 = repo / ".worktrees" / "T-0009"
+    _link(w9 / ".lake" / "build" / "store", fx); _link(w9 / ".venv", fx)
+    res = retire(root, "T-0009", execute=True)
+    assert res["ok"], res["out"]
+    assert _files(fx) == want and not w9.exists()
+
+
+def test_retire_keeps_untracked_value_before_deleting(world):
+    """DoD 5 (the T-0286 trap): untracked and gitignored files outside .lake/ build/ __pycache__/ .pytest_cache/ and the
+    .venv link are copied to <repo>-RETIRED/<stamp>-<id>-kept/ (content checked) and listed in the event; the
+    regenerable ones are not."""
+    root, repo, wt = _spawned(world, "merged", merged=False)
+    (wt / ".gitignore").write_text("*.pdf\n"); checkpoint_commit(root, "T-0001")
+    git(repo, "merge", "-q", "task/T-0001"); git(repo, "push", "-q", "origin", "master")
+    value = {"sources/paper.pdf": "gitignored paper", "missions/QI10/PLAN.md": "untracked plan"}
+    regen = (".lake/build/A.olean", "build/out.o", "QuantumInsertion/__pycache__/x.pyc", ".pytest_cache/v/cache")
+    for rel, text in [*value.items(), *((r, "regen") for r in regen)]:
+        (wt / rel).parent.mkdir(parents=True, exist_ok=True); (wt / rel).write_text(text)
+    assert "paper.pdf" not in git(wt, "status", "--porcelain", "-uall")              # really ignored
+    res = retire(root, "T-0001", execute=True)
+    assert res["ok"], res["out"]
+    assert not wt.exists()
+    kept = list((repo.parent / "quantum-insertion-RETIRED").glob("*-T-0001-kept"))
+    assert len(kept) == 1
+    assert {rel: (kept[0] / rel).read_text() for rel in value} == value
+    assert _files(kept[0]) == sorted([*value, "KEPT.txt"])
+    ev = _events(root, "worktree_deleted")[-1]
+    assert sorted(ev["data"]["kept"]) == sorted(value) and ev["data"]["kept_dir"] == str(kept[0]) and ev["data"]["kept_count"] == 2
+
+
+def test_retire_refuses_a_dirty_finished_worktree(world):
+    """DoD 6: a merged worktree with a modified tracked file -> code 3, nothing deleted or moved."""
+    root, repo, wt = _spawned(world, "merged")
+    (wt / "n1.txt").write_text("changed\n")
+    res = retire(root, "T-0001", execute=True)
+    assert not res["ok"] and res["code"] == 3 and (wt / "n1.txt").read_text() == "changed\n"
+    assert not (repo.parent / "quantum-insertion-RETIRED").exists() and not _events(root, "worktree_deleted")
+
+
+def test_retire_refuses_a_target_outside_the_worktree_root(world, tmp_path):
+    """DoD 7: the path is resolved and must be a direct child of the workload's worktree root; `..`, the repo root, the
+    scriptorium, the RETIRED root (a record pointing there), or a link are refused and nothing is touched."""
+    root, repo, wt = _spawned(world, "merged")
+    for bad in ("..", ".", "../T-0001", "-x"):
+        with pytest.raises(Exception):
+            retire(root, bad, execute=True)
+    cfg = root / "config" / "workloads.yaml"
+    wl = yaml.safe_load(cfg.read_text()); name = next(iter(wl)); orig = dict(wl[name])
+
+    def point(worktrees: str) -> None:
+        wl[name] = {**orig, "worktrees": worktrees}; cfg.write_text(yaml.safe_dump(wl))
+
+    point("..")                                                     # worktree root = the Desktop: name the repo itself
+    res = retire(root, "quantum-insertion", execute=True)
+    assert res["code"] == 5 and "the repo" in res["out"][-1] and (repo / "README.md").exists()
+    res = retire(root, "scriptorium", execute=True)
+    assert res["code"] == 5 and (root / "config").is_dir()
+    retired = tmp_path / "quantum-insertion-RETIRED"
+    (retired / "T-0001").mkdir(parents=True); (retired / "T-0001" / "f").write_text("kept value")
+    point("../quantum-insertion-RETIRED")                           # a record pointing into the quarantine
+    res = retire(root, "T-0001", execute=True)
+    assert res["code"] == 5 and "quarantine root" in res["out"][-1] and (retired / "T-0001" / "f").read_text() == "kept value"
+    point(orig["worktrees"])
+    other = tmp_path / "elsewhere"; other.mkdir(); (other / "f").write_text("x")
+    shutil.move(str(wt), str(tmp_path / "T-0001-real"))
+    _link(wt, other)                                                # the worktree path itself is a link
+    with pytest.raises(Exception):
+        retire(root, "T-0001", execute=True)
+    assert (other / "f").exists()
+
+
+def test_worktrees_gc_dry_run_then_apply(world):
+    """DoD 8: `scr worktrees gc --dry-run` lists every workload's worktrees with status and size and changes nothing;
+    `scr worktrees gc` deletes the finished ones, keeps the rest, and drops .lake/build from <repo>-RETIRED/* trees."""
+    root, repo, wt = _spawned(world, "merged")
+    (wt / ".lake" / "build").mkdir(parents=True); (wt / ".lake" / "build" / "A.olean").write_bytes(b"x" * 4096)
+    git(repo, "worktree", "add", "-q", "-b", "qi9", str(repo / ".worktrees" / "qi-mission-9"), "master")
+    old = repo.parent / "quantum-insertion-RETIRED" / "20261001-000000-T-0042"
+    for rel in ("worktree/.lake/build/B.olean", "worktree/missions/QI10/PLAN.md", "git-worktree-meta/HEAD"):
+        (old / rel).parent.mkdir(parents=True, exist_ok=True); (old / rel).write_text(rel)
+
+    def snap():
+        return (sorted(p.as_posix() for p in repo.parent.rglob("*") if ".git" not in p.parts),
+                len(EventLog(root / "events" / "events.jsonl").read()))
+    before = snap()
+    r = scr(root, "--json", "worktrees", "gc", "--dry-run", journal_on=False)
+    by = {x["worktree"]: x for x in json.loads(r.stdout)}
+    assert by["T-0001"]["status"] == "merged" and by["T-0001"]["action"] == "delete" and by["T-0001"]["bytes"] >= 4096
+    assert by["qi-mission-9"]["status"] is None and by["qi-mission-9"]["action"] == "keep"
+    assert by["quantum-insertion-RETIRED/20261001-000000-T-0042"]["action"] == "drop .lake/build"
+    text = scr(root, "worktrees", "gc", "--dry-run", journal_on=False).stdout
+    assert "T-0001" in text and "merged" in text and "MB" in text and "dry run" in text
+    assert snap() == before                                                       # changed nothing
+    r = scr(root, "worktrees", "gc", journal_on=False)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not wt.exists() and (repo / ".worktrees" / "qi-mission-9").exists()
+    assert not (old / "worktree" / ".lake" / "build").exists()
+    assert (old / "worktree" / "missions" / "QI10" / "PLAN.md").exists() and (old / "git-worktree-meta" / "HEAD").exists()
+    assert git(repo, "rev-parse", "--verify", "task/T-0001") and len(_events(root, "worktree_deleted")) == 1
+    assert len(_events(root, "worktrees_gc")) == 1
 
 
 def test_sweep_commits_mission_worktrees_only(world):

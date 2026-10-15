@@ -948,7 +948,7 @@ def main(argv=None):
         sys.exit(2)
     finally:
         # journal AFTER the command, whether it succeeded or raised: a partial change is still a change
-        if args.cmd in MUTATING:
+        if args.cmd in MUTATING and not (args.cmd == "worktrees" and getattr(args, "dry_run", False)):   # gc --dry-run changes nothing (T-0321)
             try:
                 root = find_root(Path(args.root) if getattr(args, "root", None) else None)
                 refresh(root, quiet=True)             # derived views always follow the records, journal or not

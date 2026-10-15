@@ -27,16 +27,24 @@ Run the mechanical checks (check_done.py, statement_diff.py, the build) in the F
 
 ## Retiring the worktree
 
-Never delete a worktree by hand. Run `scr retire <worktree> --execute`, which
-quarantines the tree instead of deleting it (a move into `<repo>-RETIRED/`), after
-checking it is merged. Full rationale: `docs/worktree-retirement.md`.
+Never delete a worktree by hand (no `rm -rf`, no bare `git worktree remove`). Run
+`scr retire <id> --execute`; it decides by the task's status (T-0321, since 2026-10-10):
+- **merged / closed / rejected** → the tree is deleted: links (`.venv`, a `.lake/packages`
+  junction) unlinked first, every untracked or gitignored file outside `.lake/`, `build/`,
+  `__pycache__/`, `.pytest_cache/` copied to `<repo>-RETIRED/<stamp>-<id>-kept/` and hash-checked,
+  then `git worktree remove --force` + `git worktree prune`; one `worktree_deleted` event.
+- **returned / escalated / omri_queue** → quarantined (moved to `<repo>-RETIRED/<stamp>-<id>/`)
+  without its `.lake/build`.
+The watcher does this itself after a landing and when a task becomes closed/rejected; old trees
+are `scr worktrees gc` (`--dry-run` first). Full rationale: `docs/worktree-retirement.md`.
 
 Route its exit code like any other check:
-- **0** — retired. Note the quarantine path in review.md. Do not delete the branch and do not empty the quarantine; both are Omri's.
-- **2** — the branch is not merged into main, so the merge did not actually land. Verify **main's tree**, not the PR status, before doing anything else.
+- **0** — retired. Note the kept / quarantine path (if any) in review.md. Do not delete the branch and do not empty `<repo>-RETIRED/`; both are Omri's.
+- **2** — the branch is not merged into main, so the merge did not actually land (or a closed tree's HEAD is on no branch). Verify **main's tree**, not the PR status, before doing anything else.
 - **3** — uncommitted changes to tracked files. The Scriber left work behind: `escalated` → `omri_queue`. This is a judgment call, not a mechanical one.
+- **4** — the task is still live (ready … accepted); nothing to retire yet. **5** — the path is not a direct child of the worktree root; stop and look.
 
-Why it never deletes: an unguarded `delete the worktree` step let `quantum-insertion` reach 95 GB across 14 worktrees, 7 of them merged and dead, while one worktree held a mission folder that existed in no commit anywhere. See the doc for the two bugs — a `rm -rf` that accepted `../..`, and a "tidy" `git worktree remove` that emptied the quarantine while its own verification reported OK.
+Why the guards: an unguarded `delete the worktree` step let `quantum-insertion` reach 95 GB across 14 worktrees while one held a mission folder that existed in no commit anywhere; a `rm -rf` once accepted `../..`; and the T-0286 paper sat under the gitignored `sources/`. Why it deletes now: on 2026-10-10 C: hit 0 bytes free with 55 trees × ~600 MB of `.lake/build`.
 
 ## Phase C through loopy (optional, `kind: prove` tasks only)
 
