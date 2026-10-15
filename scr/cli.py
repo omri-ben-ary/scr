@@ -291,7 +291,8 @@ def cmd_dispatch(args):
     limits = store.config("limits")
     g = Graph.build(store.load_all())
     # the slot-holders: the same set as scr.watch.SLOT_STATUSES; `escalated` and `returned` never count (T-0092)
-    running = [t.id for t in g.tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"}]   # never `waiting` (scr/jobs.py)
+    running = [t.id for t in g.tasks.values() if t.status in {"dispatched", "in_progress", "checkpoint", "submitted"}
+               and not str(t.rec.get("title") or "").startswith("hotfix:")]   # never `waiting` (scr/jobs.py); a hotfix record is Omri editing the checkout, not a session (2026-10-15: T-0383 held a slot for 6 h)
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")
     ranked = [r["task"] for r in rows]

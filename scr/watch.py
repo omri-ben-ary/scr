@@ -995,7 +995,8 @@ class Watcher:
         elif self.auto_dispatch and ok:
             cap = int(self.limits.get("concurrency", 3))
             tasks = self.store.load_all()
-            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES)   # escalated / returned never count (T-0092)
+            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES
+                            and not str(t.rec.get("title") or "").startswith("hotfix:"))   # escalated / returned never count (T-0092); a hotfix record is no session
             if n_running < cap:
                 args = ["dispatch", "--quiet"] + (["--allow-statements"] if self.allow_statements else [])
                 out = self.scr("prioritizer", *args)
