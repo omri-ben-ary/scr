@@ -10,6 +10,7 @@ Event kinds:
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -26,6 +27,48 @@ def now_iso() -> str:
 def event_hash(ev: dict) -> str:
     body = {k: v for k, v in ev.items() if k != "h"}
     return H("event", canon(body))
+
+
+class _file_lock:
+    """An exclusive lock on `path` (created if absent), held for the block: msvcrt on Windows, fcntl elsewhere.
+    Waits up to `timeout` s in 50 ms steps, then raises TimeoutError — a stuck holder must never deadlock the
+    watcher silently."""
+
+    def __init__(self, path: Path, timeout: float = 30.0):
+        self.path, self.timeout, self.fh = path, timeout, None
+
+    def __enter__(self):
+        import time
+        self.fh = open(self.path, "a+b")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.monotonic() > deadline:
+                    self.fh.close()
+                    raise TimeoutError(f"events lock busy for {self.timeout:g}s: {self.path}")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+        return False
 
 
 class EventLog:
@@ -50,15 +93,19 @@ class EventLog:
         return (evs[-1]["h"] if evs else ZERO, len(evs))
 
     def append(self, kind: str, **fields: Any) -> dict:
+        """One event, under the log's file lock (T-0333, done 2026-10-15): head() and the write are one critical
+        section, so two processes appending at once — the watcher and a scriber's `scr job submit` forked the
+        chain at seq 7996 (10 Oct) and 10249 (15 Oct) — serialize instead of both continuing from the same prev."""
         if kind not in EVENT_KINDS:
             raise ValueError(f"unknown event kind {kind}")
-        prev, n = self.head()
-        ev = {"seq": n + 1, "ts": fields.pop("ts", None) or now_iso(), "kind": kind, **fields, "prev": prev}
-        ev = {k: v for k, v in ev.items() if v is not None}
-        ev["h"] = event_hash(ev)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(canon(ev) + "\n")
+        with _file_lock(self.path.with_name(self.path.name + ".lock")):
+            prev, n = self.head()
+            ev = {"seq": n + 1, "ts": fields.pop("ts", None) or now_iso(), "kind": kind, **fields, "prev": prev}
+            ev = {k: v for k, v in ev.items() if v is not None}
+            ev["h"] = event_hash(ev)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(canon(ev) + "\n")
         return ev
 
     # ---- verification ---------------------------------------------------

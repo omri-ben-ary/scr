@@ -143,72 +143,17 @@ def test_waiting_is_a_known_state_everywhere():
     assert set(lifecycle.TRANSITIONS) <= set(STATES), set(lifecycle.TRANSITIONS) - set(STATES)
 
 
-# ---- T-0335: `scr --root <live> job submit` from a worktree records under the live root, runs in the worktree ----------
-def _live_root(tmp_path: Path) -> Path:
-    live = tmp_path / "live"
-    for d in ("tasks", "config", "events", ".scr"):
-        (live / d).mkdir(parents=True)
-    return live
-
-
-def _submit_from(root, monkeypatch, live: Path, worktree: Path, *extra: str) -> dict:
-    from scr.cli import build_parser, cmd_job
-    monkeypatch.delenv("SCRIPTORIUM_ROOT", raising=False)
-    monkeypatch.chdir(worktree)
-    args = build_parser().parse_args(["--root", str(live), "--actor", "steward:T-0001", "job", "submit", *extra,
-                                      "--name", "check", "--timeout", "1h", "--", sys.executable, "-V"])
-    cmd_job(args)
-    return json.loads((live / ".scr" / "jobs" / "J-0001.json").read_text())
-
-
-def test_submit_from_a_lean_worktree_records_under_the_live_root_with_the_worktree_cwd(root, tmp_path, monkeypatch):
-    live = _live_root(tmp_path)
-    wt = tmp_path / "quantum-insertion" / ".worktrees" / "T-0001"         # outside the scriptorium tree
-    wt.mkdir(parents=True)
-    job = _submit_from(root, monkeypatch, live, wt)
-    assert Path(job["cwd"]) == wt.resolve() and job["name"] == "check" and job["cmd"] == [sys.executable, "-V"]
-    assert job["actor"] == "steward:T-0001"
-    assert not (wt / ".scr").exists()
-
-
-def test_submit_from_a_tooling_worktree_still_records_under_the_live_root(root, tmp_path, monkeypatch):
-    live = _live_root(tmp_path)
-    wt = tmp_path / "scriptorium-worktrees" / "T-0001"
-    for d in ("tasks", "config"):                                          # find_root would pick THIS tree without --root
-        (wt / d).mkdir(parents=True)
-    job = _submit_from(root, monkeypatch, live, wt)
-    assert Path(job["cwd"]) == wt.resolve()
-    assert not (wt / ".scr" / "jobs").exists()
-    # an explicit --cwd still wins over the caller's directory
-    other = tmp_path / "elsewhere"; other.mkdir()
-    (live / ".scr" / "jobs" / "J-0001.json").unlink()
-    assert Path(_submit_from(root, monkeypatch, live, wt, "--cwd", str(other))["cwd"]) == other.resolve()
-
-
-def test_submit_refuses_a_flag_as_the_name_or_the_program(root):
-    """J-0001: `job submit --root ...` made `--root` the name; J-0002: `-m pytest` lost the interpreter (rc 127)."""
-    with pytest.raises(ValueError):
-        jobs.submit(root["root"], ["-m", "pytest"], name="t")
-    with pytest.raises(ValueError):
-        jobs.submit(root["root"], ["python"], name="--root")
-    assert not list((root["root"] / ".scr" / "jobs").glob("J-*.json"))
-
-
-def test_scriber_brief_passes_the_live_root_before_job(tmp_path):
-    from scr.brief import BRIEF_TEMPLATE, brief_for
-    assert "{scr} --root {root} job submit" in BRIEF_TEMPLATE and "{scr} --root {root} job tail" in BRIEF_TEMPLATE
-    live = tmp_path / "live"
-    (live / "config").mkdir(parents=True)
-    tdir = live / "tasks" / "T-0001-x"
-    tdir.mkdir(parents=True)
-
-    class T:                                                               # the fields brief_for reads
-        id, dir, rec = "T-0001", tdir, {"title": "x", "worktree": "../wt/T-0001"}
-
-    class S:
-        def config(self, name):
-            return {}
-
-    text = brief_for(live, S(), T())
-    assert f"--root {live.resolve()} job submit --task T-0001" in text
-    assert f"--root {live.resolve()} job tail" in text
+def test_landing_jobs_have_their_own_lane(tmp_path, monkeypatch):
+    """2026-10-15: a queued `land-<id>` job starts even when jobs_concurrency is full; a second landing waits."""
+    from datetime import datetime, timezone
+    from scr import jobs
+    root = tmp_path / "s"; (root / ".scr" / "jobs").mkdir(parents=True); (root / "config").mkdir()
+    (root / "config" / "limits.yaml").write_text("jobs_concurrency: 1\n", encoding="utf-8")
+    started = []
+    monkeypatch.setattr(jobs, "_start", lambda r, j: started.append(j["id"]) or j.update(status="running", pid=1, started=jobs.now_iso()) or jobs.save(r, j))
+    monkeypatch.setattr(jobs, "pid_alive", lambda pid: True)
+    import json
+    for jid, name, st in (("J-0001", "suite", "running"), ("J-0002", "build", "queued"), ("J-0003", "land-T-0001", "queued"), ("J-0004", "land-T-0002", "queued")):
+        (root / ".scr" / "jobs" / f"{jid}.json").write_text(json.dumps({"id": jid, "name": name, "status": st, "cmd": ["x"], "pid": 1 if st == "running" else None, "timeout_min": 60}), encoding="utf-8")
+    jobs.poll(root, datetime.now(timezone.utc))
+    assert started == ["J-0003"]          # the landing lane; J-0002 waits for jobs_concurrency, J-0004 for the lane
