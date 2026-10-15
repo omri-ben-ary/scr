@@ -1,7 +1,7 @@
 """Workload-repo operations (quantum-insertion): worktrees, checkpoint commits, landing, sweeping,
 retiring. Python ports of the former hooks/*.ps1 and retire_worktree.sh so they run and are
-tested on any OS. Invariants: nothing is deleted (retire = quarantine by move), never force-push,
-never touch the trusted branch.
+tested on any OS. Invariants: never force-push, never touch the trusted branch, never delete a branch; retire
+deletes only a finished task's worktree, links unlinked and untracked value copied out first (T-0321).
 """
 from __future__ import annotations
 
@@ -881,7 +881,7 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
         nxt = _LAND_NEXT.get(r["reason"], "see the FAILED line above, then `scr land {tid}` again").format(trunk=trunk, br=br, wt=wt, tid=tid)
         r["out"].append(f"{tid}: NOT landed ({r['reason']}) — next: {nxt}")
     else:
-        r["out"].append(f"  next: `scr retire {tid} --execute` quarantines the worktree (the watcher does this itself)")
+        r["out"].append(f"  next: `scr retire {tid} --execute` deletes the worktree once merged (the watcher does this itself)")
     return {**r, "url": None}
 
 
@@ -1073,54 +1073,281 @@ def hygiene_digest(root: Path, rows: list[dict], day: str) -> Path:
     return p
 
 
-# ---- retire (quarantine, never delete) ---------------------------------------------------
+# ---- retire: delete a finished task's worktree, quarantine a live one (T-0321) ----------------
+# 2026-10-10: C: reached 0 bytes free with 55 worktrees x ~600 MB of .lake/build; Omri deleted 13 merged trees by
+# hand. Since T-0321 a worktree whose task is merged / closed / rejected is DELETED (`git worktree remove --force` +
+# `git worktree prune`; the branch and every commit stay); returned / escalated / omri_queue keep the quarantine
+# move into <repo>-RETIRED/, minus .lake/build. The two traps the quarantine guarded against still hold: untracked
+# or ignored files outside REGENERABLE are copied out (sha-256 checked) before anything is deleted, and every link
+# (the .venv link, a shared .lake/packages junction) is unlinked first, never recursed into.
+DELETE_STATUSES = FINISHED_STATUSES
+QUARANTINE_STATUSES = {"returned", "escalated", "omri_queue"}
+REGENERABLE_DIRS = {".lake", "build", "__pycache__", ".pytest_cache"}   # at any depth; plus the top-level .venv link
+KEPT_LISTED = 200                                                       # files named in the event; KEPT.txt has all
+
+
+def _is_link(p: Path) -> bool:
+    """A symlink, or (Windows) any reparse point — a directory junction above all, which is_symlink() misses."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return False
+    import stat as _stat
+    return _stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)   # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _unlink_link(p: Path) -> None:
+    """Remove the link itself, never its target: rmdir removes a junction / directory symlink on Windows, unlink a
+    symlink on POSIX (and a file link anywhere)."""
+    if os.name == "nt" and os.path.isdir(p):
+        os.rmdir(p)
+    else:
+        os.unlink(p)
+
+
+def _scan(top: Path) -> tuple[list[tuple[str, int]], list[str]]:
+    """(files as (relpath, bytes), directory links as relpath) under `top`, walked without following any link."""
+    files: list[tuple[str, int]] = []
+    links: list[str] = []
+    stack = [top]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            p = Path(e.path)
+            rel = p.relative_to(top).as_posix()
+            if _is_link(p) and (os.path.isdir(p) or e.is_dir(follow_symlinks=False)):
+                links.append(rel)
+            elif e.is_dir(follow_symlinks=False):
+                stack.append(p)
+            else:
+                try:
+                    files.append((rel, os.lstat(p).st_size))
+                except OSError:
+                    files.append((rel, 0))
+    return files, links
+
+
+def tree_bytes(top: Path) -> int:
+    """Bytes on disk under `top`, links not followed (what deleting it frees)."""
+    return sum(n for _, n in _scan(top)[0]) if top.is_dir() else 0
+
+
+def _rmtree_nolinks(top: Path) -> None:
+    """Delete a directory tree; every link inside is unlinked, never entered. `top` itself may be a link."""
+    if _is_link(top):
+        _unlink_link(top); return
+    for rel in _scan(top)[1]:
+        _unlink_link(top / rel)
+
+    def _retry(fn, path, _exc):          # a read-only file (git objects, lake oleans) on Windows
+        os.chmod(path, 0o700); fn(path)
+    shutil.rmtree(top, onerror=_retry)
+
+
+def _regenerable(rel: str, links: set[str]) -> bool:
+    parts = rel.split("/")
+    if parts[0] == ".venv" and ".venv" in links:
+        return True
+    return any(p in REGENERABLE_DIRS for p in parts[:-1])
+
+
+def _within(a: Path, b: Path) -> bool:
+    return a == b or b in a.parents
+
+
+def _target_problem(root: Path, wl: Workload, wt: Path) -> str | None:
+    """Why `wt` must not be deleted or moved: it has to be a direct child of the workload's worktree root, and neither
+    the repo, the scriptorium, the worktree root, nor anything inside <repo>-RETIRED/."""
+    p, base = wt.resolve(), wl.wt_root.resolve()
+    retired = (wl.repo.parent / f"{wl.repo.name}-RETIRED").resolve()
+    if p.parent != base:
+        return f"{wt} resolves to {p}, outside the worktree root {base}"
+    if _within(p, retired) or _within(retired, p):
+        return f"{p} is (or holds) the quarantine root {retired}"
+    for other, what in ((wl.repo.resolve(), "the repo"), (root.resolve(), "the scriptorium"), (base, "the worktree root")):
+        if _within(other, p):
+            return f"{p} is (or holds) {what} {other}"
+    return None
+
+
+def _sha256(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def retire(root: Path, name: str, execute: bool = False, wl_name: str | None = None) -> dict:
-    if wl_name is None:                 # a task's worktree lives under ITS workload's root
-        _st = Store(root)
-        if name in _st.load_all():
-            wl_name = _st.get(name).rec.get("workload")
+    """Dispose of one worktree by its task's status (T-0321): merged / closed / rejected -> delete; returned /
+    escalated / omri_queue -> quarantine (a move into <repo>-RETIRED/, .lake/build dropped); a non-task worktree
+    (a mission) -> quarantine once merged, as before; any other status -> refused (code 4, the work is live).
+    Codes: 0 done, 1 verification failed, 2 not merged (or HEAD on no ref), 3 dirty tracked files, 4 live task,
+    5 unsafe target. Never touches a branch."""
+    status = None
+    _st = Store(root)
+    if name in _st.load_all():
+        rec = _st.get(name).rec
+        status = rec.get("status")
+        if wl_name is None:             # a task's worktree lives under ITS workload's root
+            wl_name = rec.get("workload")
     wl = workload(root, None, wl_name)
     if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", "..") or ".." in name or name.startswith("-"):
         raise RepoError(f"illegal worktree name: {name}")
     wt = wl.wt_root / name
-    if not wt.is_dir() or wt.is_symlink():
+    if not wt.is_dir() or _is_link(wt):
         raise RepoError(f"no such worktree (or it is a link): {wt}")
-    if wt.resolve().parent != wl.wt_root.resolve():
-        raise RepoError(f"refusing: {name} resolves outside {wl.wt_root}")
+    problem = _target_problem(root, wl, wt)
+    if problem:
+        return {"ok": False, "code": 5, "out": [f"REFUSING: {problem}"]}
+    mode = "delete" if status in DELETE_STATUSES else "quarantine" if status in QUARANTINE_STATUSES or status is None else None
     g, mg = Git(wt), Git(wl.repo)
     br = g.branch()
+    out = [f"=== retire {name} (branch {br}, task {status or '-'}) [{'execute' if execute else 'dry-run'}]"]
+    if mode is None:
+        return {"ok": False, "code": 4, "out": out + [f"REFUSING: task {name} is {status}; its worktree is live work"]}
     # T-0188: merged means merged into origin/<main> (fetched first) for a workload with its own checkout — its
     # local main can sit far behind (quantum-insertion's master, 53 commits on 2026-09-24, refused merged T-0115
     # as 52 ahead); the scriptorium's own workload keeps its checkout trunk (branch_base). A failed fetch
     # (offline) measures against the last fetched origin ref.
-    if wl.repo != root.resolve():
-        mg.fetch()
-    base = branch_base(root, wl, mg)
-    out = [f"=== retire {name} (branch {br}, main {base}) [{'execute' if execute else 'dry-run'}]"]
-    if not mg.is_ancestor(br, base):
-        ahead = mg.run("rev-list", "--count", f"{base}..{br}").out
-        return {"ok": False, "code": 2, "out": out + [f"REFUSING: {br} is {ahead} commit(s) ahead of {base} — land it first"]}
+    if status in (None, "merged"):
+        if wl.repo != root.resolve():
+            mg.fetch()
+        base = branch_base(root, wl, mg)
+        out[0] = out[0].replace(f"task {status or '-'})", f"task {status or '-'}, main {base})")
+        if not mg.is_ancestor(br, base):
+            ahead = mg.run("rev-list", "--count", f"{base}..{br}").out
+            return {"ok": False, "code": 2, "out": out + [f"REFUSING: {br} is {ahead} commit(s) ahead of {base} — land it first"]}
+    elif mode == "delete" and not mg.run("for-each-ref", "--count=1", "--contains", g.head(), "refs/heads/", "refs/remotes/").out.strip():
+        return {"ok": False, "code": 2, "out": out + [f"REFUSING: HEAD {g.head()[:10]} is on no branch; deleting the worktree would orphan it"]}
     if g.run("diff", "--stat", "HEAD").out.strip():
         return {"ok": False, "code": 3, "out": out + ["REFUSING: uncommitted changes to tracked files (checkpoint commit first)"]}
     stamp = time.strftime("%Y%m%d-%H%M%S")
     retired = wl.repo.parent / f"{wl.repo.name}-RETIRED"
-    dest = retired / f"{stamp}-{name}"
-    untracked = [l for l in g.run("ls-files", "--others", "--exclude-standard").out.splitlines() if l.strip()]
-    out.append(f"  {len(untracked)} untracked file(s) travel with the tree; quarantine -> {dest / 'worktree'}")
+    files, dlinks = _scan(wt)
+    links = set(dlinks)
+    if mode == "quarantine":
+        return _quarantine(root, wl, name, wt, retired / f"{stamp}-{name}", files, links, execute, br, out)
+    tracked = set(g.run("ls-files", "-z").out.split("\0"))
+    kept = sorted(rel for rel, _ in files if rel != ".git" and rel not in tracked and not _regenerable(rel, links))
+    freed = sum(n for _, n in files)
+    kdir = retired / f"{stamp}-{name}-kept"
+    out.append(f"  {len(kept)} untracked/ignored file(s) outside the regenerable set" + (f" kept -> {kdir}" if kept else "")
+               + f"; {len(links)} link(s) unlinked first ({', '.join(sorted(links)) or 'none'})")
+    out.append(f"  delete {wt} ({freed} bytes): git worktree remove --force + prune; branch {br} stays")
     if not execute:
-        return {"ok": True, "code": 0, "out": out + ["DRY RUN — nothing moved"]}
+        return {"ok": True, "code": 0, "out": out + ["DRY RUN — nothing deleted"], "mode": mode, "bytes": freed, "kept": kept}
+    for rel in kept:                     # the value guard: copied and checked BEFORE anything is removed
+        src, dst = wt / rel, kdir / rel
+        if _is_link(src) and not src.exists():      # a dangling file link holds nothing
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        if _sha256(src) != _sha256(dst):
+            return {"ok": False, "code": 1, "out": out + [f"FAIL: kept copy of {rel} does not match; nothing deleted"]}
+    if kept:
+        (kdir / "KEPT.txt").write_text("\n".join(kept) + "\n", encoding="utf-8")
+    for rel in sorted(links, key=len, reverse=True):
+        _unlink_link(wt / rel)
+    if _scan(wt)[1]:
+        return {"ok": False, "code": 1, "out": out + ["FAIL: a link survived the unlink pass; nothing deleted"]}
+    r = mg.run("worktree", "remove", "--force", str(wt))
+    if wt.exists():                      # `Permission denied` on this Windows setup: finish link-safely ourselves
+        out.append(f"  git worktree remove left the tree ({r.out[-160:]}); removing it link-safely")
+        _rmtree_nolinks(wt)
+    mg.run("worktree", "prune")
+    listed = [l[9:] for l in mg.run("worktree", "list", "--porcelain").out.splitlines() if l.startswith("worktree ")]
+    if wt.exists() or any(Path(l).resolve() == wt.resolve() for l in listed):
+        return {"ok": False, "code": 1, "out": out + [f"FAIL: {wt} still exists or is still listed by git worktree list"]}
+    if br != "HEAD" and not mg.ok("rev-parse", "--verify", "--quiet", f"refs/heads/{br}"):
+        out.append(f"  note: no local branch {br} (it may live only on origin)")
+    out.append(f"  OK: deleted {wt}, {freed} bytes freed; branch {br} intact" + (f"; {len(kept)} file(s) kept in {kdir}" if kept else ""))
+    _log(root).append("system", name="worktree_deleted", actor="steward-watch", task=name if status else None,
+                      note=f"{name} ({status}): deleted {wt}, {freed} bytes freed" + (f"; {len(kept)} file(s) kept -> {kdir}" if kept else ""),
+                      data={"path": str(wt), "bytes": freed, "kept_dir": str(kdir) if kept else None,
+                            "kept": kept[:KEPT_LISTED], "kept_count": len(kept), "links": sorted(links)})
+    return {"ok": True, "code": 0, "out": out, "mode": mode, "bytes": freed, "kept": kept}
+
+
+def _quarantine(root: Path, wl: Workload, name: str, wt: Path, dest: Path, files: list, links: set, execute: bool,
+                br: str, out: list[str]) -> dict:
+    """The move into <repo>-RETIRED/<stamp>-<name>/worktree, .lake/build removed first (regenerable, ~600 MB)."""
+    mg = Git(wl.repo)
+    build = wt / ".lake" / "build"
+    keep = [rel for rel, _ in files if not (rel + "/").startswith(".lake/build/")]
+    out.append(f"  {len(keep)} file(s) travel with the tree, .lake/build {'dropped' if build.exists() else 'absent'}; quarantine -> {dest / 'worktree'}")
+    if not execute:
+        return {"ok": True, "code": 0, "out": out + ["DRY RUN — nothing moved"], "mode": "quarantine"}
+    if build.exists() or _is_link(build):
+        _rmtree_nolinks(build)
     dest.mkdir(parents=True, exist_ok=True)
     shutil.move(str(wt), str(dest / "worktree"))
     mg.run("worktree", "prune")
     meta = wl.repo / ".git" / "worktrees" / name
     if meta.exists():
         shutil.move(str(meta), str(dest / "git-worktree-meta"))
-    files = sum(1 for _ in (dest / "worktree").rglob("*") if _.is_file())
-    if files == 0:
-        return {"ok": False, "code": 1, "out": out + ["FAIL: quarantine is EMPTY — stop and investigate"]}
-    out.append(f"  OK: {files} file(s) readable in quarantine; branch {br} intact at {mg.run('rev-parse', '--short', br).out}")
+    n = len(_scan(dest / "worktree")[0])
+    if n == 0 or n < len(keep):          # verify recoverability, not disappearance
+        return {"ok": False, "code": 1, "out": out + [f"FAIL: quarantine holds {n} of {len(keep)} file(s) — stop and investigate"]}
+    out.append(f"  OK: {n} file(s) readable in quarantine; branch {br} intact at {mg.run('rev-parse', '--short', br).out}")
     _log(root).append("system", name="worktree_retired", actor="steward-watch", note=f"{name} -> {dest}")
-    return {"ok": True, "code": 0, "out": out}
+    return {"ok": True, "code": 0, "out": out, "mode": "quarantine"}
+
+
+def worktrees_gc(root: Path, dry_run: bool = True, wl_name: str | None = None) -> list[dict]:
+    """`scr worktrees gc` (T-0321): every worktree of every workload (or one) with its task status and size; without
+    dry_run, retire() each whose task is merged / closed / rejected (delete, value guard and all) and drop the
+    .lake/build of every tree already under <repo>-RETIRED/. Nothing else in the quarantine is touched."""
+    store = Store(root)
+    tasks = store.load_all()
+    names = [wl_name] if wl_name else list(store.config("workloads") or {})
+    rows: list[dict] = []
+    seen: set[Path] = set()
+    for wname in names:
+        wl = workload(root, store, wname)
+        if wl.wt_root.is_dir():
+            for d in sorted(wl.wt_root.iterdir()):
+                if not d.is_dir():
+                    continue
+                t = tasks.get(d.name)
+                status = t.status if t else None
+                link = _is_link(d)
+                row = {"workload": wl.name, "worktree": d.name, "path": str(d), "status": status,
+                       "bytes": 0 if link else tree_bytes(d), "action": "keep" if link or status not in DELETE_STATUSES else "delete",
+                       "ok": True, "out": []}
+                if not dry_run and row["action"] == "delete":
+                    try:
+                        r = retire(root, d.name, execute=True, wl_name=wl.name)
+                    except RepoError as e:
+                        r = {"ok": False, "code": "error", "out": [str(e)]}
+                    row["ok"], row["out"] = r["ok"], r["out"]
+                    row["action"] = "deleted" if r["ok"] else f"refused ({r['code']})"
+                rows.append(row)
+        retired = (wl.repo.parent / f"{wl.repo.name}-RETIRED").resolve()
+        if retired in seen or not retired.is_dir():
+            continue
+        seen.add(retired)
+        for q in sorted(retired.iterdir()):
+            for b in (q / "worktree" / ".lake" / "build", q / ".lake" / "build"):
+                if not (b.exists() or _is_link(b)):
+                    continue
+                row = {"workload": wl.name, "worktree": f"{retired.name}/{q.name}", "path": str(b), "status": "retired",
+                       "bytes": 0 if _is_link(b) else tree_bytes(b), "action": "drop .lake/build", "ok": True, "out": []}
+                if not dry_run:
+                    _rmtree_nolinks(b)
+                    row["action"] = "dropped .lake/build"
+                rows.append(row)
+    if not dry_run:
+        freed = sum(r["bytes"] for r in rows if r["action"] in ("deleted", "dropped .lake/build"))
+        _log(root).append("system", name="worktrees_gc", actor="steward-watch",
+                          note=f"{sum(r['action'] == 'deleted' for r in rows)} worktree(s) deleted, "
+                               f"{sum(r['action'] == 'dropped .lake/build' for r in rows)} quarantined .lake/build dropped, {freed} bytes freed")
+    return rows
 
 
 # ---- park --------------------------------------------------------------------------------
