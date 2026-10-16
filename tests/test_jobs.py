@@ -241,3 +241,29 @@ def test_event_appends_from_many_processes_never_fork(tmp_path):
     procs = [subprocess.Popen([sys.executable, "-c", code, str(log), f"p{i}"], cwd=str(Path(__file__).resolve().parent.parent)) for i in range(8)]
     assert all(p.wait() == 0 for p in procs)
     assert EventLog(log).verify_chain() == [] and len(EventLog(log).read()) == 200
+
+
+def test_the_watchers_landing_job_runs_in_the_landing_lane(tmp_path, monkeypatch):
+    """T-0391: the job land_via_job submits is named with jobs.LAND_PREFIX (one constant, not a watcher copy), so a
+    full jobs_concurrency does not hold it: poll() starts it in the landing lane (the J-0112 stall, T-0383)."""
+    from types import SimpleNamespace
+    root = tmp_path / "s"; (root / ".scr" / "jobs").mkdir(parents=True); (root / "config").mkdir()
+    (root / "config" / "limits.yaml").write_text("jobs_concurrency: 1\n", encoding="utf-8")
+    wt = tmp_path / "wt"; wt.mkdir()
+    started = []
+    monkeypatch.setattr(jobs, "_start", lambda r, j: started.append(j["id"]) or j.update(status="running", pid=1, started=jobs.now_iso()) or jobs.save(r, j))
+    monkeypatch.setattr(jobs, "pid_alive", lambda pid: True)
+    (root / ".scr" / "jobs" / "J-0001.json").write_text(json.dumps({"id": "J-0001", "name": "suite", "status": "running", "cmd": ["x"], "pid": 1, "timeout_min": 60}), encoding="utf-8")
+    monkeypatch.setattr(watch_mod, "is_scriptorium_task", lambda r, s, t: False)
+    monkeypatch.setattr(watch_mod, "workload_for", lambda r, s, t: None)
+    monkeypatch.setattr(watch_mod, "task_worktree", lambda wl, t: wt)
+    monkeypatch.setattr(watch_mod, "scr_exe", lambda r: ["scr"])
+    w = object.__new__(watch_mod.Watcher)
+    w.root, w.store, w.flags, w.quiet = root, None, set(), True
+    w.log = lambda line: None
+    assert w.land_via_job(SimpleNamespace(id="T-0001", rec={})) == "submitted"
+    [job] = [j for j in jobs.list_jobs(root) if j["id"] != "J-0001"]
+    assert job["name"] == "land-T-0001" and job["name"].startswith(jobs.LAND_PREFIX)
+    assert job["status"] == "queued" and started == []      # jobs_concurrency 1 is full at submit time
+    jobs.poll(root, datetime.now(timezone.utc))
+    assert started == [job["id"]]                           # the landing lane starts it anyway

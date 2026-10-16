@@ -951,7 +951,7 @@ class Watcher:
             # to freeze dispatch, reviews and the whole watcher for 2 h (T-0058 on 2026-10-14 15:51). First the
             # finished landing jobs are applied (the task may already be `merged`: `scr land` records that itself),
             # then every accepted task without a running landing gets one.
-            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)
+            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(jobs.LAND_PREFIX)
                         and j.get("status") in jobs.FINISHED and not j.get("applied") and j.get("task")]:
                 t = tasks.get(job["task"])
                 if t is None:
@@ -1499,10 +1499,8 @@ class Watcher:
         decided.append({"task": t.id, "decision": verdict})
         return True
 
-    LAND_JOB_PREFIX = "land-"
-
     def land_jobs(self, tid: str) -> list[dict]:
-        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)]
+        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(jobs.LAND_PREFIX)]
 
     def land_via_job(self, t) -> str | None:
         """The landing of an accepted task as a detached job: `scr --actor steward:<id> land <id> --merge` (ops.land_any:
@@ -1543,7 +1541,7 @@ class Watcher:
         minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
         cmd = scr_exe(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
         try:
-            job = jobs.submit(self.root, cmd, task=t.id, name=f"{self.LAND_JOB_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
+            job = jobs.submit(self.root, cmd, task=t.id, name=f"{jobs.LAND_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
         except Exception as e:  # noqa: BLE001
             self.log(f"{t.id} landing job not submitted: {e}")
             self.unflag(f"land:{t.id}")
@@ -1879,7 +1877,7 @@ class Watcher:
             job["notified"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             jobs.save(self.root, job)
             self.log(f"job {note}")
-            if job["status"] != "done" and not str(job.get("name") or "").startswith(self.LAND_JOB_PREFIX) and self.job_needs_omri(job):
+            if job["status"] != "done" and not str(job.get("name") or "").startswith(jobs.LAND_PREFIX) and self.job_needs_omri(job):
                 self.need(f"job:{job['id']}", f"job {job['id']} ({job.get('name')}) {job['status']}" + (f": {job['note']}" if job.get("note") else "")
                           + f" — log: scr job tail {job['id']}", job.get("task"))
         # resume: a waiting task whose jobs are all finished gets its session back, with the results as the prompt
