@@ -981,6 +981,9 @@ class Watcher:
                 for line in intake(self.root):
                     self.log(f"  intake: {line}")
 
+        for f in getattr(self.store, "broken", []):
+            self.need(f"broken_record:{Path(f).parent.name[:6]}", f"{Path(f).parent.name[:6]}: task.yaml is empty or unparsable ({f}) — restore it: "
+                      f"git show HEAD:tasks/{Path(f).parent.name}/task.yaml > that file (the watcher skips it meanwhile)")
         if ok and (self.auto_dispatch or self.auto_review or self.auto_land):
             self.log_frozen(self.store.load_all())
         pause = self.credits_paused(now)
