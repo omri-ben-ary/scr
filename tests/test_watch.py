@@ -2406,23 +2406,66 @@ def test_watch_retire_refused_stands_while_the_worktree_does(world):
         assert [n["key"] for n in w.need_items] == ["retire_refused:T-0001"] and "(dirty)" in w.needs[0]
 
 
-def test_ui_state_carries_watch_cards_and_nothing_else_changes(world):
-    """DoD: ui.state() returns the watcher-need cards in `needs`; the rest of its JSON is unchanged field for field."""
+# Card types whose cards carry no `name`: their kind is the type itself (one chore, one decision, one HELP line, the
+# open hotfix). `name` is the sub-kind of a system alarm, a watcher need or an escalated (gate) card (T-0341).
+NAMELESS_CARD_TYPES = {"chore", "decision", "help", "hotfix"}
+
+
+def assert_cards_named(cards: list[dict]) -> None:
+    """Every needs card has a `name`, except the documented NAMELESS_CARD_TYPES — a clear failure, not a KeyError."""
+    assert set(ui_mod.CARD_ORDER) >= NAMELESS_CARD_TYPES, "a nameless card type is no longer a card type"
+    bad = [c for c in cards if c["type"] not in NAMELESS_CARD_TYPES and not c.get("name")]
+    assert not bad, f"needs cards without a `name` (types not in NAMELESS_CARD_TYPES): {bad}"
+
+
+def test_ui_state_carries_watch_cards_and_nothing_else_changes(world, monkeypatch):
+    """DoD: ui.state() returns the watcher-need cards in `needs`; the rest of its JSON is unchanged field for field.
+    T-0341: state() also reads two things outside the fixture root, pinned here. The chore cards come from a
+    process-wide cache (ui._CHORE_CACHE, 120 s) that earlier tests fill from their own roots: on Windows one
+    state() call takes up to a minute (a PowerShell process scan per call), so the cache expired between the two
+    calls and `after` gained this root's chore cards, which carry no `name` (KeyError in J-0009/J-0015).
+    `watcher_running` scans the machine's processes, so a live watcher starting or stopping flipped it (J-0014)."""
     root, _, _ = world
+    monkeypatch.setattr("scr.run.pids_matching", lambda pattern: [])
     (root / ".gitignore").write_text(".scr/\n", encoding="utf-8")      # as in the live root: the file is never a journal change
     sgit(root, "add", ".gitignore"); sgit(root, "commit", "-q", "-m", "ignore .scr")
+    ui_mod.invalidate_chores()                                          # this root's chores, computed now, not a cached earlier root's
     before = ui_mod.state(root)
     w = Watcher(root, quiet=True)
     w.need("decision_unapplied:T-0001", "T-0001 decision accepted from review.md could not be applied — see log", "T-0001")
     w.publish_needs(datetime.now(timezone.utc))
+    ui_mod.invalidate_chores()                                          # computed again, however long the first call took
     after = ui_mod.state(root)
+    assert any(c["type"] == "chore" for c in after["needs"])           # the nameless type really is on the page
+    assert_cards_named(before["needs"] + after["needs"])
     assert set(after) == set(before)
     for k in before:
         if k not in {"generated", "needs"}:
             assert after[k] == before[k], k
     added = [c for c in after["needs"] if c not in before["needs"]]
-    assert [(c["type"], c["id"], c["name"]) for c in added] == [("watch", "T-0001", "decision_unapplied")]
+    assert [(c["type"], c["id"], c.get("name")) for c in added] == [("watch", "T-0001", "decision_unapplied")], added
     assert [c for c in after["needs"] if c["type"] != "watch"] == before["needs"]
+
+
+def test_every_needs_card_has_a_name_or_is_a_documented_nameless_type(world):
+    """T-0341: one card of each kind the fixture can raise cheaply (decision, help, system alarm, watch need, chore);
+    every card has a `name` unless its type is in NAMELESS_CARD_TYPES, and a nameless card fails with a message."""
+    from scr.events import EventLog
+    root, _, _ = world
+    scr(root, "--quiet", "task", "new", "Pick a way", "--id", "T-0002", "--queue", "omri", "--kind", "decide", "--origin", "omri", journal_on=False)
+    scr(root, "--quiet", "task", "set", "T-0001", "dispatched", journal_on=False)
+    (Store(root).get("T-0001").dir / "log.md").write_text("HELP: which lemma?\n", encoding="utf-8")
+    # one card per task and quiet alarms raise none (2026-10-14): the alarm and the watch need go on tasks with no other card
+    EventLog(root / "events" / "events.jsonl").append("system", name="verify_failed", task="T-0003", actor="steward", note="verify")
+    w = Watcher(root, quiet=True)
+    w.need("decision_unapplied:T-0004", "could not be applied", "T-0004")
+    w.publish_needs(datetime.now(timezone.utc))
+    ui_mod.invalidate_chores()
+    cards = ui_mod.needs_cards(root)
+    assert {"decision", "help", "system", "watch", "chore"} <= {c["type"] for c in cards}, cards
+    assert_cards_named(cards)
+    with pytest.raises(AssertionError, match="without a `name`"):
+        assert_cards_named(cards + [{"type": "system", "id": "T-0001", "key": "events:x"}])
 
 
 def test_every_watch_need_goes_through_the_keyed_helper():

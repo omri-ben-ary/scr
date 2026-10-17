@@ -311,41 +311,51 @@ def test_watch_tick_checkpoints_and_detects_submission(world):
 
 
 # ---- UI server + self-reload --------------------------------------------------------------------------
-def test_ui_http_and_reload(world):
+def test_ui_http_and_reload(world, tmp_path):
+    """T-0341: every wait is on a condition with a deadline sized for a loaded Windows full-suite run, where one
+    /api/state takes tens of seconds (a PowerShell process scan per call). The child writes to a file, not a pipe:
+    reading an undrained pipe of a child that still serves blocked the old test forever."""
     import http.client, socket
     root, _, _ = world
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
     env = {**os.environ, "PYTHONPATH": str(REPO)}
     env.pop("SCR_NO_JOURNAL", None)
-    p = subprocess.Popen([sys.executable, "-m", "scr", "--root", str(root), "ui", "--port", str(port), "--no-browser", "--child"], cwd=root, env=env,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    out = tmp_path / "ui-child.log"
+    with out.open("w", encoding="utf-8") as f:
+        p = subprocess.Popen([sys.executable, "-m", "scr", "--root", str(root), "ui", "--port", str(port), "--no-browser", "--child"], cwd=root, env=env,
+                             stdout=f, stderr=subprocess.STDOUT)
+
+    def child_out() -> str:
+        return out.read_text(encoding="utf-8", errors="replace")
+
+    def get(path: str):
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120); c.request("GET", path); return json.loads(c.getresponse().read())
+
     try:
-        for _ in range(50):
-            time.sleep(0.2)
+        deadline = time.monotonic() + 120
+        while True:                                         # until the server answers (or the child died)
             try:
-                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5); c.request("GET", "/api/state"); r = c.getresponse(); body = json.loads(r.read()); break
-            except (ConnectionRefusedError, OSError):
-                continue
-        else:
-            raise AssertionError("server did not start: " + (p.stdout.read() if p.stdout else ""))
+                body = get("/api/state"); break
+            except ConnectionRefusedError:
+                assert p.poll() is None, "server exited: " + child_out()
+                assert time.monotonic() < deadline, "server did not start: " + child_out()
+                time.sleep(0.2)
         assert body["verify_ok"] and any(n["type"] == "chore" for n in body["needs"])
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
         c.request("POST", "/api/run", json.dumps({"kind": "inbox", "text": "from http"}), {"Content-Type": "application/json"})
         job = json.loads(c.getresponse().read()); assert job["state"] == "running"
-        for _ in range(100):
+        deadline = time.monotonic() + 120
+        while (jobs := get("/api/jobs")) and jobs[0]["state"] == "running" and time.monotonic() < deadline:
             time.sleep(0.1)
-            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5); c.request("GET", "/api/jobs"); jobs = json.loads(c.getresponse().read())
-            if jobs and jobs[0]["state"] != "running":
-                break
         assert jobs[0]["state"] == "done", jobs[0]
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5); c.request("GET", "/"); assert b"Scriptorium" in c.getresponse().read()
-        # touch the code: the child exits with the reload code within a few seconds
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120); c.request("GET", "/"); assert b"Scriptorium" in c.getresponse().read()
+        # touch the code: the child exits with the reload code once its 2 s code watcher sees it and the server closes
         ui_py = REPO / "scr" / "ui.py"; os.utime(ui_py, None)
-        rc = p.wait(timeout=15)
-        assert rc == 3
+        rc = p.wait(timeout=120)
+        assert rc == 3, child_out()
     finally:
         if p.poll() is None:
-            p.kill()
+            p.kill(); p.wait(timeout=30)
 
 
 # ---- main branch + discuss sessions ---------------------------------------------------------------
