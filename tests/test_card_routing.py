@@ -89,3 +89,38 @@ def test_additions_only_gate1_is_accepted_by_the_watcher(world):
     other = (root / "templates" / "review.md").read_text(encoding="utf-8").replace(
         "accepted | returned (feedback below) | escalated (Gate N, reason)", "escalated (Gate 1, 3 CHANGED statements need approval)")
     assert not additions_only_gate1(other)
+
+
+def test_additions_only_gate1_rejects_negated_prose():
+    """T-0367 review: a Decision line explaining why the diff is NOT additions-only, or that checks do not pass, never qualifies."""
+    from scr.review import additions_only_gate1
+    tpl = (Path(__file__).resolve().parent.parent / "templates" / "review.md").read_text(encoding="utf-8")
+    mk = lambda line: tpl.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", line)
+    assert additions_only_gate1(mk("escalated (Gate 1: 2 ADDED, 0 MODIFIED, 0 REMOVED; mechanical checks pass)"))
+    assert additions_only_gate1(mk("escalated (Gate 1: 4 Gate-1-approved decls, PROOF-ONLY vs d256396; recommend --force-accept and land)"))
+    assert not additions_only_gate1(mk("escalated (Gate 1: NOT additions-only - 1 MODIFIED; all mechanical checks pass)"))
+    assert not additions_only_gate1(mk("escalated (Gate 1: additions only; not all checks pass)"))
+    assert not additions_only_gate1(mk("escalated (Gate 1: additions only; check_done FAIL)"))
+    assert not additions_only_gate1(mk("escalated (Gate 2: additions only; checks pass)"))
+
+
+def test_broken_record_is_skipped_not_fatal(world):
+    """2026-10-16: an empty task.yaml (T-0355) crashed every tick for 16 h; now load_all skips it and names it."""
+    root, _, _ = world
+    scr(root, "--quiet", "task", "new", "Other", "--id", "T-0002", "--workload", "quantum-insertion", "--files", "QuantumInsertion/B.lean", "--origin", "omri")
+    d = Store(root).get("T-0002").dir
+    (d / "task.yaml").write_text("", encoding="utf-8")
+    st = Store(root)
+    tasks = st.load_all()
+    assert "T-0001" in tasks and "T-0002" not in tasks and st.broken and "T-0002" in st.broken[0]
+    from scr.watch import Watcher
+    res = Watcher(root, quiet=True).tick()
+    assert any("T-0002: task.yaml is empty" in n for n in res["needs"]), res["needs"]
+
+
+def test_task_save_is_atomic(world):
+    root, _, _ = world
+    t = Store(root).get("T-0001")
+    t.rec["title"] = "renamed"
+    t.save()
+    assert not (t.dir / "task.yaml.tmp").exists() and Store(root).get("T-0001").rec["title"] == "renamed"

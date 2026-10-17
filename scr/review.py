@@ -74,8 +74,9 @@ def _verdict(line: str, rx: re.Pattern) -> str | None:
     return None if others else m.group(1)
 
 
-ADDITIONS_ONLY_RE = re.compile(r"(ADDED[- ]only|additions[- ]only|\b0 (MODIFIED|CHANGED)\b.{0,40}\b0 REMOVED\b|\b0 REMOVED\b.{0,40}\b0 (MODIFIED|CHANGED)\b)", re.I)
-CHECKS_PASS_RE = re.compile(r"(all mechanical checks pass|mechanical checks pass|every mechanical check passes|all (checks|mechanical) (pass|PASS))", re.I)
+NEGATION_RE = re.compile(r"\b(not|no|never|fail\w*|refus\w*|reject\w*|missing|unapproved|unresolved)\b", re.I)
+ADDITIONS_ONLY_RE = re.compile(r"(additions?[- ]only|added[- ]only|proof[- ]only|\b0 (modified|changed)\b[^;.]{0,60}\b0 removed\b|\b0 removed\b[^;.]{0,60}\b0 (modified|changed)\b)", re.I)
+CHECKS_PASS_RE = re.compile(r"(checks? (all )?pass|all (mechanical )?(checks )?pass|recommend(s|ed)?:? (--)?force-accept)", re.I)
 
 
 def decision_line(review_md: str) -> str:
@@ -98,13 +99,17 @@ def decision_line(review_md: str) -> str:
 
 def additions_only_gate1(review_md: str) -> bool:
     """2026-10-14 (card-routing rule 2): a Steward escalation whose Decision line says the statement diff is
-    additions-only and every mechanical check passes is accepted by the watcher, not by Omri: adding frozen,
-    approved declarations is not a statement change. All three signals must be on the Decision line."""
+    additions-only (or proof-only against the approved freeze) and the checks pass / it recommends force-accept
+    is accepted by the watcher, not by Omri: adding frozen, approved declarations is not a statement change.
+    Any negation or failure word on the Decision line ("NOT additions-only", "not all checks pass", "FAIL",
+    "unapproved") disqualifies it — the T-0367 review's probe. All signals must be on the Decision line itself."""
     verdict, _ = read_decision(review_md)
     if verdict != "escalated":
         return False
     line = decision_line(review_md)
-    return bool(ADDITIONS_ONLY_RE.search(line) and CHECKS_PASS_RE.search(line) and re.search(r"gate\s*1", line, re.I))
+    if not line or NEGATION_RE.search(line):
+        return False
+    return bool(re.search(r"gate[- ]?1", line, re.I) and ADDITIONS_ONLY_RE.search(line) and CHECKS_PASS_RE.search(line))
 
 
 def read_decision(review_md: str) -> tuple[str | None, str | None]:

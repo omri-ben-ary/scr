@@ -994,7 +994,7 @@ class Watcher:
             # to freeze dispatch, reviews and the whole watcher for 2 h (T-0058 on 2026-10-14 15:51). First the
             # finished landing jobs are applied (the task may already be `merged`: `scr land` records that itself),
             # then every accepted task without a running landing gets one.
-            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)
+            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(jobs.LAND_PREFIX)
                         and j.get("status") in jobs.FINISHED and not j.get("applied") and j.get("task")]:
                 t = tasks.get(job["task"])
                 if t is None:
@@ -1024,6 +1024,9 @@ class Watcher:
                 for line in intake(self.root):
                     self.log(f"  intake: {line}")
 
+        for f in getattr(self.store, "broken", []):
+            self.need(f"broken_record:{Path(f).parent.name[:6]}", f"{Path(f).parent.name[:6]}: task.yaml is empty or unparsable ({f}) — restore it: "
+                      f"git show HEAD:tasks/{Path(f).parent.name}/task.yaml > that file (the watcher skips it meanwhile)")
         if ok and (self.auto_dispatch or self.auto_review or self.auto_land):
             self.log_frozen(self.store.load_all())
         pause = self.credits_paused(now)
@@ -1038,7 +1041,8 @@ class Watcher:
         elif self.auto_dispatch and ok:
             cap = int(self.limits.get("concurrency", 3))
             tasks = self.store.load_all()
-            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES)   # escalated / returned never count (T-0092)
+            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES
+                            and not str(t.rec.get("title") or "").startswith("hotfix:"))   # escalated / returned never count (T-0092); a hotfix record is no session
             if n_running < cap:
                 args = ["dispatch", "--quiet"] + (["--allow-statements"] if self.allow_statements else [])
                 out = self.scr("prioritizer", *args)
@@ -1538,10 +1542,8 @@ class Watcher:
         decided.append({"task": t.id, "decision": verdict})
         return True
 
-    LAND_JOB_PREFIX = "land-"
-
     def land_jobs(self, tid: str) -> list[dict]:
-        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)]
+        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(jobs.LAND_PREFIX)]
 
     def land_via_job(self, t) -> str | None:
         """The landing of an accepted task as a detached job: `scr --actor steward:<id> land <id> --merge` (ops.land_any:
@@ -1582,7 +1584,7 @@ class Watcher:
         minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
         cmd = scr_exe(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
         try:
-            job = jobs.submit(self.root, cmd, task=t.id, name=f"{self.LAND_JOB_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
+            job = jobs.submit(self.root, cmd, task=t.id, name=f"{jobs.LAND_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
         except Exception as e:  # noqa: BLE001
             self.log(f"{t.id} landing job not submitted: {e}")
             self.unflag(f"land:{t.id}")
@@ -1918,7 +1920,7 @@ class Watcher:
             job["notified"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             jobs.save(self.root, job)
             self.log(f"job {note}")
-            if job["status"] != "done" and not str(job.get("name") or "").startswith(self.LAND_JOB_PREFIX) and self.job_needs_omri(job):
+            if job["status"] != "done" and not str(job.get("name") or "").startswith(jobs.LAND_PREFIX) and self.job_needs_omri(job):
                 self.need(f"job:{job['id']}", f"job {job['id']} ({job.get('name')}) {job['status']}" + (f": {job['note']}" if job.get("note") else "")
                           + f" — log: scr job tail {job['id']}", job.get("task"))
         # resume: a waiting task whose jobs are all finished gets its session back, with the results as the prompt
@@ -1984,7 +1986,7 @@ class Watcher:
         brief = (f"You are resuming Scriptorium task {t.id} after the job(s) you submitted finished. Results:\n{summary}\n"
                  f"Read the full log(s) if the tail is not enough, then continue the task exactly where you stopped: your brief, "
                  f"{t.dir / 'spec.md'}, {t.dir / 'log.md'} and {t.dir / 'report.md'} are unchanged. Submit further long "
-                 f"commands the same way ({self.root / '.venv' / 'Scripts' / 'scr.exe'} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
+                 f"commands the same way ({self.root / '.venv' / 'Scripts' / 'scr.exe'} --root {self.root.resolve()} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
                  f"line of log.md and end your turn).\n")
         bf = t.dir / f"resume-brief-{now:%Y%m%d-%H%M%S}.txt"
         bf.write_text(brief, encoding="utf-8")

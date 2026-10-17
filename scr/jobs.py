@@ -42,6 +42,8 @@ DEFAULT_CONCURRENCY = 2
 AUTH_LIMIT_MINUTES = 12 * 60          # the bgwait rule: longer than 12 h needs Omri (scr/bgwait.py)
 WAIT_RE = re.compile(r"^\s*(?:-\s*)?WAITING:\s*job\s+(J-\d{4,})\b", re.IGNORECASE)
 FINISHED = {"done", "failed", "timeout", "killed"}
+LAND_PREFIX = "land-"      # the watcher's landing jobs (scr/watch.py land_via_job); their own lane in poll()
+LAND_LANE = 1
 ACTIVE = {"running", "queued"}
 
 
@@ -155,10 +157,17 @@ def submit(root: Path, cmd: list[str], *, task: str | None = None, name: str | N
     minutes = parse_timeout(timeout)
     if minutes > AUTH_LIMIT_MINUTES and actor != "omri":
         raise ValueError(f"timeout {minutes} min is over {AUTH_LIMIT_MINUTES // 60} h; only Omri may submit that (--actor omri)")
+    if cmd[0].startswith("-") or (name or "").startswith("--"):
+        # J-0001 (2026-10-10): `scr job submit --root <live> ...` read `--root` as the job name and the flag list as the
+        # command (rc 127 in 0 s). A program never starts with `-`; global flags go BEFORE `job`.
+        raise ValueError(f"job submit: the command/name may not start with `-` (got {cmd[0] if cmd[0].startswith('-') else name!r}); "
+                         "put global flags before `job`: scr --root <live root> job submit --task <id> --name <n> -- <command>")
     root = Path(root)
     jid = next_id(root)
+    # cwd = the CALLER's directory (T-0335): a scriber submits from its worktree with `--root <live root>`; the job is
+    # recorded under the live root but must run where the scriber works, not in the scriptorium folder.
     job = {"id": jid, "task": task, "name": name or Path(cmd[0]).name, "cmd": list(cmd),
-           "cwd": str(Path(cwd).resolve() if cwd else root.resolve()), "log": str((jobs_dir(root) / f"{jid}.log").resolve()),
+           "cwd": str(Path(cwd or os.getcwd()).resolve()), "log": str((jobs_dir(root) / f"{jid}.log").resolve()),
            "timeout_min": minutes, "session": session, "submitted": now_iso(), "actor": actor,
            "status": "queued", "pid": None, "started": None, "deadline": None, "rc": None, "ended": None, "resumed": None}
     save(root, job)
@@ -248,13 +257,24 @@ def poll(root: Path, now: datetime | None = None) -> list[dict]:
                 save(root, job)
                 job["transition"] = "failed"
                 changed.append(job)
+    # 2026-10-15: landings (`land-<id>`, the watcher's) have a lane of their own, LAND_LANE wide, outside
+    # jobs_concurrency: J-0112 (T-0331's landing) sat queued for 11 h behind two 20 h scriber jobs.
     cap = concurrency(root)
-    running = len(list_jobs(root, status="running"))
+    is_land = lambda j: str(j.get("name") or "").startswith(LAND_PREFIX)  # noqa: E731
+    running_jobs = list_jobs(root, status="running")
+    running = len([j for j in running_jobs if not is_land(j)])
+    landing = len([j for j in running_jobs if is_land(j)])
     for job in list_jobs(root, status="queued"):
-        if running >= cap:
-            break
-        _start(root, job)
-        running += 1
+        if is_land(job):
+            if landing >= LAND_LANE:
+                continue
+            _start(root, job)
+            landing += 1
+        else:
+            if running >= cap:
+                continue
+            _start(root, job)
+            running += 1
         job["transition"] = "started"
         changed.append(job)
     return changed

@@ -96,8 +96,13 @@ class Task:
         return H("leaf", self.id, self.task_hash(), self.docs_hash())
 
     def save(self) -> None:
+        """Atomic: the record is written to task.yaml.tmp and renamed over task.yaml, so a crash or a concurrent
+        writer can never leave an empty / half-written record (T-0355's task.yaml was 0 bytes on 2026-10-15 20:55
+        and every watcher tick crashed on it for 16 h)."""
         self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "task.yaml").write_text(dump_yaml(self.rec), encoding="utf-8")
+        tmp = self.dir / "task.yaml.tmp"
+        tmp.write_text(dump_yaml(self.rec), encoding="utf-8")
+        tmp.replace(self.dir / "task.yaml")
 
 
 ID_RE = re.compile(r"^T-\d{4}$")
@@ -112,19 +117,30 @@ class Store:
     def __init__(self, root: Path):
         self.root = root
         self.tasks_dir = root / "tasks"
+        self.broken: list[str] = []          # records load_all skipped (empty / unparsable task.yaml)
 
     # ---- tasks -------------------------------------------------------------
     def load_all(self) -> dict[str, Task]:
         out: dict[str, Task] = {}
+        self.broken = []
         if not self.tasks_dir.exists():
             return out
         for d in sorted(self.tasks_dir.iterdir()):
             f = d / "task.yaml"
             if not f.is_file():
                 continue
-            rec = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+            try:
+                rec = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+            except yaml.YAMLError as e:
+                rec = {"_error": str(e)}
             if "id" not in rec:
-                raise RepoError(f"{f} has no id")
+                # 2026-10-16: one broken record must not take the whole system down. It is skipped here; the
+                # watcher raises a Needs-you line naming it (watch.py broken_records) and git holds the last good copy:
+                # `git show HEAD:<path>` restores it.
+                import sys
+                print(f"warning: {f} has no id (empty or unparsable record) — skipped; restore it from git", file=sys.stderr)
+                self.broken.append(str(f))
+                continue
             if rec["id"] in out:
                 raise RepoError(f"duplicate task id {rec['id']} in {d} and {out[rec['id']].dir}")
             out[rec["id"]] = Task(d, rec)
