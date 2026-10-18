@@ -528,6 +528,106 @@ def test_land_failure_new_on_the_branch_still_goes_back_to_the_scriber(tmp_path:
     assert not any(k.startswith("landmain:T-0007:") for k in _flags(root))
 
 
+def _land_job_count(root: Path) -> int:
+    from scr import jobs
+    return len([j for j in jobs.list_jobs(root) if str(j.get("name") or "").startswith(jobs.LAND_PREFIX)])
+
+
+def _trunk_commit(root: Path, path: str, text: str, msg: str) -> None:
+    (root / path).parent.mkdir(parents=True, exist_ok=True)
+    (root / path).write_text(text, encoding="utf-8")
+    sgit(root, "add", path); sgit(root, "commit", "-q", "-m", msg)
+
+
+def _hold_flags(root: Path) -> set[str]:
+    """The watcher's flags as it reads them: one per line (a landmain value holds ", ")."""
+    p = root / ".scr" / "watch.state.txt"
+    return {l.strip() for l in p.read_text(encoding="utf-8").splitlines() if l.strip()} if p.exists() else set()
+
+
+def test_held_landing_is_retried_once_per_trunk_code_commit(tmp_path: Path, monkeypatch):
+    """T-0404 DoD 1: a held landing (landhold + landmain) is resubmitted as a land job on the first tick after the
+    trunk head moves by a code commit, and not again on later ticks while the head stays; a record-only trunk commit
+    (the journal's) does not retry. The trunk still red: the retry re-holds with the same ids, one more land_failed."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    _tick(root)
+    assert "landhold:T-0007" in _hold_flags(root) and any(k.startswith("landretry:T-0007:") for k in _hold_flags(root))
+    assert _land_job_count(root) == 1
+    _trunk_commit(root, "tasks/note.md", "a record\n", "[journal] records only")
+    _tick(root)
+    assert _land_job_count(root) == 1                                       # records cannot fix a test: still held
+    _trunk_commit(root, "other.txt", "unrelated code\n", "trunk: a code commit")
+    head = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert _land_job_count(root) == 2, res["needs"]                         # retried once
+    assert f"landretry:T-0007:{head}" in _hold_flags(root)
+    assert Store(root).get("T-0007").status == "accepted" and not _events(root, "auto_fix", "T-0007")
+    assert len(_events(root, "land_failed", "T-0007")) == 2
+    for _ in range(2):
+        r = _tick(root)
+        lines = [n for n in r["needs"] if "T-0007" in n]
+        assert len(lines) == 1 and "--skip-main-failing" in lines[0] and MAIN_A in lines[0], r["needs"]
+    assert _land_job_count(root) == 2 and len(_events(root, "land_failed", "T-0007")) == 2
+
+
+def test_held_landing_retry_lands_once_the_trunk_is_fixed(tmp_path: Path, monkeypatch):
+    """T-0404 DoD 2: the trunk's fix of A and B (a code commit) retries the held landing; it lands, and the hold flags
+    and the NEEDS-YOU line are gone."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    _tick(root)
+    assert "landhold:T-0007" in _hold_flags(root)
+    _trunk_commit(root, "mainfails.txt", "", "trunk: fix A and B")
+    res = _tick(root)
+    assert Store(root).get("T-0007").status == "merged", res["needs"]
+    assert not any(k.startswith(("landhold:T-0007", "landmain:T-0007:", "landretry:T-0007:")) for k in _hold_flags(root)), _hold_flags(root)
+    assert not any("T-0007" in n for n in res["needs"]) and not any("T-0007" in n for n in _tick(root)["needs"])
+
+
+def test_held_landing_retry_rehold_with_new_ids(tmp_path: Path, monkeypatch):
+    """T-0404 DoD 2: the trunk fixes B only: the retry fails on A alone, still main-only: held again, landmain names A."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    _tick(root)
+    assert f"landmain:T-0007:{MAIN_A}, {MAIN_B}" in _hold_flags(root)
+    _trunk_commit(root, "mainfails.txt", f"{MAIN_A}\n", "trunk: fix B")
+    res = _tick(root)
+    flags = _hold_flags(root)
+    assert f"landmain:T-0007:{MAIN_A}" in flags and "landhold:T-0007" in flags, flags
+    assert [k for k in flags if k.startswith("landmain:T-0007:")] == [f"landmain:T-0007:{MAIN_A}"]
+    assert Store(root).get("T-0007").status == "accepted" and not _events(root, "auto_fix", "T-0007")
+    lines = [n for n in res["needs"] if "T-0007" in n]
+    assert len(lines) == 1 and MAIN_A in lines[0] and MAIN_B not in lines[0], res["needs"]
+
+
+def test_held_landing_retry_with_a_branch_new_failure_goes_to_autofix(tmp_path: Path, monkeypatch):
+    """T-0404 DoD 2: the trunk's new code makes the branch fail C, which passes on the trunk: the retry takes the
+    auto-fix path (the task ready again, an auto_fix event) and the hold is dropped."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    _tick(root)
+    assert "landhold:T-0007" in _hold_flags(root)
+    extra = FAKE_PYTEST.replace('run = ids', f'fails += ["{NEW_C}"] if Path("tool.txt").read_text(encoding="utf-8").strip() == "ok" else []\nrun = ids')
+    _trunk_commit(root, "fake_pytest.py", extra, "trunk: a test the branch breaks")
+    _tick(root)
+    assert Store(root).get("T-0007").status == "ready"
+    assert len(_events(root, "auto_fix", "T-0007")) == 1
+    assert not any(k.startswith(("landhold:T-0007", "landmain:T-0007:", "landretry:T-0007:")) for k in _hold_flags(root)), _hold_flags(root)
+
+
+def test_held_landing_from_before_the_retry_mark_is_still_honoured(tmp_path: Path, monkeypatch):
+    """T-0404 judgment: a landmain flag persisted by a T-0382 watcher (no landretry mark) still holds: the first tick
+    starts the clock at the trunk head (no retry), the next code commit retries."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    _tick(root)
+    p = root / ".scr" / "watch.state.txt"
+    p.write_text("\n".join(k for k in p.read_text(encoding="utf-8").split() if not k.startswith("landretry:")) + "\n", encoding="utf-8")
+    _trunk_commit(root, "other.txt", "code\n", "trunk: a code commit")
+    res = _tick(root)
+    assert _land_job_count(root) == 1 and any(MAIN_A in n for n in res["needs"]), res["needs"]
+    assert f"landretry:T-0007:{sgit(root, 'rev-parse', 'main')}" in _hold_flags(root)
+    _trunk_commit(root, "other.txt", "more code\n", "trunk: another code commit")
+    _tick(root)
+    assert _land_job_count(root) == 2
+
+
 def test_failing_tests_go_back_to_the_scriber_not_to_omri(tmp_path: Path, monkeypatch):
     """DoD 3b, 2026-10-14 reading: the merge is clean but the workload's tests fail on the result: not merged,
     land_failed says `tests`, the trunk untouched — and the task is sent back to its scriber (ready, auto_fix event,

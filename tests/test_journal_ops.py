@@ -789,6 +789,35 @@ def test_main_check_names_only_ids_that_fail_on_the_trunk(monkeypatch):
         assert land_test_failures(lines)[1] is False and "main check skipped" in lines[-1], lines
 
 
+def test_land_skip_main_failing_lands_when_every_failure_is_the_trunks(tmp_path: Path, monkeypatch):
+    """T-0404 DoD 3: `scr land <id> --merge --skip-main-failing` on a landing whose only failures (A, B) carry the
+    MAIN_FAILING_MARK verdict merges, and the landed event names the skipped ids. Without the flag it fails; a
+    Steward actor may not use it."""
+    from test_watch import MAIN_A, MAIN_B, _events, _main_failing_world, sgit, sscr
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    plain = sscr(root, "--actor", "omri", "land", "T-0007", "--merge", check=False)
+    assert plain.returncode == 1 and "FAILED (tests)" in plain.stdout and Store(root).get("T-0007").status == "accepted", plain.stdout
+    st = sscr(root, "--actor", "steward:T-0007", "land", "T-0007", "--merge", "--skip-main-failing", check=False)
+    assert st.returncode != 0 and "Omri's alone" in st.stdout + st.stderr, (st.stdout, st.stderr)
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--merge", "--skip-main-failing", check=False)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert Store(root).get("T-0007").status == "merged"
+    assert sgit(root, "merge-base", "--is-ancestor", "task/T-0007", "main") == ""
+    ev = _events(root, "landed", "T-0007")
+    assert len(ev) == 1 and MAIN_A in ev[0]["note"] and MAIN_B in ev[0]["note"] and "--skip-main-failing" in ev[0]["note"], ev
+
+
+def test_land_skip_main_failing_refuses_a_branch_new_failure(tmp_path: Path, monkeypatch):
+    """T-0404 DoD 3: the branch also fails C, which passes on the trunk: --skip-main-failing refuses, nothing lands."""
+    from test_watch import NEW_C, _events, _main_failing_world, sgit, sscr
+    root, _ = _main_failing_world(tmp_path, monkeypatch, f"{NEW_C}\n")
+    main_before = sgit(root, "rev-parse", "main")
+    r = sscr(root, "--actor", "omri", "land", "T-0007", "--merge", "--skip-main-failing", check=False)
+    assert r.returncode == 1 and "--skip-main-failing refused" in r.stdout and "FAILED (tests)" in r.stdout, r.stdout
+    assert Store(root).get("T-0007").status == "accepted" and sgit(root, "rev-parse", "main") == main_before
+    assert not _events(root, "landed", "T-0007")
+
+
 def test_discuss_hotfix_is_toolsmith_in_root(world):
     from scr.discuss import build
     root, _, _ = world

@@ -712,7 +712,7 @@ class _LandLock:
                 pass
 
 
-def land_scriptorium(root: Path, tid: str) -> dict:
+def land_scriptorium(root: Path, tid: str, skip_main_failing: bool = False) -> dict:
     """Land an accepted task of the scriptorium's OWN workload that was spawned into a worktree (T-0078).
     Until 2026-09-21 the watcher marked every accepted scriptorium task merged with the note "change
     already on main (journal)" — true for a hotfix made in the checkout, false for a spawned worktree:
@@ -744,6 +744,10 @@ def land_scriptorium(root: Path, tid: str) -> dict:
     before the tests, so the tests still run on exactly the tree the trunk gets.
     The whole landing holds `.scr/land-<id>.lock` (_LandLock); a second landing of the same task meanwhile
     returns `busy` without touching the worktree.
+    skip_main_failing (T-0404, `scr land --skip-main-failing`): a step-4 failure whose every failing id carries the
+    MAIN_FAILING_MARK verdict (land_test_failures: a complete list of at most MAIN_RERUN_MAX_IDS, all also failing
+    when rerun on the trunk) does not stop the landing; the skipped ids go into the landed event and log.md. Any
+    other failure still fails it.
     Returns {"ok", "reason" (busy | scope | trunk | conflict | records | tests | ...), "out" (lines), "sha"
     (trunk head on success), "tip" (the task branch head after the attempt; the watcher keys its retry on it)}."""
     lock = _LandLock(root, tid)
@@ -756,12 +760,12 @@ def land_scriptorium(root: Path, tid: str) -> dict:
                 "out": [f"=== {tid} [{t.status}] task/{tid} (scriptorium)",
                         f"  FAILED (busy): another landing of {tid} holds {lock.path} — nothing touched"]}
     try:
-        return _land_scriptorium(root, tid)
+        return _land_scriptorium(root, tid, skip_main_failing)
     finally:
         lock.release()
 
 
-def _land_scriptorium(root: Path, tid: str) -> dict:
+def _land_scriptorium(root: Path, tid: str, skip_main_failing: bool = False) -> dict:
     """land_scriptorium's steps, under its lock."""
     store = Store(root)
     t = store.get(tid)
@@ -850,12 +854,24 @@ def _land_scriptorium(root: Path, tid: str) -> dict:
     # 4. the tests, on the tree the trunk will get
     timeout = land_test_timeout(store)
     rc, txt = _run_tests_full(wl, wt, timeout)
+    skipped: list[str] = []
     if rc != 0:
-        out += _main_check(wl, root, br, trunk, rc, txt, timeout)
-        txt = txt[-6000:]
-        tail = " | ".join(l.strip() for l in txt.splitlines() if l.strip())[-400:]
-        return fail("tests", f"`{wl.cfg.get('tests') or 'pytest tests -q'}` exited {rc} in {wt}: {tail}")
-    out.append("  tests pass")
+        checked = _main_check(wl, root, br, trunk, rc, txt, timeout)
+        out += checked
+        ids, on_main = land_test_failures(checked)
+        if skip_main_failing and on_main and len(ids) <= MAIN_RERUN_MAX_IDS:
+            skipped = ids                   # T-0404: every failure is the trunk's too; the trunk gets no new red
+            out.append(f"  --skip-main-failing: {len(ids)} test(s) also failing on {trunk} skipped: {', '.join(ids)}")
+        else:
+            if skip_main_failing:
+                out.append(f"  --skip-main-failing refused: the failures are not all ({len(ids)} id(s), <= {MAIN_RERUN_MAX_IDS}, "
+                           f"complete list) also failing on {trunk}")
+            txt = txt[-6000:]
+            tail = " | ".join(l.strip() for l in txt.splitlines() if l.strip())[-400:]
+            return fail("tests", f"`{wl.cfg.get('tests') or 'pytest tests -q'}` exited {rc} in {wt}: {tail}")
+    passed = (f"tests pass except {len(skipped)} also failing on {trunk} (--skip-main-failing): {', '.join(skipped)}"
+              if skipped else "tests pass")
+    out.append(f"  {passed}")
     # 5. branch -> trunk, in the checkout, serialized with the journal
     journal(root, f"steward:{tid}", f"pre-land checkpoint for {tid}")
     with _JournalLock(root):
@@ -870,9 +886,9 @@ def _land_scriptorium(root: Path, tid: str) -> dict:
     how = "fast-forward" if mg.run("rev-parse", br).out == mg.run("rev-parse", "HEAD").out else f"merge commit on {before[:8]}"
     out.append(f"  {trunk}: {before[:8]} -> {head} ({how})")
     # 6. the record
-    _log(root).append("system", name="landed", task=tid, actor=f"steward:{tid}", note=f"{br} -> {trunk} @ {head} ({how}); tests pass")
-    out += _record_merged(root, store, tid, f"landed: {br} -> {trunk} @ {head} ({how}); tests pass", report)
-    _log_md(t, f"landed: {br} -> {trunk} @ {head} ({how}); tests pass"
+    _log(root).append("system", name="landed", task=tid, actor=f"steward:{tid}", note=f"{br} -> {trunk} @ {head} ({how}); {passed}")
+    out += _record_merged(root, store, tid, f"landed: {br} -> {trunk} @ {head} ({how}); {passed}", report)
+    _log_md(t, f"landed: {br} -> {trunk} @ {head} ({how}); {passed}"
             + (f"; records follow the trunk: {', '.join(followed)}" if followed else ""))
     out.append(f"  {tid} marked merged")
     return {"ok": True, "reason": None, "out": out, "sha": head, "tip": g.head()}
@@ -933,7 +949,8 @@ def land_no_worktree(root: Path, store: Store, t: Task, wl: Workload, dry_run: b
     return {"ok": True, "reason": None, "out": out, "sha": None, "tip": None, "url": None}
 
 
-def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False) -> dict:
+def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run: bool = False, merge: bool = False,
+             skip_main_failing: bool = False) -> dict:
     """The one place that decides which landing a task gets (T-0119): a scriptorium task (is_scriptorium_task)
     goes through land_scriptorium — commit, trunk merged in, tests, merge into the trunk, merged — exactly the
     watcher's land step; every other workload goes through the quantum-insertion land() with the QI flags.
@@ -967,7 +984,7 @@ def land_any(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry
                f"  {br} already contained in {trunk}: record merged only" if not dirty and mg.is_ancestor(br, trunk)
                else f"  would merge {trunk} into {br}, run `{wl.cfg.get('tests') or 'pytest tests -q'}` in the worktree, merge {br} into {trunk}"]
         return {"ok": True, "reason": None, "out": out, "sha": None, "tip": g.head(), "url": None}
-    r = land_scriptorium(root, tid)
+    r = land_scriptorium(root, tid, skip_main_failing=skip_main_failing)
     if not r["ok"]:
         nxt = _LAND_NEXT.get(r["reason"], "see the FAILED line above, then `scr land {tid}` again").format(trunk=trunk, br=br, wt=wt, tid=tid)
         r["out"].append(f"{tid}: NOT landed ({r['reason']}) — next: {nxt}")
