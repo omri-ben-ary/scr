@@ -462,6 +462,72 @@ def test_landing_test_timeout_comes_from_limits_yaml(tmp_path: Path, monkeypatch
     assert Store(root).get("T-0007").status == "ready" and sgit(root, "rev-parse", "main") == main_before   # back to the scriber (2026-10-14)
 
 
+# T-0382: a pytest-shaped fake runner. A test id fails in a tree when mainfails.txt or tool.txt lists it; ids
+# given on the command line run alone (the landing's main-side rerun), otherwise one passing test + every failure.
+FAKE_PYTEST = """\
+import sys
+from pathlib import Path
+fails = [l.strip() for f in ("mainfails.txt", "tool.txt") if Path(f).exists() for l in Path(f).read_text(encoding="utf-8").splitlines() if "::" in l]
+ids = [a for a in sys.argv[1:] if "::" in a]
+assert not ids or "tests" not in sys.argv[1:], sys.argv      # the rerun drops the suite path
+run = ids or ["tests/test_a.py::test_ok"] + fails
+bad = [i for i in run if i in fails]
+for i in bad:
+    print(f"FAILED {i} - AssertionError: fake")
+print(f"{len(bad)} failed, {len(run) - len(bad)} passed in 0.01s" if bad else f"{len(run)} passed in 0.01s")
+sys.exit(1 if bad else 0)
+"""
+MAIN_A, MAIN_B, NEW_C = "tests/test_ui.py::test_ui_http_and_reload", "tests/test_ui.py::test_ui_state_carries_watch_cards", "tests/test_x.py::test_c"
+
+
+def _main_failing_world(tmp_path: Path, monkeypatch, branch_tool: str) -> tuple[Path, Path]:
+    """_land_world whose trunk fails MAIN_A and MAIN_B (mainfails.txt, committed on main after the spawn, so the
+    landing's trunk merge brings it to the branch) and whose worktree's tool.txt is `branch_tool`."""
+    root, _, wt = _land_world(tmp_path, monkeypatch)
+    wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wl["scriptorium"]["tests"] = f"{sys.executable} fake_pytest.py tests -q"
+    (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(wl), encoding="utf-8")
+    (root / "fake_pytest.py").write_text(FAKE_PYTEST, encoding="utf-8")
+    (root / "mainfails.txt").write_text(f"{MAIN_A}\n{MAIN_B}\n", encoding="utf-8")
+    sscr(root, "--quiet", "snapshot")                                   # the config hash moved: keep verify green
+    sgit(root, "add", "-A"); sgit(root, "commit", "-q", "-m", "[journal] fake pytest; the trunk fails A and B")
+    (wt / "tool.txt").write_text(branch_tool, encoding="utf-8")
+    return root, wt
+
+
+def test_land_failing_only_on_main_failing_tests_is_held_not_returned(tmp_path: Path, monkeypatch):
+    """T-0382 DoD: the landing's tests fail on A and B only, and A and B also fail on main (the rerun of just those
+    ids in the checkout): the task stays accepted, no auto_fix, the land_failed event names A and B, and ONE
+    NEEDS-YOU line names them — on this tick and the next."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
+    main_before = sgit(root, "rev-parse", "main")
+    res = _tick(root)
+    assert res["ok"], res
+    assert Store(root).get("T-0007").status == "accepted"
+    assert not _events(root, "auto_fix", "T-0007")
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and MAIN_A in ev[0]["note"] and MAIN_B in ev[0]["note"] and "also fail on the trunk" in ev[0]["note"], ev
+    for r in (res, _tick(root)):
+        lines = [n for n in r["needs"] if "T-0007" in n]
+        assert len(lines) == 1 and MAIN_A in lines[0] and MAIN_B in lines[0] and "also fail on main" in lines[0], r["needs"]
+    assert Store(root).get("T-0007").status == "accepted" and not _events(root, "auto_fix", "T-0007")
+    assert sgit(root, "rev-parse", "main") == main_before and len(_events(root, "land_failed", "T-0007")) == 1
+
+
+def test_land_failure_new_on_the_branch_still_goes_back_to_the_scriber(tmp_path: Path, monkeypatch):
+    """T-0382 DoD: the same world, but the branch also fails C, which passes on main: today's path — auto_fix,
+    the task ready again — and the land_failed event names A, B and C."""
+    root, _ = _main_failing_world(tmp_path, monkeypatch, f"{NEW_C}\n")
+    res = _tick(root)
+    assert res["ok"], res
+    assert Store(root).get("T-0007").status == "ready"
+    assert len(_events(root, "auto_fix", "T-0007")) == 1
+    ev = _events(root, "land_failed", "T-0007")
+    assert len(ev) == 1 and all(i in ev[0]["note"] for i in (MAIN_A, MAIN_B, NEW_C)) and "also fail on the trunk" not in ev[0]["note"], ev
+    assert not any("also fail on main" in n for n in res["needs"]), res["needs"]
+    assert not any(k.startswith("landmain:T-0007:") for k in _flags(root))
+
+
 def test_failing_tests_go_back_to_the_scriber_not_to_omri(tmp_path: Path, monkeypatch):
     """DoD 3b, 2026-10-14 reading: the merge is clean but the workload's tests fail on the result: not merged,
     land_failed says `tests`, the trunk untouched — and the task is sent back to its scriber (ready, auto_fix event,

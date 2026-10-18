@@ -713,6 +713,72 @@ def test_ops_run_tests_names_substituted_interpreter(tmp_path, monkeypatch):
     assert first.startswith("note:") and "tools/python.exe" in first and sys.executable in first and str(tmp_path) in first, out
 
 
+PYTEST_Q_OUT = """\
+..F.....E..F
+=================================== FAILURES ===================================
+____________________________ test_ui_http_and_reload ___________________________
+E   AssertionError: boom
+=========================== short test summary info ============================
+FAILED tests/test_journal_ops.py::test_ui_http_and_reload - AssertionError: boom
+ERROR tests/test_watch.py::test_setup_breaks - OSError: no
+FAILED tests/test_ui.py::test_ui_state_carries_watch_cards_and_nothing_else_changes
+FAILED tests/test_p.py::test_param[a - b] - ValueError: x
+3 failed, 361 passed, 2 skipped, 1 error in 2477.10s (0:41:17)
+"""
+
+
+def test_failing_test_ids_are_parsed_from_pytest_q_output():
+    """T-0382 DoD: the ids come from pytest -q's short summary (FAILED / ERROR lines), in order, without the
+    ` - why` part; the list is complete only when the final `N failed, M error` count matches it."""
+    from scr.ops import failed_test_ids, rerun_argv
+    ids, complete = failed_test_ids(PYTEST_Q_OUT)
+    assert ids == ["tests/test_journal_ops.py::test_ui_http_and_reload", "tests/test_watch.py::test_setup_breaks",
+                   "tests/test_ui.py::test_ui_state_carries_watch_cards_and_nothing_else_changes", "tests/test_p.py::test_param[a - b]"], ids
+    assert complete
+    cut = PYTEST_Q_OUT.replace("FAILED tests/test_ui.py::test_ui_state_carries_watch_cards_and_nothing_else_changes\n", "")
+    assert failed_test_ids(cut) == (["tests/test_journal_ops.py::test_ui_http_and_reload", "tests/test_watch.py::test_setup_breaks",
+                                     "tests/test_p.py::test_param[a - b]"], False)      # a lost line: never complete
+    assert failed_test_ids("tests timed out after 5s") == ([], False)
+    assert rerun_argv(["py", "-m", "pytest", "tests", "-q"], ["tests/a.py::x", "tests/b.py::y"]) == ["py", "-m", "pytest", "-q", "tests/a.py::x", "tests/b.py::y"]
+
+
+def _main_check_run(monkeypatch, branch_out: str, main_out: str | None, rc: int = 1):
+    """ops._main_check with the test runner faked: `main_out` is what the rerun on the trunk prints (None: it
+    must not run). Returns (lines, the ids the rerun was given)."""
+    from types import SimpleNamespace
+    from scr import ops
+    seen: dict = {}
+
+    def fake(wl, cwd, timeout=0, ids=None):
+        assert main_out is not None, "the main rerun ran"
+        seen["ids"], seen["cwd"] = ids, cwd
+        return (1 if "FAILED" in main_out else 0), main_out
+    monkeypatch.setattr(ops, "_run_tests_full", fake)
+    lines = ops._main_check(SimpleNamespace(cfg={}), Path("ROOT"), "task/T-1", "main", rc, branch_out, 3600)
+    return lines, seen
+
+
+def test_main_check_names_only_ids_that_fail_on_the_trunk(monkeypatch):
+    """T-0382: the rerun on the checkout is of just the failing ids; the trunk mark is written only when EVERY id
+    fails there too, and land_test_failures reads the decision back from the lines (a job log's, too)."""
+    from scr.ops import land_test_failures
+    two = "FAILED tests/x.py::a - E\nFAILED tests/x.py::b\n2 failed, 9 passed in 1s\n"
+    lines, seen = _main_check_run(monkeypatch, two, "FAILED tests/x.py::a\nFAILED tests/x.py::b - E\n2 failed in 1s\n")
+    assert seen == {"ids": ["tests/x.py::a", "tests/x.py::b"], "cwd": Path("ROOT")}
+    assert land_test_failures(lines + ["  FAILED (tests): ..."]) == (["tests/x.py::a", "tests/x.py::b"], True), lines
+    # b passes on the trunk: it is the branch's failure
+    lines, _ = _main_check_run(monkeypatch, two, "FAILED tests/x.py::a\n1 failed, 1 passed in 1s\n")
+    assert land_test_failures(lines) == (["tests/x.py::a", "tests/x.py::b"], False) and "tests/x.py::b" in lines[-1], lines
+    # an id the trunk does not have (pytest rc 4/5, nothing failed) is new
+    lines, _ = _main_check_run(monkeypatch, two, "ERROR: not found: tests/x.py::b\nno tests ran in 0.1s\n")
+    assert land_test_failures(lines)[1] is False
+    # an incomplete list, a non-1 rc, or too many failures: no rerun at all
+    for out, rc in (("FAILED tests/x.py::a\n2 failed in 1s\n", 1), (two, 2),
+                    ("".join(f"FAILED tests/x.py::t{i}\n" for i in range(11)) + "11 failed in 1s\n", 1)):
+        lines, _ = _main_check_run(monkeypatch, out, None, rc)
+        assert land_test_failures(lines)[1] is False and "main check skipped" in lines[-1], lines
+
+
 def test_discuss_hotfix_is_toolsmith_in_root(world):
     from scr.discuss import build
     root, _, _ = world
