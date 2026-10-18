@@ -1572,7 +1572,10 @@ class Watcher:
                             self.unflag(k)
                         self.unflag(f"land:{t.id}")
                         return "failed"
-                self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
+                held = next((k.split(":", 2)[2] for k in self.flags if k.startswith(f"landmain:{t.id}:")), None)   # T-0382
+                if not any(n["key"] == f"land_failed:{t.id}" for n in self.need_items):   # raised by land_failed this tick
+                    self.need(f"land_failed:{t.id}", self.land_main_need(t, held.split(", ")) if held else
+                              f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
                 self.unflag(f"land:{t.id}")
                 return None
         elif not wt.exists():
@@ -1622,6 +1625,8 @@ class Watcher:
                 for k in failed:
                     self.unflag(k)
                 self.unflag(f"landhold:{t.id}")
+                for k in [k for k in self.flags if k.startswith(f"landmain:{t.id}:")]:
+                    self.unflag(k)
                 try:
                     r = retire(self.root, t.id, execute=True)
                 except Exception as e:  # noqa: BLE001
@@ -1792,7 +1797,10 @@ class Watcher:
         """A refused landing (land_scriptorium or the no-worktree land_any): ONE land_failed event per branch tip
         (+ scope), then — 2026-10-14 — the task goes back to its scriber with the failure (autofix, at most
         AUTOFIX_MAX times); only after that does the task stay accepted with a NEEDS-YOU line every tick. A lost
-        worktree or an internal error is Omri's at once. Returns False."""
+        worktree or an internal error is Omri's at once. T-0382: a `tests` failure whose every failing id also failed
+        when rerun on the trunk (ops.land_test_failures) is held instead — no autofix, one NEEDS-YOU line naming the
+        tests (flags landhold + `landmain:<id>:<ids>`) — and its land_failed event lists the ids. Returns False."""
+        from .ops import land_test_failures
         why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
         nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
         key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
@@ -1800,9 +1808,23 @@ class Watcher:
             self.unflag(k)
         if failed - {key}:
             self.unflag(f"landhold:{t.id}")                             # a new tip: the hold belonged to the old one
+            for k in [k for k in self.flags if k.startswith(f"landmain:{t.id}:")]:
+                self.unflag(k)
+        # T-0382: the failing test ids (ops.land_test_failures reads them from the landing's lines) go into the event;
+        # when every one of them also failed when rerun on the trunk, the branch is not at fault: hold, no autofix
+        ids, on_main = land_test_failures(res["out"]) if res.get("reason") == "tests" else ([], False)
+        note = why[:900] if not ids else (f"{why[:500]} || " + ("all also fail on the trunk; " if on_main else "")
+                                          + f"failing tests ({len(ids)}): {', '.join(ids)}")[:900]
         if self.flag(key):
-            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
+            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", note, "--quiet")
         self.unflag(f"land:{t.id}")
+        if on_main:
+            self.flags.add(f"landhold:{t.id}")
+            for k in [k for k in self.flags if k.startswith(f"landmain:{t.id}:")]:
+                self.unflag(k)
+            self.flags.add(f"landmain:{t.id}:{', '.join(ids)}")
+            self.need(f"land_failed:{t.id}", self.land_main_need(t, ids), t.id)
+            return False
         if res.get("reason") in self.OMRI_LAND_REASONS:          # the checkout's problem, not the branch's: never sent to a scriber
             self.flags.add(f"landhold:{t.id}")
         else:
@@ -1815,6 +1837,12 @@ class Watcher:
                 return False
         self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         return False
+
+    def land_main_need(self, t, ids: list[str]) -> str:
+        """The NEEDS-YOU line of a landing held because every failing test also fails on the trunk (T-0382)."""
+        trunk = workload_for(self.root, self.store, t).main
+        return (f"{t.id} accepted; its landing failed only on test(s) that also fail on {trunk}: {', '.join(ids)} — "
+                f"merge task/{t.id} into {trunk} by hand, or wait for the fix of those tests (a new commit on task/{t.id} retries)")
 
     OMRI_LAND_REASONS = {"lost_worktree", "error", "trunk", "busy"}
 

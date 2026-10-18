@@ -5,6 +5,7 @@ never touch the trusted branch.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -527,19 +528,104 @@ def _run_tests(wl: Workload, cwd: Path, timeout: int = LAND_TEST_TIMEOUT_S) -> t
     (a spawned scriptorium worktree links `.venv` to the checkout's), a missing python* interpreter falls back
     to this one and the returned text then starts with a one-line note naming it (T-0255).
     land_scriptorium passes `timeout` from limits.yaml land_test_timeout_seconds (land_test_timeout)."""
-    cmd = wl.cfg.get("tests")
-    if not cmd:
-        cmd = ".venv/Scripts/python.exe -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q"
-    argv, note = resolve_test_argv(cmd, cwd)
+    rc, txt = _run_tests_full(wl, cwd, timeout)
+    return rc, txt[-6000:]
+
+
+def _tests_cmd(wl: Workload) -> str:
+    return wl.cfg.get("tests") or (".venv/Scripts/python.exe -m pytest tests -q" if os.name == "nt" else "python -m pytest tests -q")
+
+
+def _run_tests_full(wl: Workload, cwd: Path, timeout: int = LAND_TEST_TIMEOUT_S, ids: list[str] | None = None) -> tuple[int, str]:
+    """_run_tests without the 6000-character tail cut: land_scriptorium parses the FAILED lines from the whole
+    output (T-0382), since a long run's tail may have lost some. With `ids`, the same command runs only those
+    test ids (rerun_argv) — the main-side check of a failed landing."""
+    argv, note = resolve_test_argv(_tests_cmd(wl), cwd)
+    if ids is not None:
+        argv = rerun_argv(argv, ids)
     lead = f"{note}\n" if note else ""
     env = {**os.environ, "SCR_NO_JOURNAL": "1"}
     try:
         r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, encoding="utf-8", errors="replace")
-        return r.returncode, lead + (r.stdout + r.stderr)[-6000:]
+        return r.returncode, lead + r.stdout + r.stderr
     except subprocess.TimeoutExpired:
         return 124, lead + f"tests timed out after {timeout}s (raise {LAND_TEST_TIMEOUT_KEY} in config/limits.yaml)"
     except FileNotFoundError as e:
         return 127, lead + f"test command not found: {e}"
+
+
+_FAILED_RE = re.compile(r"^(?:FAILED|ERROR) (\S+?\[[^\]]*\]|\S+)(?: - .*)?$")   # a parametrized id may hold spaces
+_SUMMARY_RE = re.compile(r"(?:^|[\s=])(\d+) (failed|errors?)\b")
+
+
+def failed_test_ids(text: str) -> tuple[list[str], bool]:
+    """The test ids of pytest's short summary (`FAILED tests/x.py::name - why`, `ERROR tests/x.py::name`), in
+    order, once each, plus whether that list is COMPLETE: the last summary line's `N failed` + `M error(s)`
+    equals its length (T-0382). An incomplete list is never compared with main — a failure missing from it
+    could be new on the branch."""
+    ids: list[str] = []
+    for line in text.splitlines():
+        m = _FAILED_RE.match(line.strip())
+        if m and m.group(1) not in ids:
+            ids.append(m.group(1))
+    summary = next((l for l in reversed(text.splitlines()) if re.search(r"\b\d+ (failed|passed|errors?)\b", l)), "")
+    total = sum(int(n) for n, _ in _SUMMARY_RE.findall(summary))
+    return ids, bool(ids) and total == len(ids)
+
+
+def rerun_argv(argv: list[str], ids: list[str]) -> list[str]:
+    """The tests argv narrowed to `ids`: positional arguments naming a path the ids live under (the `tests` of
+    `pytest tests -q`) are dropped, the ids appended; options and the program stay."""
+    files = [i.split("::", 1)[0].replace("\\", "/") for i in ids]
+
+    def covers(a: str) -> bool:
+        a = a.replace("\\", "/").rstrip("/")
+        return bool(a) and not a.startswith("-") and any(f == a or f.startswith(a + "/") for f in files)
+    return [argv[0]] + [a for a in argv[1:] if not covers(a)] + list(ids)
+
+
+MAIN_RERUN_MAX_IDS = 10          # more failures than this are the branch's: no main-side rerun
+MAIN_RERUN_TIMEOUT_S = 900       # the rerun of a few ids on the checkout (T-0341's test_ui_http_and_reload once hung)
+FAILING_TESTS_MARK = "failing tests: "
+MAIN_FAILING_MARK = "also failing on the trunk: "
+
+
+def land_test_failures(out: list[str]) -> tuple[list[str], bool]:
+    """From a landing's output lines (land_scriptorium's, or a landing job's log): the failing test ids, and
+    whether EVERY one of them also failed when rerun on the trunk's checkout (T-0382). True only when both
+    lines are present and name the same ids."""
+    def ids(mark: str) -> list[str] | None:
+        for l in out:
+            if mark in l:
+                try:
+                    v = json.JSONDecoder().raw_decode(l.split(mark, 1)[1])[0]
+                    return [str(x) for x in v] if isinstance(v, list) else None
+                except ValueError:
+                    return None
+        return None
+    failed, main = ids(FAILING_TESTS_MARK) or [], ids(MAIN_FAILING_MARK)
+    return failed, bool(failed) and main is not None and set(main) == set(failed)
+
+
+def _main_check(wl: Workload, root: Path, br: str, trunk: str, rc: int, txt: str, timeout: int) -> list[str]:
+    """Step 4's follow-up on a failed test run (T-0382): the failing ids, and — when the list is complete and
+    short — the same ids rerun in the checkout, which sits on the trunk. Only when every id fails there too is the
+    MAIN_FAILING_MARK line written; anything else (an id that passes or does not exist on the trunk, a timeout,
+    an incomplete list) leaves the failure the branch's. Returns output lines."""
+    ids, complete = failed_test_ids(txt)
+    if not ids:
+        return []
+    lines = [f"  {FAILING_TESTS_MARK}{json.dumps(ids)}"]
+    if rc != 1 or not complete:
+        return lines + [f"  main check skipped: the failure list is not pytest's complete one (rc {rc})"]
+    if len(ids) > MAIN_RERUN_MAX_IDS:
+        return lines + [f"  main check skipped: {len(ids)} failures (> {MAIN_RERUN_MAX_IDS})"]
+    mrc, mtxt = _run_tests_full(wl, root, min(timeout, MAIN_RERUN_TIMEOUT_S), ids=ids)
+    on_main = set(failed_test_ids(mtxt)[0]) if mrc == 1 else set()
+    new = [i for i in ids if i not in on_main]
+    if new:
+        return lines + [f"  main check: {len(new)} of {len(ids)} not failing on {trunk} (new on {br}, rc {mrc}): {json.dumps(new)}"]
+    return lines + [f"  {MAIN_FAILING_MARK}{json.dumps(ids)} (rerun of just these ids on {trunk})"]
 
 
 # The scriptorium's record paths (T-0120): on a task branch they are never authoritative — they exist there
@@ -646,6 +732,8 @@ def land_scriptorium(root: Path, tid: str) -> dict:
          the landing (`records`) by name: a scriber's words are moved to the live root, never dropped;
       4. run the workload's `tests:` command in the worktree — on exactly the tree the trunk will get —
          within limits.yaml land_test_timeout_seconds (default 3600; a timeout fails the landing: `tests`);
+         a failure lists pytest's failing ids and, when they are few and the list complete, reruns just those
+         ids in the checkout (the trunk): the watcher holds rather than autofixes when all fail there too (T-0382);
       5. journal the checkout, then under the journal lock merge task/<id> into the trunk: a fast-forward
          after step 3 unless the trunk moved meanwhile (journal commits: records, never the tooling under
          test), a merge commit then; a failure here is aborted and reported like the others;
@@ -760,8 +848,11 @@ def _land_scriptorium(root: Path, tid: str) -> dict:
         followed += [p for p in rec if p not in followed]
         out.append(f"  records follow the trunk: {len(rec)} path(s) reverted on {br}: " + ", ".join(rec))
     # 4. the tests, on the tree the trunk will get
-    rc, txt = _run_tests(wl, wt, land_test_timeout(store))
+    timeout = land_test_timeout(store)
+    rc, txt = _run_tests_full(wl, wt, timeout)
     if rc != 0:
+        out += _main_check(wl, root, br, trunk, rc, txt, timeout)
+        txt = txt[-6000:]
         tail = " | ".join(l.strip() for l in txt.splitlines() if l.strip())[-400:]
         return fail("tests", f"`{wl.cfg.get('tests') or 'pytest tests -q'}` exited {rc} in {wt}: {tail}")
     out.append("  tests pass")
