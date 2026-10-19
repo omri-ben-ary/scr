@@ -35,7 +35,8 @@ Per tick:
   stuck         -> escalated + one slot_freed event (auto-decide; T-0092): a task that cannot progress is
                    escalated, never held — submitted > review_stale_hours with no Decision written, or
                    in_progress/checkpoint with a blocking HELP line unanswered > help_stale_hours, or
-                   in_progress/checkpoint past its own budget.max_wall_hours (T-0121); the
+                   in_progress/checkpoint past its own budget.max_wall_hours of running time (T-0121; waiting
+                   spans not counted, T-0342); the
                    escalated task no longer counts against the cap, so auto-dispatch below fills the slot
                    on the same tick. A running task's launched session is checkpointed, then stopped
                    (T-0124), so the refill never makes cap + 1 sessions
@@ -71,7 +72,7 @@ from .events import EventLog, now_iso
 from .gitops import Git
 from .journal import journal
 from .lifecycle import requeue
-from .ops import (FINISHED_STATUSES, LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
+from .ops import (FINISHED_STATUSES, LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_record_path, is_scriptorium_task, land, land_any, land_scriptorium, retire,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
 from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_exe, session_argv, start_claude
 from .state import State
@@ -79,6 +80,7 @@ from .store import Store
 
 STATE_FILE = ".scr/watch.state.txt"
 LOG_FILE = "reports/steward_watch.log"
+LAND_RETRY = "landretry:"                  # landretry:<id>:<trunk sha>: the trunk head a held landing was last tried on (T-0404)
 NEEDS_FILE = ".scr/watch.needs.json"      # the tick's NEEDS-YOU list, read by scr/ui.py needs_cards (T-0173)
 # claude -p writes this to stderr when it kills the session at its background-task ceiling (T-0067 owns the ceiling)
 DEAD_LINE = "Background tasks still running after"
@@ -377,6 +379,48 @@ def wall_stale(started: datetime | None, hours: float, now: datetime) -> dict | 
     if age_h <= hours:
         return None
     return {"since": started, "age_h": age_h}
+
+
+RUNNING_STATUSES = ("in_progress", "checkpoint")
+
+
+def running_wall(events: list[dict], tid: str, hours: float, now: datetime) -> dict | None:
+    """{since, age_h} like `wall_stale`, but the age is the task's RUNNING time (T-0342): the sum of its
+    in_progress/checkpoint spans since the last `dispatched -> in_progress` start (`since`, which still names the
+    episode). A `waiting` span (a job running detached, the watcher not ticking) is not charged; a
+    checkpoint <-> in_progress heartbeat neither resets nor double-counts the clock. Seen 2026-10-12: T-0136 was
+    escalated for "13.3 h in progress" 27 s after its resume, almost all of it spent waiting on J-0015."""
+    since = run_from = None
+    total = 0.0
+    for e in events:
+        if e.get("kind") != "state" or e.get("task") != tid:
+            continue
+        ts = _event_ts(e)
+        if ts is None:
+            continue
+        if e.get("from") == "dispatched" and e.get("to") == "in_progress":
+            since, run_from, total = ts, ts, 0.0          # a new episode: the clock starts again
+        elif since is None:
+            continue
+        elif e.get("to") in RUNNING_STATUSES:
+            run_from = run_from or ts                     # waiting -> in_progress resumes; a heartbeat keeps the span
+        elif run_from is not None:
+            total += (ts - run_from).total_seconds()      # the span ends (waiting, submitted, returned, ...)
+            run_from = None
+    if since is None:
+        return None
+    if run_from is not None:
+        total += max((now - run_from).total_seconds(), 0.0)
+    age_h = round(total / 3600, 1)
+    if age_h <= hours:
+        return None
+    return {"since": since, "age_h": age_h}
+
+
+def running_hours(events: list[dict], tid: str, now: datetime) -> float | None:
+    """The running time `running_wall` charges, rounded to 0.1 h; None before the first dispatched -> in_progress."""
+    row = running_wall(events, tid, -1.0, now)
+    return row["age_h"] if row else None
 
 
 def help_stale(log_md: str, hours: float, now: datetime, seen: dict[str, datetime] | None = None,
@@ -799,18 +843,18 @@ class Watcher:
 
             hours = wall_hours(t.rec)
             started = self.started_at(t.id)
-            wall = round((now - started).total_seconds() / 3600, 1) if started else None
-            if wall_stale(started, hours, now):
+            wall = running_hours(self.read_events(), t.id, now)      # running time only, not waiting (T-0342)
+            if running_wall(self.read_events(), t.id, hours, now):
                 flags.append(f"OVER-WALL({wall}/{hours}h)")
                 # ONE diagnostic `budget_wall` per episode (the episode is this in_progress start, as for
                 # `slot_freed`); the enforcement is `escalation_checks` later this tick (T-0121), which escalates
                 # the task through `_escalate` unless the submission or dead branches below route it first.
                 if self.flag(f"wall:{t.id}:{started.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"):
-                    self.log(f"{t.id} wall budget exhausted: {wall} h > {hours} h")
+                    self.log(f"{t.id} wall budget exhausted: {wall} h running time > {hours} h")
                     self.scr(f"steward:{t.id}", "event", "system", "--name", "budget_wall", "--task", t.id, "--note", f"{wall} h", "--quiet")
                 if not (self.auto_decide and ok) or takeover_of(self.read_events(), t.id):
                     # held (no auto-decide, or Omri's own takeover run): the line says so every tick
-                    self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h) — escalate or extend", t.id)
+                    self.need(f"wall:{t.id}", f"{t.id} over wall budget ({wall} h of {hours} h running time) — escalate or extend", t.id)
 
             rep = t.dir / "report.md"
             rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
@@ -954,7 +998,7 @@ class Watcher:
             # to freeze dispatch, reviews and the whole watcher for 2 h (T-0058 on 2026-10-14 15:51). First the
             # finished landing jobs are applied (the task may already be `merged`: `scr land` records that itself),
             # then every accepted task without a running landing gets one.
-            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)
+            for job in [j for j in jobs.list_jobs(self.root) if str(j.get("name") or "").startswith(jobs.LAND_PREFIX)
                         and j.get("status") in jobs.FINISHED and not j.get("applied") and j.get("task")]:
                 t = tasks.get(job["task"])
                 if t is None:
@@ -985,6 +1029,9 @@ class Watcher:
                 for line in intake(self.root):
                     self.log(f"  intake: {line}")
 
+        for f in getattr(self.store, "broken", []):
+            self.need(f"broken_record:{Path(f).parent.name[:6]}", f"{Path(f).parent.name[:6]}: task.yaml is empty or unparsable ({f}) — restore it: "
+                      f"git show HEAD:tasks/{Path(f).parent.name}/task.yaml > that file (the watcher skips it meanwhile)")
         if ok and (self.auto_dispatch or self.auto_review or self.auto_land):
             self.log_frozen(self.store.load_all())
         pause = self.credits_paused(now)
@@ -999,7 +1046,8 @@ class Watcher:
         elif self.auto_dispatch and ok:
             cap = int(self.limits.get("concurrency", 3))
             tasks = self.store.load_all()
-            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES)   # escalated / returned never count (T-0092)
+            n_running = sum(1 for t in tasks.values() if t.status in SLOT_STATUSES
+                            and not str(t.rec.get("title") or "").startswith("hotfix:"))   # escalated / returned never count (T-0092); a hotfix record is no session
             if n_running < cap:
                 args = ["dispatch", "--quiet"] + (["--allow-statements"] if self.allow_statements else [])
                 out = self.scr("prioritizer", *args)
@@ -1342,25 +1390,25 @@ class Watcher:
                 continue                            # under takeover Omri is in the session: his HELP lines and wall hold nothing
             elif t.status in {"in_progress", "checkpoint"} and str(t.rec.get("title", "")).startswith("hotfix:"):
                 continue                            # 2026-10-14: a hotfix record is open while Omri edits the checkout; no wall
-            elif t.status in {"in_progress", "checkpoint"} and (row := wall_stale(self.started_at(t.id), hours := wall_hours(t.rec), now)):
+            elif t.status in {"in_progress", "checkpoint"} and (row := running_wall(events, t.id, hours := wall_hours(t.rec), now)):
                 # T-0121: out of budget is stuck. The running loop raised this episode's `budget_wall` earlier this
                 # tick, so the trail reads budget_wall -> escalated -> slot_freed. `escalated` leaves only for
                 # omri_queue (scr/lifecycle.py), so the redispatch route needs --force (it is logged).
                 sess = self.session_of(t)
                 if len([k for k in self.flags if k.startswith(f"autofix:{t.id}:wall:")]) < self.AUTOFIX_MAX:
                     # 2026-10-14: the first two exhaustions extend the wall by the same budget and relaunch from the
-                    # checkpoint (the wall counts waiting time too, T-0342); the third is Omri's
+                    # checkpoint; the third is Omri's. The wall is running time only, waiting excluded (T-0342)
                     if sess:
                         wl = workload_for(self.root, self.store, t)
                         self.stop_session(t, sess["pid"], task_worktree(wl, t), t.rec.get("branch") or "task/" + t.id, created=sess.get("created"))
                     new_hours = hours * 2
                     self.scr(f"steward:{t.id}", "task", "field", t.id, "budget.max_wall_hours", str(new_hours), "--note", "auto-fix: wall extended", "--quiet")
-                    if self.autofix(t, "wall", f"wall budget exhausted ({row['age_h']} h > {hours:g} h); extended to {new_hours:g} h; "
+                    if self.autofix(t, "wall", f"wall budget exhausted ({row['age_h']} h running time > {hours:g} h); extended to {new_hours:g} h; "
                                               f"relaunch from the branch's last checkpoint and finish, or write report.md with what is done"):
                         continue
                 transcripts = [sess["transcript"]] if sess and sess.get("transcript") else sorted(p.name for p in t.dir.glob("session-*.txt"))[-1:]
-                reason = (f"wall budget exhausted: {row['age_h']} h in progress since "
-                          f"{row['since'].astimezone(timezone.utc):%Y-%m-%dT%H:%MZ} > max_wall_hours {hours:g}")
+                reason = (f"wall budget exhausted: {row['age_h']} h running time (in_progress/checkpoint, waiting not counted) "
+                          f"since {row['since'].astimezone(timezone.utc):%Y-%m-%dT%H:%MZ} > max_wall_hours {hours:g}")
                 action = (f"extend the wall with `scr task field {t.id} budget.max_wall_hours N`, then `scr task set {t.id} returned --force` "
                           "+ `ready` so it is redispatched, or decide in the gate card")
             elif t.status in {"in_progress", "checkpoint"}:
@@ -1499,10 +1547,8 @@ class Watcher:
         decided.append({"task": t.id, "decision": verdict})
         return True
 
-    LAND_JOB_PREFIX = "land-"
-
     def land_jobs(self, tid: str) -> list[dict]:
-        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(self.LAND_JOB_PREFIX)]
+        return [j for j in jobs.list_jobs(self.root) if j.get("task") == tid and str(j.get("name") or "").startswith(jobs.LAND_PREFIX)]
 
     def land_via_job(self, t) -> str | None:
         """The landing of an accepted task as a detached job: `scr --actor steward:<id> land <id> --merge` (ops.land_any:
@@ -1531,9 +1577,16 @@ class Watcher:
                             self.unflag(k)
                         self.unflag(f"land:{t.id}")
                         return "failed"
-                self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
-                self.unflag(f"land:{t.id}")
-                return None
+                held = next((k.split(":", 2)[2] for k in self.flags if k.startswith(f"landmain:{t.id}:")), None)   # T-0382
+                if held and self.land_retry_due(t, mg, wl.main):   # T-0404: the trunk's code moved since the hold
+                    self.unflag(f"land_failed:{t.id}:{tip}+{scope_sig}")
+                    self.log(f"{t.id} held landing retried: {wl.main} moved since the hold on {held}")
+                else:
+                    if not any(n["key"] == f"land_failed:{t.id}" for n in self.need_items):   # raised by land_failed this tick
+                        self.need(f"land_failed:{t.id}", self.land_main_need(t, held.split(", ")) if held else
+                                  f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
+                    self.unflag(f"land:{t.id}")
+                    return None
         elif not wt.exists():
             self.need(f"auto_land_failed:{t.id}", f"{t.id} accepted but its worktree {wt} is missing — nothing to land", t.id)
             return None
@@ -1542,13 +1595,16 @@ class Watcher:
         from .ops import land_test_timeout
         minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
         cmd = scr_exe(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
+        trunk = self.trunk_head(wl.main) if scriptorium else None    # the trunk a main-only hold is keyed on (T-0404)
         try:
-            job = jobs.submit(self.root, cmd, task=t.id, name=f"{self.LAND_JOB_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
+            job = jobs.submit(self.root, cmd, task=t.id, name=f"{jobs.LAND_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
         except Exception as e:  # noqa: BLE001
             self.log(f"{t.id} landing job not submitted: {e}")
             self.unflag(f"land:{t.id}")
             return None
         job["land_tip"], job["land_scope_sig"], job["land_scriptorium"] = tip, scope_sig, scriptorium
+        if trunk:
+            job["land_trunk"] = trunk
         jobs.save(self.root, job)
         self.log(f"{t.id} landing submitted as job {job['id']} ({'scriptorium: commit, merge trunk, tests, merge' if scriptorium else 'push, PR, merge'}; {minutes} min)")
         return "submitted"
@@ -1580,7 +1636,7 @@ class Watcher:
             else:
                 for k in failed:
                     self.unflag(k)
-                self.unflag(f"landhold:{t.id}")
+                self.clear_land_hold(t.id)
                 try:
                     r = retire(self.root, t.id, execute=True)
                 except Exception as e:  # noqa: BLE001
@@ -1609,7 +1665,8 @@ class Watcher:
                     tip = g.head() if not g.dirty() else tip
             except Exception:  # noqa: BLE001
                 pass
-        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": tip, "sha": None}
+        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": tip, "sha": None,
+               "trunk": job.get("land_trunk")}
         if scriptorium:
             self.land_failed(t, res, failed, scope_sig)
             return "failed"
@@ -1774,17 +1831,35 @@ class Watcher:
         """A refused landing (land_scriptorium or the no-worktree land_any): ONE land_failed event per branch tip
         (+ scope), then — 2026-10-14 — the task goes back to its scriber with the failure (autofix, at most
         AUTOFIX_MAX times); only after that does the task stay accepted with a NEEDS-YOU line every tick. A lost
-        worktree or an internal error is Omri's at once. Returns False."""
+        worktree or an internal error is Omri's at once. T-0382: a `tests` failure whose every failing id also failed
+        when rerun on the trunk (ops.land_test_failures) is held instead — no autofix, one NEEDS-YOU line naming the
+        tests (flags landhold + `landmain:<id>:<ids>`) — and its land_failed event lists the ids. Returns False."""
+        from .ops import land_test_failures
         why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
         nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
         key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
         for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
             self.unflag(k)
         if failed - {key}:
-            self.unflag(f"landhold:{t.id}")                             # a new tip: the hold belonged to the old one
+            self.clear_land_hold(t.id)                                  # a new tip: the hold belonged to the old one
+        # T-0382: the failing test ids (ops.land_test_failures reads them from the landing's lines) go into the event;
+        # when every one of them also failed when rerun on the trunk, the branch is not at fault: hold, no autofix
+        ids, on_main = land_test_failures(res["out"]) if res.get("reason") == "tests" else ([], False)
+        note = why[:900] if not ids else (f"{why[:500]} || " + ("all also fail on the trunk; " if on_main else "")
+                                          + f"failing tests ({len(ids)}): {', '.join(ids)}")[:900]
         if self.flag(key):
-            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", why[:900], "--quiet")
+            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", note, "--quiet")
         self.unflag(f"land:{t.id}")
+        if on_main:
+            self.clear_land_hold(t.id)
+            self.flags.add(f"landhold:{t.id}")
+            self.flags.add(f"landmain:{t.id}:{', '.join(ids)}")
+            trunk = res.get("trunk") or self.trunk_head(workload_for(self.root, self.store, t).main)
+            if trunk:                                                   # T-0404: retried once the trunk's code moves past it
+                self.flags.add(f"{LAND_RETRY}{t.id}:{trunk}")
+            self.need(f"land_failed:{t.id}", self.land_main_need(t, ids), t.id)
+            return False
+        self.clear_land_hold(t.id)                                      # a retried hold that failed on a branch-new test
         if res.get("reason") in self.OMRI_LAND_REASONS:          # the checkout's problem, not the branch's: never sent to a scriber
             self.flags.add(f"landhold:{t.id}")
         else:
@@ -1797,6 +1872,45 @@ class Watcher:
                 return False
         self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
         return False
+
+    def land_main_need(self, t, ids: list[str]) -> str:
+        """The NEEDS-YOU line of a landing held because every failing test also fails on the trunk (T-0382)."""
+        trunk = workload_for(self.root, self.store, t).main
+        return (f"{t.id} accepted; its landing failed only on test(s) that also fail on {trunk}: {', '.join(ids)} — "
+                f"`scr land {t.id} --merge --skip-main-failing` lands it anyway, or wait: a code commit on {trunk} (the fix of "
+                f"those tests) or a new commit on task/{t.id} retries")
+
+    def trunk_head(self, trunk: str) -> str | None:
+        r = Git(self.root).run("rev-parse", trunk)
+        return r.out.strip() if r.ok and r.out.strip() else None
+
+    def clear_land_hold(self, tid: str) -> None:
+        """Drop a landing hold: landhold, the T-0382 `landmain:<id>:<ids>` and the T-0404 retry mark."""
+        self.unflag(f"landhold:{tid}")
+        for k in [k for k in self.flags if k.startswith((f"landmain:{tid}:", f"{LAND_RETRY}{tid}:"))]:
+            self.unflag(k)
+
+    def land_retry_due(self, t, mg: Git, trunk: str) -> bool:
+        """T-0404: a landing held on main-only failures is retried once the trunk has moved past the commit it was
+        held on — by a commit outside the record paths and reports/ (the journal moves the trunk every tick; only
+        code can fix a test) — at most once per trunk commit: the mark `landretry:<id>:<sha>` moves to the head being tried.
+        A hold from before T-0404 (no mark) starts its clock at the current head and keeps holding."""
+        head = self.trunk_head(trunk)
+        if not head:
+            return False
+        marks = [k for k in self.flags if k.startswith(f"{LAND_RETRY}{t.id}:")]
+        since = marks[0].split(":", 2)[2] if marks else None
+        if since == head:
+            return False
+        for k in marks:
+            self.unflag(k)
+        self.flags.add(f"{LAND_RETRY}{t.id}:{head}")
+        if not since:
+            return False
+        d = mg.run("diff", "--name-only", since, head)
+        if not d.ok:                                    # an unknown hold commit (rewritten history): retry once
+            return True
+        return any(p.strip() and not is_record_path(p.strip()) and not p.strip().startswith("reports/") for p in d.out.splitlines())
 
     OMRI_LAND_REASONS = {"lost_worktree", "error", "trunk", "busy"}
 
@@ -1902,7 +2016,7 @@ class Watcher:
             job["notified"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             jobs.save(self.root, job)
             self.log(f"job {note}")
-            if job["status"] != "done" and not str(job.get("name") or "").startswith(self.LAND_JOB_PREFIX) and self.job_needs_omri(job):
+            if job["status"] != "done" and not str(job.get("name") or "").startswith(jobs.LAND_PREFIX) and self.job_needs_omri(job):
                 self.need(f"job:{job['id']}", f"job {job['id']} ({job.get('name')}) {job['status']}" + (f": {job['note']}" if job.get("note") else "")
                           + f" — log: scr job tail {job['id']}", job.get("task"))
         # resume: a waiting task whose jobs are all finished gets its session back, with the results as the prompt
