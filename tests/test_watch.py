@@ -2638,6 +2638,55 @@ def test_every_needs_card_has_a_name_or_is_a_documented_nameless_type(world):
         assert_cards_named(cards + [{"type": "system", "id": "T-0001", "key": "events:x"}])
 
 
+def _fake_chore_status(calls: list):
+    """chores_mod.status stand-in: each root's chores are the ids in its chores.txt, minus the acked ones."""
+    def status(root, acked):
+        calls.append(Path(root).name)
+        ids = (Path(root) / "chores.txt").read_text(encoding="utf-8").split()
+        return [{"id": i, "title": i, "why": "", "manual": True, "link": None, "runnable": False}
+                for i in ids if f"chore:{i}" not in acked]
+    return status
+
+
+def test_chore_cards_are_cached_per_root(tmp_path, monkeypatch):
+    """T-0401: two roots within max_age, no invalidate_chores() between them: each gets its own chores, and a
+    changed root (or a dismissed chore) is not served the other root's cached list."""
+    calls: list = []
+    monkeypatch.setattr(ui_mod.chores_mod, "status", _fake_chore_status(calls))
+    monkeypatch.setattr(ui_mod, "_CHORE_CACHE", {})
+    a, b = tmp_path / "a", tmp_path / "b"
+    for r, ids in ((a, "ca1 ca2"), (b, "cb1")):
+        r.mkdir(); (r / "chores.txt").write_text(ids, encoding="utf-8")
+    assert [c["id"] for c in ui_mod.chore_cards(a, set())] == ["ca1", "ca2"]
+    assert [c["id"] for c in ui_mod.chore_cards(b, set())] == ["cb1"]
+    assert [c["id"] for c in ui_mod.chore_cards(a, set())] == ["ca1", "ca2"] and calls == ["a", "b"]
+    assert [c["id"] for c in ui_mod.chore_cards(a, {"chore:ca1"})] == ["ca2"]       # a dismissal recomputes
+    assert [c["id"] for c in ui_mod.chore_cards(a, {"chore:ca1", "help:T-0001"})] == ["ca2"] and calls == ["a", "b", "a"]
+    assert len(ui_mod._CHORE_CACHE) == 2                                            # one entry per root
+
+
+def test_chore_cards_cache_hits_then_invalidate_recomputes(tmp_path, monkeypatch):
+    """T-0401: the same root twice within max_age computes chores once; invalidate_chores() clears every root's
+    entry, so the next call recomputes; an expired entry is recomputed and evicted with the other expired ones."""
+    calls: list = []
+    monkeypatch.setattr(ui_mod.chores_mod, "status", _fake_chore_status(calls))
+    monkeypatch.setattr(ui_mod, "_CHORE_CACHE", {})
+    a, b = tmp_path / "a", tmp_path / "b"
+    for r in (a, b):
+        r.mkdir(); (r / "chores.txt").write_text("c1", encoding="utf-8")
+    first = ui_mod.chore_cards(a, set())
+    assert ui_mod.chore_cards(a, set()) is first and calls == ["a"]
+    ui_mod.chore_cards(b, set())
+    ui_mod.invalidate_chores()
+    assert ui_mod._CHORE_CACHE == {}
+    ui_mod.chore_cards(a, set())
+    assert calls == ["a", "b", "a"]
+    t = ui_mod.time.time()
+    monkeypatch.setattr(ui_mod.time, "time", lambda: t + 121)
+    ui_mod.chore_cards(b, set())                                                    # a's entry expired: evicted
+    assert calls == ["a", "b", "a", "b"] and list(ui_mod._CHORE_CACHE) == [str(b.resolve())]
+
+
 def test_every_watch_need_goes_through_the_keyed_helper():
     """Every NEEDS-YOU line has a stable key: `self.needs.append` appears only inside Watcher.need."""
     src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
