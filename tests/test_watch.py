@@ -2587,15 +2587,15 @@ def assert_cards_named(cards: list[dict]) -> None:
 def test_ui_state_carries_watch_cards_and_nothing_else_changes(world, monkeypatch):
     """DoD: ui.state() returns the watcher-need cards in `needs`; the rest of its JSON is unchanged field for field.
     T-0341: state() also reads two things outside the fixture root, pinned here. The chore cards come from a
-    process-wide cache (ui._CHORE_CACHE, 120 s) that earlier tests fill from their own roots: on Windows one
-    state() call takes up to a minute (a PowerShell process scan per call), so the cache expired between the two
-    calls and `after` gained this root's chore cards, which carry no `name` (KeyError in J-0009/J-0015).
-    `watcher_running` scans the machine's processes, so a live watcher starting or stopping flipped it (J-0014)."""
+    cache (ui._CHORE_CACHE, 120 s; keyed by root since T-0401, so an earlier test's root cannot leak in):
+    on Windows one state() call takes up to a minute (a PowerShell process scan per call), so the cache expired
+    between the two calls and `after` gained this root's chore cards, which carry no `name` (KeyError in
+    J-0009/J-0015). `watcher_running` scans the machine's processes, so a live watcher starting or stopping
+    flipped it (J-0014)."""
     root, _, _ = world
     monkeypatch.setattr("scr.run.pids_matching", lambda pattern: [])
     (root / ".gitignore").write_text(".scr/\n", encoding="utf-8")      # as in the live root: the file is never a journal change
     sgit(root, "add", ".gitignore"); sgit(root, "commit", "-q", "-m", "ignore .scr")
-    ui_mod.invalidate_chores()                                          # this root's chores, computed now, not a cached earlier root's
     before = ui_mod.state(root)
     w = Watcher(root, quiet=True)
     w.need("decision_unapplied:T-0001", "T-0001 decision accepted from review.md could not be applied — see log", "T-0001")
