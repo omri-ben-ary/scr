@@ -352,10 +352,14 @@ def test_accepted_scriptorium_worktree_is_committed_merged_and_tested(tmp_path: 
     log = (t.dir / "log.md").read_text(encoding="utf-8")
     assert f"landed: task/T-0007 -> main @ {sha}" in log, log
     assert not _events(root, "land_failed", "T-0007") and not res["needs"], res["needs"]
-    # merged is journaled (the tick commits the record) and pushed; the worktree is retired (quarantined, not deleted)
+    # merged is journaled (the tick commits the record) and pushed; the worktree is deleted (T-0321), the branch stays
     assert sgit(root, "status", "--porcelain") == ""
     assert sgit(root, "rev-parse", "main") == sgit(origin, "rev-parse", "main")
-    assert not wt.exists() and list((tmp_path / "scriptorium-RETIRED").glob("*-T-0007/worktree/tool.txt"))
+    assert not wt.exists() and not list((tmp_path / "scriptorium-RETIRED").glob("*-T-0007/worktree"))
+    gone = _events(root, "worktree_deleted", "T-0007")
+    assert len(gone) == 1 and gone[0]["data"]["path"] == str(wt) and gone[0]["data"]["bytes"] > 0, gone
+    assert str(wt.resolve()).replace("\\", "/").lower() not in sgit(root, "worktree", "list").replace("\\", "/").lower()
+    assert sgit(root, "rev-parse", "--verify", "task/T-0007")
 
 
 def test_accepted_hotfix_without_worktree_is_merged_without_a_merge(tmp_path: Path, monkeypatch):
@@ -2868,12 +2872,13 @@ def test_retire_takes_a_branch_merged_into_origin_main_only(world):
     """DoD: local main behind origin/main, the branch merged into origin/main only -> retire proceeds (dry run shows
     the move), no REFUSING line; the local master is left where it was."""
     root, repo, wt = _retire_world(world, merged=True)
+    _set_status(root, "T-0001", "merged")
     local = jgit(repo, "rev-parse", "master")
     assert int(jgit(repo, "rev-list", "--count", "master..task/T-0001")) == 2          # the old measure: 2 ahead
     res = retire(root, "T-0001")
     assert res["ok"] and res["code"] == 0, res["out"]
     assert not any("REFUSING" in l for l in res["out"])
-    assert "origin/master" in res["out"][0] and any("quarantine ->" in l for l in res["out"]) and res["out"][-1] == "DRY RUN — nothing moved"
+    assert "origin/master" in res["out"][0] and any(l.startswith(f"  delete {wt}") for l in res["out"]) and res["out"][-1] == "DRY RUN — nothing deleted"
     assert wt.exists() and jgit(repo, "rev-parse", "master") == local                  # nothing moved, local master untouched
     assert retire(root, "T-0001", execute=True)["ok"] and not wt.exists()
 
@@ -2881,6 +2886,7 @@ def test_retire_takes_a_branch_merged_into_origin_main_only(world):
 def test_retire_still_refuses_a_branch_not_in_origin_main(world):
     """DoD: a branch not merged into origin/main is refused, its ahead count measured against origin/main."""
     root, repo, wt = _retire_world(world, merged=False)
+    _set_status(root, "T-0001", "merged")
     res = retire(root, "T-0001", execute=True)
     assert not res["ok"] and res["code"] == 2 and wt.exists(), res["out"]
     assert res["out"][-1].startswith("REFUSING: task/T-0001 is 2 commit(s) ahead of origin/master")
@@ -2910,13 +2916,13 @@ def _retire_flags(w, tid: str = "T-0001") -> list[str]:
 
 def test_watch_retries_a_refused_retire_once_the_branch_is_merged(world):
     """DoD: merged task, leftover worktree whose branch is in origin/master, a retire_refused:<id>:2 flag -> after one
-    tick the worktree is under <repo>-RETIRED/, no retire_refused flag remains and no need is raised."""
+    tick the worktree is deleted (T-0321), no retire_refused flag remains and no need is raised."""
     root, repo, wt = _retire_world(world, merged=True)
     _set_status(root, "T-0001", "merged")
     w = Watcher(root, quiet=True)
     w.flags.add("retire_refused:T-0001:2")
     res = w.tick()
-    assert not wt.exists() and list((repo.parent / f"{repo.name}-RETIRED").glob("*-T-0001/worktree/n1.txt"))
+    assert not wt.exists() and len(_events(root, "worktree_deleted", "T-0001")) == 1 and jgit(repo, "rev-parse", "--verify", "task/T-0001")
     assert _retire_flags(w) == [] and "retire_refused:T-0001" not in [n["key"] for n in w.need_items], res["needs"]
     assert not any("retire_refused:" in l for l in (root / STATE_FILE).read_text(encoding="utf-8").splitlines())
     assert "T-0001 retire retry: worktree retired" in (root / LOG_FILE).read_text(encoding="utf-8")
@@ -2968,6 +2974,57 @@ def test_watch_retire_retry_never_runs_off_merged_or_without_a_worktree(world, m
     w.flags |= {"retire_refused:T-0001:2", "retire_retry:T-0001:20000101T000000"}
     w.retire_refused_needs(w.store.load_all())
     assert calls == [] and _retire_flags(w) == [] and w.need_items == []
+
+
+# ---- T-0321: closed / rejected trees are deleted by the watcher; a dirty one takes the retire_refused path ------
+def _finish(root: Path, tid: str, status: str) -> None:
+    from scr.events import now_iso
+    t = Store(root).get(tid)
+    t.rec["status"] = status; t.rec["updated"] = now_iso(); t.save()
+
+
+def test_watch_deletes_a_closed_or_rejected_worktree(world, monkeypatch):
+    """DoD 2 through the watcher: a task closed / rejected while the watcher runs has its worktree deleted on the next
+    tick (branch kept, one worktree_deleted event); one closed before the watcher started is left to `worktrees gc`."""
+    root, repo, wt = _retire_world(world, merged=False)
+    tip = jgit(repo, "rev-parse", "task/T-0001")
+    _finish(root, "T-0001", "closed")
+    calls = _counting_retire(monkeypatch)
+    w = Watcher(root, quiet=True)
+    w.started_iso = "2999-01-01T00:00:00Z"                                    # closed long before this watcher
+    w.retire_finished(w.store.load_all())
+    assert calls == [] and wt.exists()
+    for n, status in enumerate(("rejected", "closed"), start=1):
+        if n == 2:                                                            # a fresh tree on the same branch
+            jgit(repo, "worktree", "add", "-q", str(wt), "task/T-0001")
+        w = Watcher(root, quiet=True)
+        w.started_iso = "2000-01-01T00:00:00Z"
+        _finish(root, "T-0001", status)
+        w.tick()
+        assert not wt.exists() and calls == ["T-0001"] * n, status
+        assert len(_events(root, "worktree_deleted", "T-0001")) == n and jgit(repo, "rev-parse", "task/T-0001") == tip
+        assert _retire_flags(w) == [] and "retire_refused:T-0001" not in [k["key"] for k in w.need_items]
+
+
+def test_watch_dirty_finished_worktree_takes_the_retire_refused_path(world):
+    """DoD 6 through the watcher: a merged task whose worktree has a modified tracked file -> the retry refuses with
+    code 3, the tree is untouched, flag retire_refused:<id>:3 and its NEEDS-YOU line stand; the same for a closed one."""
+    root, repo, wt = _retire_world(world, merged=True)
+    _set_status(root, "T-0001", "merged")
+    (wt / "n1.txt").write_text("changed\n")
+    w = Watcher(root, quiet=True)
+    w.flags |= {"retire_refused:T-0001:2", "retire_retry:T-0001:20000101T000000"}
+    w.retire_refused_needs(w.store.load_all())
+    assert (wt / "n1.txt").read_text() == "changed\n" and not (repo.parent / f"{repo.name}-RETIRED").exists()
+    assert "retire_refused:T-0001:3" in w.flags and [n["key"] for n in w.need_items] == ["retire_refused:T-0001"]
+    assert "merged" in w.needs[0] and "(3)" in w.needs[0]
+    _finish(root, "T-0001", "closed")
+    w = Watcher(root, quiet=True)
+    w.started_iso = "2000-01-01T00:00:00Z"
+    w.retire_finished(w.store.load_all())
+    assert wt.exists() and "retire_refused:T-0001:3" in w.flags and not _events(root, "worktree_deleted", "T-0001")
+    w.retire_refused_needs(w.store.load_all())
+    assert [n["key"] for n in w.need_items] == ["retire_refused:T-0001"] and "closed" in w.needs[0]
 
 
 # ---- T-0187: out of usage credits is not a session death ---------------------------------------------------

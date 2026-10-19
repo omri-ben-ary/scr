@@ -476,6 +476,24 @@ def cmd_retire(args):
     sys.exit(0 if r["ok"] else r["code"])
 
 
+def cmd_worktrees(args):
+    root, _, _ = _ctx(args)
+    from .ops import worktrees_gc
+    # T-0321: the retire rules applied to what is already on disk; --dry-run lists and changes nothing
+    rows = worktrees_gc(root, dry_run=args.dry_run, wl_name=args.workload)
+    if args.json:
+        _out(rows, True); return
+    for r in rows:
+        print(f"{r['workload']:<18} {r['worktree']:<40} {r['status'] or '-':<11} {r['bytes'] / 2**20:>9.1f} MB  {r['action']}")
+        for line in r["out"] if not r["ok"] else []:
+            print(f"  {line}")
+    gone = [r for r in rows if r["action"] in ("delete", "deleted", "drop .lake/build", "dropped .lake/build")]
+    print(f"worktrees gc: {len(rows)} row(s), {sum(r['bytes'] for r in gone) / 2**30:.2f} GB "
+          + ("would be freed (dry run)" if args.dry_run else "freed"))
+    if any(not r["ok"] for r in rows):
+        sys.exit(1)
+
+
 def cmd_spawn(args):
     root, _, _ = _ctx(args)
     from .ops import spawn
@@ -865,7 +883,12 @@ def build_parser() -> argparse.ArgumentParser:
     sw.add_argument("--all", action="store_true", help="hygiene audit: every workload, one typed row per worktree (dirty-mission/finished/phantom/orphan/locked/live); only dirty missions are committed")
     sw.add_argument("--workload", help="the workload to sweep (default: the first in config/workloads.yaml)"); sw.set_defaults(fn=cmd_sweep)
     pk = sub.add_parser("park", parents=[common], help="returned -> escalated -> omri_queue"); pk.add_argument("id"); pk.add_argument("--note"); pk.set_defaults(fn=cmd_park)
-    rt = sub.add_parser("retire", parents=[common], help="quarantine a merged worktree (move, never delete)"); rt.add_argument("name"); rt.add_argument("--execute", action="store_true"); rt.set_defaults(fn=cmd_retire)
+    rt = sub.add_parser("retire", parents=[common], help="dispose of a worktree by its task's status: merged/closed/rejected -> delete (git worktree remove + prune, untracked value copied out, links unlinked); returned/escalated/omri_queue -> quarantine into <repo>-RETIRED/ without .lake/build"); rt.add_argument("name"); rt.add_argument("--execute", action="store_true"); rt.set_defaults(fn=cmd_retire)
+    wg = sub.add_parser("worktrees", parents=[common], help="worktree disk hygiene").add_subparsers(dest="wcmd", required=True)
+    gc_help = ("every workload's worktrees with task status and size; deletes those whose task is merged/closed/rejected "
+               "(the `scr retire` rules) and drops .lake/build from trees under <repo>-RETIRED/; --dry-run changes nothing")
+    gc = wg.add_parser("gc", parents=[common], help=gc_help, description=gc_help)
+    gc.add_argument("--dry-run", action="store_true"); gc.add_argument("--workload", help="one workload (default: all in config/workloads.yaml)"); gc.set_defaults(fn=cmd_worktrees)
     sp = sub.add_parser("spawn", parents=[common], help="worktree per dispatched task from origin/<main>"); sp.add_argument("--tasks", nargs="*"); sp.add_argument("--no-lake", action="store_true"); sp.set_defaults(fn=cmd_spawn)
     la = sub.add_parser("launch", parents=[common], help="start scriber sessions for dispatched tasks")
     la.add_argument("--tasks", nargs="*"); la.add_argument("--mode", choices=["headless", "tabs"], default="headless"); la.add_argument("--permission-mode", default=None, help="override the config default (limits.yaml claude_permission_mode; see scr/run.py)")
@@ -915,7 +938,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
-MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire",
+MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire", "worktrees",
             "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix", "job"}
 
 
@@ -937,7 +960,7 @@ def main(argv=None):
         sys.exit(2)
     finally:
         # journal AFTER the command, whether it succeeded or raised: a partial change is still a change
-        if args.cmd in MUTATING:
+        if args.cmd in MUTATING and not (args.cmd == "worktrees" and getattr(args, "dry_run", False)):   # gc --dry-run changes nothing (T-0321)
             try:
                 root = find_root(Path(args.root) if getattr(args, "root", None) else None)
                 refresh(root, quiet=True)             # derived views always follow the records, journal or not
