@@ -149,6 +149,20 @@ def _start(root: Path, job: dict) -> dict:
     return job
 
 
+def _program_in(program: str, cwd: Path) -> str:
+    """A relative program path (one with a separator) resolved against the job's cwd. On Windows CreateProcess looks a
+    relative argv[0] up from the PARENT's directory, not from Popen's cwd, so J-0132 (`.venv/Scripts/python.exe` from a
+    worktree) died rc 127 [WinError 2] (T-0394). A bare name (`python`, `lake`) is left to PATH lookup."""
+    p = Path(program)
+    if p.is_absolute() or not ("/" in program or os.sep in program):
+        return program
+    q = (cwd / p).resolve()
+    if not q.exists():
+        raise ValueError(f"job submit: program {program!r} not found under the job cwd {cwd}; pass an absolute path "
+                         "to the program, or --cwd <the directory it is relative to>")
+    return str(q)
+
+
 def submit(root: Path, cmd: list[str], *, task: str | None = None, name: str | None = None, cwd: str | Path | None = None,
            timeout: str | int | None = None, session: str | None = None, actor: str = "scr") -> dict:
     """Record + start (or queue) a job. `cmd` is an argv list (never a shell string)."""
@@ -163,11 +177,13 @@ def submit(root: Path, cmd: list[str], *, task: str | None = None, name: str | N
         raise ValueError(f"job submit: the command/name may not start with `-` (got {cmd[0] if cmd[0].startswith('-') else name!r}); "
                          "put global flags before `job`: scr --root <live root> job submit --task <id> --name <n> -- <command>")
     root = Path(root)
-    jid = next_id(root)
     # cwd = the CALLER's directory (T-0335): a scriber submits from its worktree with `--root <live root>`; the job is
     # recorded under the live root but must run where the scriber works, not in the scriptorium folder.
-    job = {"id": jid, "task": task, "name": name or Path(cmd[0]).name, "cmd": list(cmd),
-           "cwd": str(Path(cwd or os.getcwd()).resolve()), "log": str((jobs_dir(root) / f"{jid}.log").resolve()),
+    run_cwd = Path(cwd or os.getcwd()).resolve()
+    cmd = [_program_in(cmd[0], run_cwd), *cmd[1:]]
+    jid = next_id(root)
+    job = {"id": jid, "task": task, "name": name or Path(cmd[0]).name, "cmd": cmd,
+           "cwd": str(run_cwd), "log": str((jobs_dir(root) / f"{jid}.log").resolve()),
            "timeout_min": minutes, "session": session, "submitted": now_iso(), "actor": actor,
            "status": "queued", "pid": None, "started": None, "deadline": None, "rc": None, "ended": None, "resumed": None}
     save(root, job)
