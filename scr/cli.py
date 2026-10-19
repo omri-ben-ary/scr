@@ -419,9 +419,17 @@ def cmd_land(args):
     (the watcher's land step), every other workload to the QI push/PR land()."""
     root, store, _ = _ctx(args)
     from .ops import is_scriptorium_task, land_any
-    if is_scriptorium_task(root, store, store.get(args.id)) and (args.no_pr or args.draft or args.merge):
+    scriptorium = is_scriptorium_task(root, store, store.get(args.id))
+    if scriptorium and (args.no_pr or args.draft or args.merge):
         print("scriptorium task: --merge is implied, --no-pr/--draft do not apply")
-    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
+    if args.skip_main_failing:
+        # T-0404: landing with failing tests is Omri's call, like --force-accept; the watcher only retries (watch.py)
+        if args.actor != "omri":
+            raise RepoError(f"{args.id}: --skip-main-failing is Omri's alone (--actor omri), not {args.actor}'s")
+        if not scriptorium:
+            raise RepoError(f"{args.id}: --skip-main-failing applies to a scriptorium landing only")
+    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge,
+                 skip_main_failing=args.skip_main_failing)
     _print(r["out"])
     if not r["ok"]:
         sys.exit(1)
@@ -848,7 +856,10 @@ def build_parser() -> argparse.ArgumentParser:
                  "--dry-run prints the plan, --no-pr/--draft/--merge do not apply); any other workload via the PR path "
                  "(commit + push, open its PR; --merge: merge and mark merged)")
     ld = sub.add_parser("land", parents=[common], help=land_help, description=land_help)
-    ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true"); ld.set_defaults(fn=cmd_land)
+    ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true")
+    ld.add_argument("--skip-main-failing", action="store_true", help="scriptorium, Omri only: land although tests fail, when every "
+                    "failing id also fails when rerun on the trunk (the MAIN_FAILING_MARK verdict); the land event names them")
+    ld.set_defaults(fn=cmd_land)
     sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
     sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true")
     sw.add_argument("--all", action="store_true", help="hygiene audit: every workload, one typed row per worktree (dirty-mission/finished/phantom/orphan/locked/live); only dirty missions are committed")

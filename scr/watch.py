@@ -70,7 +70,7 @@ from .events import EventLog
 from .gitops import Git
 from .journal import journal
 from .lifecycle import requeue
-from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, land, land_any, land_scriptorium, retire,
+from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_record_path, is_scriptorium_task, land, land_any, land_scriptorium, retire,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
 from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_exe, session_argv, start_claude
 from .state import State
@@ -78,6 +78,7 @@ from .store import Store
 
 STATE_FILE = ".scr/watch.state.txt"
 LOG_FILE = "reports/steward_watch.log"
+LAND_RETRY = "landretry:"                  # landretry:<id>:<trunk sha>: the trunk head a held landing was last tried on (T-0404)
 NEEDS_FILE = ".scr/watch.needs.json"      # the tick's NEEDS-YOU list, read by scr/ui.py needs_cards (T-0173)
 # claude -p writes this to stderr when it kills the session at its background-task ceiling (T-0067 owns the ceiling)
 DEAD_LINE = "Background tasks still running after"
@@ -1573,11 +1574,15 @@ class Watcher:
                         self.unflag(f"land:{t.id}")
                         return "failed"
                 held = next((k.split(":", 2)[2] for k in self.flags if k.startswith(f"landmain:{t.id}:")), None)   # T-0382
-                if not any(n["key"] == f"land_failed:{t.id}" for n in self.need_items):   # raised by land_failed this tick
-                    self.need(f"land_failed:{t.id}", self.land_main_need(t, held.split(", ")) if held else
-                              f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
-                self.unflag(f"land:{t.id}")
-                return None
+                if held and self.land_retry_due(t, mg, wl.main):   # T-0404: the trunk's code moved since the hold
+                    self.unflag(f"land_failed:{t.id}:{tip}+{scope_sig}")
+                    self.log(f"{t.id} held landing retried: {wl.main} moved since the hold on {held}")
+                else:
+                    if not any(n["key"] == f"land_failed:{t.id}" for n in self.need_items):   # raised by land_failed this tick
+                        self.need(f"land_failed:{t.id}", self.land_main_need(t, held.split(", ")) if held else
+                                  f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
+                    self.unflag(f"land:{t.id}")
+                    return None
         elif not wt.exists():
             self.need(f"auto_land_failed:{t.id}", f"{t.id} accepted but its worktree {wt} is missing — nothing to land", t.id)
             return None
@@ -1586,6 +1591,7 @@ class Watcher:
         from .ops import land_test_timeout
         minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
         cmd = scr_exe(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
+        trunk = self.trunk_head(wl.main) if scriptorium else None    # the trunk a main-only hold is keyed on (T-0404)
         try:
             job = jobs.submit(self.root, cmd, task=t.id, name=f"{jobs.LAND_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
         except Exception as e:  # noqa: BLE001
@@ -1593,6 +1599,8 @@ class Watcher:
             self.unflag(f"land:{t.id}")
             return None
         job["land_tip"], job["land_scope_sig"], job["land_scriptorium"] = tip, scope_sig, scriptorium
+        if trunk:
+            job["land_trunk"] = trunk
         jobs.save(self.root, job)
         self.log(f"{t.id} landing submitted as job {job['id']} ({'scriptorium: commit, merge trunk, tests, merge' if scriptorium else 'push, PR, merge'}; {minutes} min)")
         return "submitted"
@@ -1624,9 +1632,7 @@ class Watcher:
             else:
                 for k in failed:
                     self.unflag(k)
-                self.unflag(f"landhold:{t.id}")
-                for k in [k for k in self.flags if k.startswith(f"landmain:{t.id}:")]:
-                    self.unflag(k)
+                self.clear_land_hold(t.id)
                 try:
                     r = retire(self.root, t.id, execute=True)
                 except Exception as e:  # noqa: BLE001
@@ -1655,7 +1661,8 @@ class Watcher:
                     tip = g.head() if not g.dirty() else tip
             except Exception:  # noqa: BLE001
                 pass
-        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": tip, "sha": None}
+        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": tip, "sha": None,
+               "trunk": job.get("land_trunk")}
         if scriptorium:
             self.land_failed(t, res, failed, scope_sig)
             return "failed"
@@ -1807,9 +1814,7 @@ class Watcher:
         for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
             self.unflag(k)
         if failed - {key}:
-            self.unflag(f"landhold:{t.id}")                             # a new tip: the hold belonged to the old one
-            for k in [k for k in self.flags if k.startswith(f"landmain:{t.id}:")]:
-                self.unflag(k)
+            self.clear_land_hold(t.id)                                  # a new tip: the hold belonged to the old one
         # T-0382: the failing test ids (ops.land_test_failures reads them from the landing's lines) go into the event;
         # when every one of them also failed when rerun on the trunk, the branch is not at fault: hold, no autofix
         ids, on_main = land_test_failures(res["out"]) if res.get("reason") == "tests" else ([], False)
@@ -1819,12 +1824,15 @@ class Watcher:
             self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", note, "--quiet")
         self.unflag(f"land:{t.id}")
         if on_main:
+            self.clear_land_hold(t.id)
             self.flags.add(f"landhold:{t.id}")
-            for k in [k for k in self.flags if k.startswith(f"landmain:{t.id}:")]:
-                self.unflag(k)
             self.flags.add(f"landmain:{t.id}:{', '.join(ids)}")
+            trunk = res.get("trunk") or self.trunk_head(workload_for(self.root, self.store, t).main)
+            if trunk:                                                   # T-0404: retried once the trunk's code moves past it
+                self.flags.add(f"{LAND_RETRY}{t.id}:{trunk}")
             self.need(f"land_failed:{t.id}", self.land_main_need(t, ids), t.id)
             return False
+        self.clear_land_hold(t.id)                                      # a retried hold that failed on a branch-new test
         if res.get("reason") in self.OMRI_LAND_REASONS:          # the checkout's problem, not the branch's: never sent to a scriber
             self.flags.add(f"landhold:{t.id}")
         else:
@@ -1842,7 +1850,40 @@ class Watcher:
         """The NEEDS-YOU line of a landing held because every failing test also fails on the trunk (T-0382)."""
         trunk = workload_for(self.root, self.store, t).main
         return (f"{t.id} accepted; its landing failed only on test(s) that also fail on {trunk}: {', '.join(ids)} — "
-                f"merge task/{t.id} into {trunk} by hand, or wait for the fix of those tests (a new commit on task/{t.id} retries)")
+                f"`scr land {t.id} --merge --skip-main-failing` lands it anyway, or wait: a code commit on {trunk} (the fix of "
+                f"those tests) or a new commit on task/{t.id} retries")
+
+    def trunk_head(self, trunk: str) -> str | None:
+        r = Git(self.root).run("rev-parse", trunk)
+        return r.out.strip() if r.ok and r.out.strip() else None
+
+    def clear_land_hold(self, tid: str) -> None:
+        """Drop a landing hold: landhold, the T-0382 `landmain:<id>:<ids>` and the T-0404 retry mark."""
+        self.unflag(f"landhold:{tid}")
+        for k in [k for k in self.flags if k.startswith((f"landmain:{tid}:", f"{LAND_RETRY}{tid}:"))]:
+            self.unflag(k)
+
+    def land_retry_due(self, t, mg: Git, trunk: str) -> bool:
+        """T-0404: a landing held on main-only failures is retried once the trunk has moved past the commit it was
+        held on — by a commit outside the record paths and reports/ (the journal moves the trunk every tick; only
+        code can fix a test) — at most once per trunk commit: the mark `landretry:<id>:<sha>` moves to the head being tried.
+        A hold from before T-0404 (no mark) starts its clock at the current head and keeps holding."""
+        head = self.trunk_head(trunk)
+        if not head:
+            return False
+        marks = [k for k in self.flags if k.startswith(f"{LAND_RETRY}{t.id}:")]
+        since = marks[0].split(":", 2)[2] if marks else None
+        if since == head:
+            return False
+        for k in marks:
+            self.unflag(k)
+        self.flags.add(f"{LAND_RETRY}{t.id}:{head}")
+        if not since:
+            return False
+        d = mg.run("diff", "--name-only", since, head)
+        if not d.ok:                                    # an unknown hold commit (rewritten history): retry once
+            return True
+        return any(p.strip() and not is_record_path(p.strip()) and not p.strip().startswith("reports/") for p in d.out.splitlines())
 
     OMRI_LAND_REASONS = {"lost_worktree", "error", "trunk", "busy"}
 
