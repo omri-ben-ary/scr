@@ -17,3 +17,5 @@ From the event log since the previous report: throughput (merged, by kind), auto
 
 ## Weekly (Sunday 08:00) → `reports/weekly/<iso-week>.md`
 Trends over the four last weeks, the three biggest leaks, and at most three concrete Gate 4 proposals, each as an Omri-queue item (`kind: system`, `origin: observer`) with the exact config diff or instruction change and the metric it should move.
+
+Worktree disk use (T-0321; C: hit 0 bytes free on 2026-10-10): run `scr worktrees gc --dry-run --json` (read-only; never without `--dry-run`) and report, per workload, the number and total GB of worktrees (`.worktrees`, `../scriptorium-worktrees`) and of `<repo>-RETIRED/` `.lake/build` trees, plus the reclaimable total (rows whose action is `delete` / `drop .lake/build`) and free space on the drive. Any reclaimable worktree is a leak (the watcher should have deleted it): list it, and when the reclaimable total passes 10 GB or the drive has under 20 GB free, propose `scr worktrees gc` to Omri as an Omri-queue item.

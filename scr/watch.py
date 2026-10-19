@@ -45,7 +45,9 @@ Per tick:
                    goes to the next ready task on the same tick (a dispatched task WITH a launch event is the
                    launcher's and is left alone); after dispatch_timeout_rounds such rounds in a row with no launch,
                    one needs line quoting the launcher's reason from this log (T-0127; no attempt was charged)
-  accepted      -> land + merge + retire (auto-land)
+  accepted      -> land + merge + retire (auto-land): the merged task's worktree is deleted (T-0321)
+  closed/rejected -> the worktree is deleted when the status changed while this watcher runs (T-0321);
+                   older ones wait for `scr worktrees gc`, which Omri runs
   merges/night  -> intake (auto-intake)
   below cap     -> dispatch + launch headless (auto-dispatch)
   needs list    -> written to .scr/watch.needs.json at the end of every tick, empty or not, paused or not (T-0173):
@@ -66,11 +68,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import bgwait, jobs
-from .events import EventLog
+from .events import EventLog, now_iso
 from .gitops import Git
 from .journal import journal
 from .lifecycle import requeue
-from .ops import (LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_record_path, is_scriptorium_task, land, land_any, land_scriptorium, retire,
+from .ops import (FINISHED_STATUSES, LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_record_path, is_scriptorium_task, land, land_any, land_scriptorium, retire,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
 from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_exe, session_argv, start_claude
 from .state import State
@@ -520,6 +522,7 @@ class Watcher:
         self_wl = self_workload(root, self.store)
         self.push_journal = bool(push) or bool((self_wl.cfg if self_wl else {}).get("push", False))
         self.flags: set[str] = set()
+        self.started_iso = now_iso()               # closed/rejected after this are retired by retire_finished (T-0321)
         sf = root / STATE_FILE
         if sf.exists():
             self.flags = {l.strip() for l in sf.read_text(encoding="utf-8").splitlines() if l.strip()}
@@ -1011,6 +1014,7 @@ class Watcher:
                     continue
                 if self.land_via_job(t) == "merged":
                     merged_now += 1
+        self.retire_finished(tasks)
         self.retire_refused_needs(tasks)
 
         if ok:
@@ -1607,7 +1611,7 @@ class Watcher:
 
     def apply_land_job(self, t, job: dict) -> str:
         """A finished landing job: on rc 0 `scr land` already recorded the merge (status merged, events, cascade) and
-        the worktree is retired here; otherwise the job log's FAILED / REFUSED / merge-failed line is the reason and
+        the worktree is retired (deleted, T-0321) here; otherwise the job log's FAILED / REFUSED / merge-failed line is the reason and
         the failure takes the same route as before (land_failed for the scriptorium, the QI conflict / scope / push
         branches), i.e. auto-fix first, Omri third."""
         job["applied"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1757,13 +1761,36 @@ class Watcher:
         self.flags.add(f"retire_refused:{tid}:{code}")
         self.flags.add(f"retire_retry:{tid}:{datetime.now():%Y%m%dT%H%M%S}")   # the attempt just made (T-0209)
 
+    def retire_finished(self, tasks: dict) -> None:
+        """A task set closed or rejected (by hand or a review) has no landing to retire its worktree (T-0321): one
+        whose record changed since this watcher started and whose worktree is still there is retired (deleted) once;
+        a refusal raises the same retire_refused flag and hourly retry as a merged task's. The trees of tasks closed
+        before the watcher started are left to `scr worktrees gc` (Omri runs the first one)."""
+        for t in tasks.values():
+            if t.status not in {"closed", "rejected"} or str(t.rec.get("updated") or "") < self.started_iso:
+                continue
+            if any(k.startswith(f"retire_refused:{t.id}:") for k in self.flags):
+                continue
+            try:
+                if not task_worktree(workload_for(self.root, self.store, t), t).is_dir():
+                    continue
+                r = retire(self.root, t.id, execute=True)
+            except Exception as e:  # noqa: BLE001
+                r = {"ok": False, "code": "error", "out": [str(e)]}
+            self.log(f"{t.id} {t.status}: " + ("worktree retired" if r["ok"] else f"worktree retire refused ({r['code']})"))
+            for line in r["out"]:
+                self.log(f"  retire: {line}")
+            if not r["ok"]:
+                self.retire_refused(t.id, r["code"])
+
     def retire_refused_needs(self, tasks: dict) -> None:
-        """Each flagged task that is still `merged` with its worktree present gets its retire retried at most hourly
-        (T-0209); a success clears flag and line, a refusal keeps both. Anything else drops the flag."""
+        """Each flagged task that is still merged / closed / rejected (T-0321) with its worktree present gets its retire
+        retried at most hourly (T-0209); a success clears flag and line, a refusal keeps both. Anything else drops the
+        flag."""
         for k in sorted(k for k in self.flags if k.startswith("retire_refused:")):
             _, tid, code = k.split(":", 2)
             t = tasks.get(tid)
-            if t is None or t.status != "merged" or not task_worktree(workload_for(self.root, self.store, t), t).exists():
+            if t is None or t.status not in FINISHED_STATUSES or not task_worktree(workload_for(self.root, self.store, t), t).exists():
                 self.unflag(k)
                 for r in [r for r in self.flags if r.startswith(f"retire_retry:{tid}:")]:
                     self.unflag(r)
@@ -1771,7 +1798,7 @@ class Watcher:
             code = self._retry_retire(tid, code)
             if code is None:
                 continue
-            self.need(f"retire_refused:{tid}", f"{tid} merged; worktree retire refused ({code}) — see log", tid)
+            self.need(f"retire_refused:{tid}", f"{tid} {t.status}; worktree retire refused ({code}) — see log", tid)
 
     def _retry_retire(self, tid: str, code: str) -> str | None:
         """Re-run a refused retire once the last attempt (flag `retire_retry:<id>:<stamp>`, kept across restarts) is an

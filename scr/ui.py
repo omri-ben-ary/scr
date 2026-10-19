@@ -130,7 +130,11 @@ def _started(root: Path, tid: str) -> str | None:
     return ts
 
 
-_CHORE_CACHE: dict = {"ts": 0.0, "items": []}
+# chore_cards' cache (T-0401): one entry per resolved root, {"ts", "acked", "items"}, so a second root never gets the
+# first root's cards. `acked` is the chore keys dismissed when the entry was computed: a dismissal within max_age
+# recomputes instead of showing the dismissed chore. A new entry evicts the expired ones, so a long-lived UI keeps
+# at most one entry per root it served in the last max_age seconds.
+_CHORE_CACHE: dict[str, dict] = {}
 
 # System events that become a "needs you" card, one per (task, name). `stale` is a live condition: its card
 # shows only while the watcher's `stale:<task>` flag is set (idle >= stale_minutes, session alive) and
@@ -162,17 +166,22 @@ def _watch_flags(root: Path) -> set[str]:
 
 
 def chore_cards(root: Path, acked: set[str], max_age: float = 120.0) -> list[dict]:
-    if time.time() - _CHORE_CACHE["ts"] < max_age:
-        return _CHORE_CACHE["items"]
+    key, mine, now = str(Path(root).resolve()), frozenset(a for a in acked if a.startswith("chore:")), time.time()
+    hit = _CHORE_CACHE.get(key)
+    if hit and now - hit["ts"] < max_age and hit["acked"] == mine:
+        return hit["items"]
     items = [{"key": f"chore:{c['id']}", "id": c["id"], "type": "chore", "kind": "manual" if c["manual"] else "run",
               "title": c["title"], "text": c["why"], "link": c["link"], "options": [], "runnable": c["runnable"]}
              for c in chores_mod.status(root, acked)]
-    _CHORE_CACHE.update(ts=time.time(), items=items)
+    for k in [k for k, v in _CHORE_CACHE.items() if now - v["ts"] >= max_age]:
+        del _CHORE_CACHE[k]
+    _CHORE_CACHE[key] = {"ts": time.time(), "acked": mine, "items": items}
     return items
 
 
 def invalidate_chores() -> None:
-    _CHORE_CACHE["ts"] = 0.0
+    """Every root's chore cards are recomputed on their next call (a chore ran, T-0401: all roots, not just one)."""
+    _CHORE_CACHE.clear()
 
 
 CARD_ORDER = {"hotfix": -1, "chore": 0, "gate": 1, "help": 2, "decision": 3, "system": 4, "watch": 5}
