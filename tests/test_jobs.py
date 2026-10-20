@@ -284,3 +284,33 @@ def test_the_watchers_landing_job_runs_in_the_landing_lane(tmp_path, monkeypatch
     assert job["status"] == "queued" and started == []      # jobs_concurrency 1 is full at submit time
     jobs.poll(root, datetime.now(timezone.utc))
     assert started == [job["id"]]                           # the landing lane starts it anyway
+
+
+def test_submit_resolves_a_relative_program_against_the_job_cwd(root, tmp_path):
+    """T-0394: J-0132 recorded `.venv/Scripts/python.exe` verbatim and Windows CreateProcess looked it up from the
+    wrapper's directory, not the job cwd (rc 127). A relative program with a separator is now made absolute."""
+    wt = tmp_path / "wt"; (wt / ".venv" / "Scripts").mkdir(parents=True)
+    (wt / ".venv" / "Scripts" / "python.exe").write_bytes(b"")
+    j = jobs.submit(root["root"], [".venv/Scripts/python.exe", "-c", "pass"], cwd=wt)
+    prog = Path(j["cmd"][0])
+    assert prog.is_absolute() and prog == (wt / ".venv" / "Scripts" / "python.exe").resolve()
+    assert prog.is_relative_to(wt.resolve()) and j["cmd"][1:] == ["-c", "pass"]
+    on_disk = json.loads((root["root"] / ".scr" / "jobs" / f"{j['id']}.json").read_text())
+    assert on_disk["cmd"][0] == str(prog) and on_disk["name"] == "python.exe"
+
+
+def test_submit_refuses_a_relative_program_missing_under_the_cwd(root, tmp_path):
+    wt = tmp_path / "wt"; wt.mkdir()
+    before = sorted((root["root"] / ".scr").glob("jobs/J-*.json"))
+    with pytest.raises(ValueError) as e:
+        jobs.submit(root["root"], ["./missing/run.exe", "x"], cwd=wt)
+    msg = str(e.value)
+    assert "./missing/run.exe" in msg and str(wt.resolve()) in msg
+    assert "absolute path" in msg and "--cwd" in msg              # tells the Scriber what to do
+    assert sorted((root["root"] / ".scr").glob("jobs/J-*.json")) == before and root["started"] == []
+
+
+def test_submit_leaves_a_bare_program_name_to_path_lookup(root, tmp_path):
+    j = jobs.submit(root["root"], ["python", "-m", "pytest"], cwd=tmp_path)
+    assert j["cmd"] == ["python", "-m", "pytest"]
+    assert json.loads((root["root"] / ".scr" / "jobs" / f"{j['id']}.json").read_text())["cmd"][0] == "python"
