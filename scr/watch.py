@@ -986,6 +986,8 @@ class Watcher:
         # reloads the records and so fills the slot a stuck task freed on the SAME tick.
         # A dispatch the launcher never picked up (T-0122) goes back to `ready` first: its slot is then free for
         # the auto-dispatch below, which may hand it to the next ready task or to this one again.
+        if ok and self.cloud_landing_checks(now, tasks):                  # cloud lane branches -> submitted
+            tasks = self.store.load_all()
         if self.auto_decide and ok and self.dispatch_checks(now, tasks):
             tasks = self.store.load_all()
         if self.auto_decide and ok and self.escalation_checks(now, tasks):
@@ -1263,6 +1265,75 @@ class Watcher:
             return []
 
     # ---- a failed dispatch leaves the slot (T-0122) ---------------------------------------------------
+    # ---- cloud lane (docs/proposals/cloud-pool.md; Omri 2026-10-21: "automate the landing part of the cloud tasks") ----
+    CLOUD_MARK = "cloud lane"
+
+    def cloud_tasks(self, tasks: dict) -> list:
+        """Tasks a cloud pool session is running: status `blocked`, and the newest `-> blocked` state event carries a
+        note containing CLOUD_MARK (that note is how Omri / the pool hands a task to the cloud lane; the record itself
+        is untouched so the PC lane never dispatches it)."""
+        last: dict[str, str] = {}
+        for e in self.read_events():
+            if e.get("kind") == "state" and e.get("to") == "blocked" and e.get("task"):
+                last[e["task"]] = str(e.get("note") or "")
+        return [t for t in tasks.values() if t.status == "blocked" and self.CLOUD_MARK in last.get(t.id, "").lower()]
+
+    def cloud_landing_checks(self, now: datetime, tasks: dict) -> int:
+        """Bring finished cloud-lane branches into the normal review path. For every cloud task: fetch
+        `task/<id>` from the workload's origin; when its tip commit subject starts with `scriber done:` and
+        tasks/<id>/report.md is a finished report (the pool writes it), attach `.worktrees/<id>` to that branch
+        (fast-forward it if Omri attached it by hand) and walk blocked -> ready -> dispatched -> in_progress ->
+        submitted as steward:<id>, each hop a journaled event, so the Steward reviews it exactly like a local
+        worktree branch. Returns the number landed this tick. A fetch failure or an unfinished report is silent
+        (the branch is not there yet); a worktree or transition failure raises one needs line."""
+        landed = 0
+        cloud = self.cloud_tasks(tasks)
+        if not cloud:
+            return 0
+        g = Git(self.wl.repo)
+        for t in cloud:
+            br = f"task/{t.id}"
+            if not g.run("fetch", "origin", f"{br}:refs/remotes/origin/{br}", timeout=120).ok:
+                continue                                            # not pushed yet
+            subj = g.run("log", "-1", "--format=%s", f"origin/{br}")
+            if not subj.ok or not subj.out.strip().lower().startswith("scriber done:"):
+                continue
+            rep = t.dir / "report.md"
+            rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
+            if not rep_text or rep_text == self.report_tpl or report_unfinished(rep_text, self.report_tpl):
+                if self.flag(f"cloud_report_wait:{t.id}:{g.run('rev-parse', '--short', f'origin/{br}').out.strip()}"):
+                    self.log(f"{t.id} cloud branch {br} is done but report.md is not written yet; waiting")
+                continue
+            wt = task_worktree(self.wl, t)
+            if wt.exists():
+                r = Git(wt).run("pull", "--ff-only", "origin", br, timeout=120)
+            elif g.branch_exists(br):
+                r = g.run("worktree", "add", str(wt), br)
+                if r.ok:
+                    r = Git(wt).run("pull", "--ff-only", "origin", br, timeout=120)
+            else:
+                r = g.run("worktree", "add", "--track", "-b", br, str(wt), f"origin/{br}")
+            if not r.ok:
+                self.need(f"cloud_worktree:{t.id}", f"{t.id} cloud branch {br} is done but the worktree could not be attached: {r.out[-200:]}", t.id)
+                continue
+            sha = g.run("rev-parse", "--short", f"origin/{br}").out.strip()
+            hops = [("ready", f"cloud lane: branch {br} @ {sha} fetched, worktree attached"),
+                    ("dispatched", "cloud lane: ran in a cloud pool session"),
+                    ("in_progress", "cloud lane"),
+                    ("submitted", "cloud scriber finished; report.md and log.md in the task dir; review as a local branch")]
+            cur = t.status
+            for st, note in hops:
+                if self.scr(f"steward:{t.id}", "task", "set", t.id, st, "--note", note, "--quiet") is None:
+                    self.need(f"cloud_land:{t.id}", f"{t.id} cloud landing stopped at {cur} -> {st}; set it on by hand (branch {br} @ {sha})", t.id)
+                    break
+                cur = st
+            else:
+                self.scr(f"steward:{t.id}", "event", "system", "--name", "cloud_landed", "--task", t.id, "--note", f"{br} @ {sha}", "--quiet")
+                self.log(f"{t.id} cloud branch {br} @ {sha} landed into review")
+                self.unflag(f"cloud_land:{t.id}"); self.unflag(f"cloud_worktree:{t.id}")
+                landed += 1
+        return landed
+
     def dispatch_checks(self, now: datetime, tasks: dict) -> int:
         """`dispatched` -> `ready` for every task whose dispatch is older than dispatch_timeout_minutes with no
         `launch` event after it (`dispatch_stale`, a pure function of the log and `now`): the launcher never
