@@ -1765,14 +1765,25 @@ class Watcher:
         """A task set closed or rejected (by hand or a review) has no landing to retire its worktree (T-0321): one
         whose record changed since this watcher started and whose worktree is still there is retired (deleted) once;
         a refusal raises the same retire_refused flag and hourly retry as a merged task's. The trees of tasks closed
-        before the watcher started are left to `scr worktrees gc` (Omri runs the first one)."""
+        before the watcher started are left to `scr worktrees gc` (Omri runs the first one). A tree something still works
+        in (T-0440: the run's live session, or an active job of the task or with its cwd inside the tree) is skipped on
+        this tick with one NEEDS-YOU line (flag `retire_busy:<id>`, logged once); it is retired on the first tick after."""
+        busy_now = set()
         for t in tasks.values():
             if t.status not in {"closed", "rejected"} or str(t.rec.get("updated") or "") < self.started_iso:
                 continue
             if any(k.startswith(f"retire_refused:{t.id}:") for k in self.flags):
                 continue
             try:
-                if not task_worktree(workload_for(self.root, self.store, t), t).is_dir():
+                wt = task_worktree(workload_for(self.root, self.store, t), t)
+                if not wt.is_dir():
+                    continue
+                busy = self.retire_busy(t, wt)
+                if busy:
+                    busy_now.add(t.id)
+                    if self.flag(f"retire_busy:{t.id}"):
+                        self.log(f"{t.id} {t.status}: worktree retire deferred, still in use ({busy})")
+                    self.need(f"retire_busy:{t.id}", f"{t.id} {t.status}; worktree not retired while {busy} works in it", t.id)
                     continue
                 r = retire(self.root, t.id, execute=True)
             except Exception as e:  # noqa: BLE001
@@ -1782,6 +1793,28 @@ class Watcher:
                 self.log(f"  retire: {line}")
             if not r["ok"]:
                 self.retire_refused(t.id, r["code"])
+        for k in [k for k in self.flags if k.startswith("retire_busy:") and k.split(":", 1)[1] not in busy_now]:
+            self.unflag(k)
+
+    def retire_busy(self, t, wt: Path) -> str | None:
+        """What still works in a finished task's worktree `wt` (T-0440), or None: the current run's headless session
+        when its pid is alive and not reused (`pid N`), else each active job whose task is `t` or whose cwd resolves
+        inside `wt` (`job J-xxxx`). Only looks; never stops anything."""
+        sess = self.session_of(t)
+        if sess and pid_alive(sess["pid"]) and not self.pid_reused(sess):
+            return f"session pid {sess['pid']}"
+        root = wt.resolve()
+        ids = []
+        for j in jobs.list_jobs(self.root, active_only=True):
+            inside = False
+            if j.get("cwd"):
+                try:
+                    inside = Path(j["cwd"]).resolve().is_relative_to(root)
+                except (OSError, ValueError):
+                    inside = False
+            if j.get("task") == t.id or inside:
+                ids.append(str(j.get("id")))
+        return f"job {', '.join(ids)}" if ids else None
 
     def retire_refused_needs(self, tasks: dict) -> None:
         """Each flagged task that is still merged / closed / rejected (T-0321) with its worktree present gets its retire

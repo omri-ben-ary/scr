@@ -3027,6 +3027,84 @@ def test_watch_dirty_finished_worktree_takes_the_retire_refused_path(world):
     assert [n["key"] for n in w.need_items] == ["retire_refused:T-0001"] and "closed" in w.needs[0]
 
 
+
+# ---- T-0440: a finished tree something still works in is not retired; one need line until it is free ----------
+def _busy_job(root: Path, cwd: Path, task: str | None = None, jid: str = "J-0007") -> None:
+    """A `running` job record (no wrapper pid, no deadline: jobs.poll leaves it alone) working in `cwd`."""
+    from scr import jobs
+    jobs.save(root, {"id": jid, "task": task, "name": "lake", "cmd": ["lake", "build"], "cwd": str(cwd.resolve()),
+                     "status": "running", "pid": None, "deadline": None, "timeout_min": 240})
+
+
+def _busy_keys(w) -> list[str]:
+    return [n["key"] for n in w.need_items if n["key"].startswith("retire_busy:")]
+
+
+def test_watch_retire_skips_a_rejected_tree_with_a_live_session(world, monkeypatch):
+    """DoD 1 + 3: rejected task, worktree present, the run's launch pid alive -> the tick leaves the tree, never calls
+    retire, raises one need line naming the task and pid; a second tick adds no second line. Once the pid is dead
+    (and no job is active) the next tick retires the tree and clears flag and line."""
+    root, repo, wt = _retire_world(world, merged=False)
+    _launched(root, "T-0001", 4242)
+    _finish(root, "T-0001", "rejected")
+    calls = _counting_retire(monkeypatch)
+    alive = {4242}
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: pid in alive)
+    w = Watcher(root, quiet=True)
+    w.started_iso = "2000-01-01T00:00:00Z"
+    for _ in range(2):
+        w.tick()
+        assert wt.exists() and calls == [] and _busy_keys(w) == ["retire_busy:T-0001"]
+        lines = [l for l in w.needs if "4242" in l]
+        assert len(lines) == 1 and "T-0001" in lines[0] and "rejected" in lines[0]
+        assert "retire_busy:T-0001" in w.flags
+    assert sum("retire deferred" in l for l in (root / LOG_FILE).read_text(encoding="utf-8").splitlines()) == 1
+    alive.clear()
+    w.tick()
+    assert not wt.exists() and calls == ["T-0001"] and len(_events(root, "worktree_deleted", "T-0001")) == 1
+    assert "retire_busy:T-0001" not in w.flags and _busy_keys(w) == [] and not any("4242" in l for l in w.needs)
+
+
+def test_watch_retire_skips_a_tree_with_an_active_job_inside(world, monkeypatch):
+    """DoD 2: no live session but a `running` job whose cwd is inside the worktree (owned by no task) -> skipped,
+    the need line names the J-id; the job finished -> the next tick retires."""
+    root, repo, wt = _retire_world(world, merged=False)
+    _finish(root, "T-0001", "closed")
+    (wt / "sub").mkdir()
+    _busy_job(root, wt / "sub")
+    calls = _counting_retire(monkeypatch)
+    w = Watcher(root, quiet=True)
+    w.started_iso = "2000-01-01T00:00:00Z"
+    w.tick()
+    assert wt.exists() and calls == [] and _busy_keys(w) == ["retire_busy:T-0001"]
+    assert len([l for l in w.needs if "J-0007" in l]) == 1 and "T-0001" in w.needs[[i for i, l in enumerate(w.needs) if "J-0007" in l][0]]
+    from scr import jobs
+    jobs.save(root, {**jobs.load(root, "J-0007"), "status": "done", "rc": 0})
+    w.tick()
+    assert not wt.exists() and calls == ["T-0001"] and "retire_busy:T-0001" not in w.flags and _busy_keys(w) == []
+
+
+def test_watch_retire_busy_by_task_job_and_reused_pid(world, monkeypatch):
+    """An active job of the task (cwd elsewhere) also defers; a launch pid that now belongs to another process
+    (pid_reused) counts as dead, so with no job the tree is retired."""
+    root, repo, wt = _retire_world(world, merged=False)
+    _launched(root, "T-0001", 4242, created=111)
+    _finish(root, "T-0001", "rejected")
+    _busy_job(root, root, task="T-0001", jid="J-0009")
+    calls = _counting_retire(monkeypatch)
+    monkeypatch.setattr(watch_mod, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(watch_mod, "process_created", lambda pid: 222)
+    w = Watcher(root, quiet=True)
+    w.started_iso = "2000-01-01T00:00:00Z"
+    w.retire_finished(w.store.load_all())
+    assert wt.exists() and calls == [] and _busy_keys(w) == ["retire_busy:T-0001"] and "J-0009" in w.needs[0]
+    assert "4242" not in w.needs[0]
+    from scr import jobs
+    jobs.save(root, {**jobs.load(root, "J-0009"), "status": "killed"})
+    w.need_items, w.needs = [], []
+    w.retire_finished(w.store.load_all())
+    assert not wt.exists() and calls == ["T-0001"] and "retire_busy:T-0001" not in w.flags and w.need_items == []
+
 # ---- T-0187: out of usage credits is not a session death ---------------------------------------------------
 # 2026-09-23 09:47Z-13:56Z the account had no credits: each headless session printed one line and exited, the
 # watcher returned the task and spent its attempt, then dispatched the next two into the same wall (16 tasks).
