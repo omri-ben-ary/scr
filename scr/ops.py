@@ -443,6 +443,26 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
     if dry_run:
         return {"ok": True, "url": None, "out": out}
 
+    # 2026-10-21 hotfix (T-0560 double landing): a branch that origin/<main> already contains — merged by an earlier
+    # landing job or by hand — is landed by recording the merge, not by pushing and opening a PR again. Before this,
+    # the re-applied `accepted` of an already-merged task queued a second landing whose PR creation failed, the
+    # watcher read "rc 0 but not merged" as a test failure, and auto-fix dispatched a scriber on a merged task.
+    mg0 = Git(wl.repo)
+    mg0.fetch()
+    if mg0.remote_contains(f"origin/{wl.main}", br):
+        out.append(f"  already in origin/{wl.main}: nothing to push, no PR")
+        if t.status == "submitted":
+            from . import lifecycle
+            lifecycle.apply(t.rec, "accepted"); t.save()
+            log.append("state", task=tid, **{"from": "submitted"}, to="accepted", actor=f"steward:{tid}", note=f"already in origin/{wl.main}")
+            t = store.get(tid)
+        if t.status != "merged":
+            out.append(f"  {tid} marked merged (branch already in {wl.main})")
+            out += _record_merged(root, store, tid, f"already in origin/{wl.main} (recorded by land)", report)
+        else:
+            out.append(f"  {tid} is already merged")
+        return {"ok": True, "url": pr_url_for(br, wt) if (not no_pr and gh_available()) else None, "out": out}
+
     r = g.push(br)
     if not r.ok:
         out.append(f"  push failed: {r.out[-400:]}")
@@ -469,6 +489,11 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
                 bf.write_text(body, encoding="utf-8")
                 url = pr_create(wl.main, br, f"[{tid}] {title}", bf, wt, draft=draft)
                 out.append(f"  PR: {url}" if url else "  PR creation failed (see gh output)")
+                if not url and merge:
+                    # 2026-10-21 hotfix: a landing asked to merge cannot succeed without a PR; say so as a
+                    # FAILED (pr) line so the watcher names the right reason instead of guessing "tests".
+                    out.append("  FAILED (pr): PR creation failed; not merged")
+                    return {"ok": False, "url": None, "out": out}
     if t.status == "submitted":
         from . import lifecycle
         lifecycle.apply(t.rec, "accepted"); t.save()

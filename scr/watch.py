@@ -1603,6 +1603,20 @@ class Watcher:
         rev = t.dir / "review.md"
         if not rev.exists():
             return False
+        # 2026-10-21 hotfix (T-0561): a review.md written BEFORE the task's current submission is the previous
+        # attempt's review, whatever its digest — the digest guard below misses it when the review session applied
+        # its own verdict without the digest note. Such a file is archived and the review re-run.
+        since = submitted_since(self.read_events(), t.id)
+        try:
+            mtime = datetime.fromtimestamp(rev.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            mtime = None
+        if since and mtime and mtime < since:
+            why = f"review.md ({mtime:%Y-%m-%dT%H:%M:%SZ}) predates the current submission ({since:%Y-%m-%dT%H:%M:%SZ})"
+            if self.rerun_review(t, why):
+                return False
+            self.need(f"decision_stale:{t.id}", f"{t.id} is submitted again but {why} — a fresh review is needed", t.id)
+            return False
         text = rev.read_text(encoding="utf-8", errors="replace")
         verdict, problem = read_decision(text)
         if problem:
@@ -1767,6 +1781,11 @@ class Watcher:
         elif reason == "scope":
             fix = (f"landing refused for out-of-scope paths ({why[:200]}): either widen scope.files in the record "
                    f"(`scr task field {t.id} scope.files <list>`) when the task owns them, or revert the drift commit; then resubmit.")
+        elif reason == "pr":
+            # 2026-10-21 hotfix: a failed PR creation (gh, auth, an existing PR state) is not something a scriber
+            # can fix on the branch; it goes to Omri, and the task stays accepted.
+            self.need(f"land_pr_failed:{t.id}", f"{t.id} accepted but PR creation failed ({why[:200]}) — check gh / the PR state and rerun `scr land {t.id} --merge`", t.id)
+            return "failed"
         else:
             fix = f"landing failed ({why[:300] or reason}); fix the branch and resubmit."
         if not self.autofix(t, "land", fix):
