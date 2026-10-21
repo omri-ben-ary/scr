@@ -617,3 +617,60 @@ def test_decision_refused_close_does_not_start_the_concierge(world, monkeypatch)
     r = apply(root, tid, "option 2", kind="decision", concierge=True)
     assert r["ok"] is True and len(calls) == 1 and calls[0][1] == tid, (r, calls)
     assert Store(root).get(tid).status == "closed"
+
+
+# ---- 2026-10-21 hotfix: stale review.md on resubmission; already-merged branch landing ----------------------
+def test_review_written_before_the_current_submission_is_archived_not_applied(world):
+    """T-0561, 2026-10-21: the task was returned, fixed, resubmitted by Omri (`--force`), and the watcher applied the
+    OLD review.md again (the review session had applied its own verdict without the digest note, so the digest guard
+    did not fire). A review.md whose mtime predates the current `submitted` transition is the previous attempt's:
+    it is archived (review-stale-*.md) and the review re-run, the status stays submitted."""
+    import os
+    import time
+    from scr.watch import Watcher
+    root, _, _ = world
+    t = _submit(root, worktree=False)
+    (t.dir / "review.md").write_text(_review("returned (feedback below)"), encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(t.dir / "review.md", (old, old))          # the review was written an hour before the resubmission
+    n_state = len(_events(root, "T-0001", "state"))
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert res["ok"], res
+    assert Store(root).get("T-0001").status == "submitted" and res["decided"] == []
+    assert len(_events(root, "T-0001", "state")) == n_state
+    assert not (t.dir / "review.md").exists() and list(t.dir.glob("review-stale-*.md")), sorted(p.name for p in t.dir.iterdir())
+    assert _events(root, "T-0001", "system", name="review_retry"), "a review re-run event is logged"
+    # a review written after the submission is applied as before
+    (t.dir / "review.md").write_text(_review("accepted"), encoding="utf-8")
+    res = Watcher(root, quiet=True, auto_decide=True).tick()
+    assert Store(root).get("T-0001").status == "accepted" and res["decided"] == [{"task": "T-0001", "decision": "accepted"}]
+
+
+def test_land_of_a_branch_already_in_main_records_merged_without_a_pr(world, monkeypatch):
+    """T-0560, 2026-10-21: an `accepted` decision re-applied to a task whose branch PR #204 had already merged queued a
+    second landing; PR creation failed, the watcher read 'rc 0 but not merged' as a test failure, and auto-fix
+    dispatched a scriber on a merged task. `land` now checks origin/<main> first: a branch it already contains is
+    recorded merged (status, event, cascade) with nothing pushed and no PR."""
+    from scr import ops
+    root, repo, origin = world
+    t = _submit(root)
+    (t.dir / "review.md").write_text(_review("accepted"), encoding="utf-8")
+    wl = ops.workload_for(root, Store(root), Store(root).get("T-0001"))
+    wt = ops.task_worktree(wl, Store(root).get("T-0001"))
+    g = Git(wt)
+    (wt / "landed.txt").write_text("x\n", encoding="utf-8")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "work")
+    g.push("task/T-0001")
+    # merge the branch into main on the origin by hand, as a hand-merge or an earlier landing would
+    mg = Git(wl.repo)
+    mg.fetch(); mg.run("checkout", "-q", wl.main); mg.run("merge", "-q", "--no-ff", "-m", "merged by hand", "task/T-0001"); mg.run("push", "-q", "origin", wl.main)
+    calls: list[str] = []
+    monkeypatch.setattr(ops, "pr_create", lambda *a, **k: calls.append("pr_create") or None)
+    monkeypatch.setattr(ops, "gh_available", lambda: True)
+    monkeypatch.setattr(ops, "pr_url_for", lambda *a, **k: None)
+    res = land(root, "T-0001", merge=True)
+    assert res["ok"], res["out"]
+    assert any("already in origin/" in l for l in res["out"]), res["out"]
+    assert calls == [], "no PR is created for a branch main already contains"
+    assert Store(root).get("T-0001").status == "merged"
+    assert _events(root, "T-0001", "state", to="merged"), "the merge is recorded"
