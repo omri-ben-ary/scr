@@ -990,6 +990,11 @@ class Watcher:
             tasks = self.store.load_all()
         if self.auto_decide and ok and self.dispatch_checks(now, tasks):
             tasks = self.store.load_all()
+        if self.auto_dispatch and ok and not self.credits_paused(now):   # cloud lane: hand over up to limits.cloud_pools
+            out = self.scr("steward", "cloud", "claim", "--quiet")
+            if out and "-> blocked" in out:
+                self.log("cloud claim: " + "; ".join(l.strip() for l in out.splitlines() if "-> blocked" in l))
+                tasks = self.store.load_all()
         if self.auto_decide and ok and self.escalation_checks(now, tasks):
             tasks = self.store.load_all()
             review = [t for t in tasks.values() if t.status == "submitted"]
@@ -1272,11 +1277,9 @@ class Watcher:
         """Tasks a cloud pool session is running: status `blocked`, and the newest `-> blocked` state event carries a
         note containing CLOUD_MARK (that note is how Omri / the pool hands a task to the cloud lane; the record itself
         is untouched so the PC lane never dispatches it)."""
-        last: dict[str, str] = {}
-        for e in self.read_events():
-            if e.get("kind") == "state" and e.get("to") == "blocked" and e.get("task"):
-                last[e["task"]] = str(e.get("note") or "")
-        return [t for t in tasks.values() if t.status == "blocked" and self.CLOUD_MARK in last.get(t.id, "").lower()]
+        from .cloud import claimed_ids
+        ids = set(claimed_ids(self.read_events(), tasks))
+        return [t for t in tasks.values() if t.id in ids]
 
     def cloud_landing_checks(self, now: datetime, tasks: dict) -> int:
         """Bring finished cloud-lane branches into the normal review path. For every cloud task: fetch
@@ -1300,6 +1303,15 @@ class Watcher:
                 continue
             rep = t.dir / "report.md"
             rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
+            if not rep_text or rep_text == self.report_tpl or report_unfinished(rep_text, self.report_tpl):
+                # the pool may deliver report.md + log.md on a `cloud-reports/<id>` branch (no bridge needed)
+                rb = f"cloud-reports/{t.id}"
+                if g.run("fetch", "origin", f"{rb}:refs/remotes/origin/{rb}", timeout=120).ok:
+                    for name in ("report.md", "log.md"):
+                        r = g.run("show", f"origin/{rb}:{name}")
+                        if r.ok and r.out.strip():
+                            (t.dir / name).write_text(r.out.rstrip("\n") + "\n", encoding="utf-8")
+                    rep_text = rep.read_text(encoding="utf-8", errors="replace").strip() if rep.exists() else ""
             if not rep_text or rep_text == self.report_tpl or report_unfinished(rep_text, self.report_tpl):
                 if self.flag(f"cloud_report_wait:{t.id}:{g.run('rev-parse', '--short', f'origin/{br}').out.strip()}"):
                     self.log(f"{t.id} cloud branch {br} is done but report.md is not written yet; waiting")
@@ -1328,6 +1340,10 @@ class Watcher:
                     break
                 cur = st
             else:
+                try:                                                  # the claim is spent: the PC lane owns the task from here
+                    t2 = self.store.get(t.id); t2.rec.pop("lane", None); t2.save()
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"{t.id} could not clear lane: {e}")
                 self.scr(f"steward:{t.id}", "event", "system", "--name", "cloud_landed", "--task", t.id, "--note", f"{br} @ {sha}", "--quiet")
                 self.log(f"{t.id} cloud branch {br} @ {sha} landed into review")
                 self.unflag(f"cloud_land:{t.id}"); self.unflag(f"cloud_worktree:{t.id}")

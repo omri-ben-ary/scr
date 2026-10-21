@@ -286,6 +286,44 @@ def _worktree_root(root: Path, store: Store, key: str | None) -> str:
         return wl.wt_root.as_posix()
 
 
+def cmd_cloud(args):
+    """Cloud lane (scr/cloud.py): `claim` hands ready, cloud-eligible tasks to the pool up to limits.cloud_pools by
+    setting them `blocked` with the cloud-lane note (journaled, so the record is the claim); `status` lists claims."""
+    from . import cloud
+    from .events import now_iso
+    root, store, log = _ctx(args)
+    tasks = store.load_all()
+    events = log.read()
+    busy = cloud.claimed_ids(events, tasks)
+    cap, lean_ok = cloud.cloud_limits(store)
+    if args.op == "status":
+        print(f"cloud_pools {cap} (lean {'on' if lean_ok else 'off'}); claimed {len(busy)}: {', '.join(busy) or '—'}")
+        return
+    if cap <= 0:
+        if not args.quiet:
+            print("cloud_pools is 0 in config/limits.yaml: nothing claimed")
+        return
+    g = Graph.build(tasks)
+    chosen, skipped = cloud.pick(store, g, events, store.config("weights"))
+    if args.dry_run:
+        print("would claim:", ", ".join(chosen) or "—", f"(claimed now: {len(busy)}, cap {cap})")
+        for tid, why in skipped[:8]:
+            print(f"  skip {tid}: {why}")
+        return
+    for tid in chosen:
+        t = store.get(tid)
+        note = cloud.claim_note(args.actor, now_iso())
+        old = t.status
+        lifecycle.apply(t.rec, "blocked")
+        t.rec["lane"] = "cloud"                       # the claim, readable by code; the note is for people
+        t.rec["branch"] = f"task/{tid}"
+        t.save()
+        log.append("state", task=tid, **{"from": old}, to="blocked", actor=args.actor, note=note)
+        if not args.quiet:
+            print(f"{tid}: {old} -> blocked ({note})")
+    if not chosen and not args.quiet:
+        print(f"nothing to claim (claimed now: {len(busy)}, cap {cap})")
+
 def cmd_dispatch(args):
     root, store, log = _ctx(args)
     limits = store.config("limits")
@@ -295,7 +333,9 @@ def cmd_dispatch(args):
                and not str(t.rec.get("title") or "").startswith("hotfix:")]   # never `waiting` (scr/jobs.py); a hotfix record is Omri editing the checkout, not a session (2026-10-15: T-0383 held a slot for 6 h)
     cap = int(limits.get("concurrency", 3)) - len(running)
     rows = rank_ready(g, store.config("weights"), "scribers")
-    ranked = [r["task"] for r in rows]
+    from . import cloud as _cloud
+    cloud_held = set(_cloud.claimed_ids(log.read(), g.tasks))         # handed to the cloud lane: never a PC dispatch
+    ranked = [r["task"] for r in rows if r["task"] not in cloud_held]
     # T-0272: a frozen workload's task is never picked; `scr --actor omri dispatch <id>` is the one exception path
     from .ops import task_frozen, workload_for
     if args.ids:
@@ -856,6 +896,9 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("dispatch", parents=[common], help="pick a conflict-free set of ready tasks and mark them dispatched")
     d.add_argument("ids", nargs="*", help="dispatch only these tasks (a frozen workload's task: --actor omri only)")
     d.add_argument("--dry-run", action="store_true"); d.add_argument("--allow-statements", action="store_true"); d.set_defaults(fn=cmd_dispatch)
+
+    cl = sub.add_parser("cloud", parents=[common], help="cloud lane: claim ready tasks for the cloud pool / show claims")
+    cl.add_argument("op", choices=["claim", "status"]); cl.add_argument("--dry-run", action="store_true"); cl.set_defaults(fn=cmd_cloud)
 
     ev = sub.add_parser("event", parents=[common], help="append a system/checkin event")
     ev.add_argument("kind", choices=["system", "checkin"]); ev.add_argument("--name"); ev.add_argument("--task"); ev.add_argument("--note"); ev.add_argument("--data", help="YAML/JSON"); ev.add_argument("--op")

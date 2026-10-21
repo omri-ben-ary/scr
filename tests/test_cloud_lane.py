@@ -111,3 +111,70 @@ def test_tick_lands_cloud_branch_into_review(world, tmp_path):
     assert res["ok"]
     assert Store(root).get(TID).status == "submitted"
     assert (repo / ".worktrees" / TID).is_dir()
+
+
+# ---- the claim (dispatch half; Omri 21 Oct "start using the cloud in normal flow") ---------------------------------
+def _limits(root: Path, **kw) -> None:
+    import yaml
+    p = root / "config" / "limits.yaml"
+    d = yaml.safe_load(p.read_text(encoding="utf-8"))
+    d.update(kw)
+    p.write_text(yaml.safe_dump(d), encoding="utf-8")
+
+
+def test_claim_hands_a_ready_eligible_task_to_the_cloud_and_dispatch_never_takes_it(world):
+    root, repo, _ = world
+    _limits(root, cloud_pools=1, cloud_lean=1)
+    r = scr(root, "--actor", "steward", "cloud", "claim")
+    assert "ready -> blocked" in r.stdout and TID in r.stdout
+    t = Store(root).get(TID)
+    assert t.status == "blocked" and t.rec.get("lane") == "cloud" and t.rec.get("branch") == f"task/{TID}"
+    w = Watcher(root, quiet=True)
+    assert [x.id for x in w.cloud_tasks(w.store.load_all())] == [TID]
+    r = scr(root, "--actor", "steward", "cloud", "claim")                 # cap 1: nothing more to claim
+    assert "nothing to claim" in r.stdout
+    r = scr(root, "--actor", "prioritizer", "dispatch", "--dry-run")      # the PC lane never picks a cloud claim
+    assert TID not in r.stdout
+    assert Store(root).get(TID).status == "blocked"
+
+
+def test_claim_skips_lean_and_heavy_tasks_when_configured(world):
+    root, _, _ = world
+    _limits(root, cloud_pools=2, cloud_lean=0)
+    r = scr(root, "--actor", "steward", "cloud", "claim", "--dry-run")   # T-0001's scope is QuantumInsertion/A.lean
+    assert "would claim: —" in r.stdout and "Lean task" in r.stdout
+    _limits(root, cloud_pools=2, cloud_lean=1)
+    r = scr(root, "--actor", "steward", "cloud", "claim", "--dry-run")
+    assert f"would claim: {TID}" in r.stdout
+    from scr.cloud import eligible
+    assert eligible({"scope": {"files": ["QuantumInsertion/FourQuery/T8/Grid/A.lean"]}}, lean_ok=True).startswith("heavy")
+    assert eligible({"scope": {"files": ["missions/QI30/X9/X.md"]}, "needs": ["lp"]}, lean_ok=False).startswith("needs")
+    assert eligible({"scope": {"files": ["missions/QI30/X9/X.md"]}}, lean_ok=False) is None
+    assert eligible({"scope": {"files": ["missions/QI30/X9/X.md"]}, "lane": "pc"}, lean_ok=True) == "lane: pc"
+
+
+def test_cloud_pools_zero_disables_the_lane(world):
+    root, _, _ = world
+    _limits(root, cloud_pools=0)
+    r = scr(root, "--actor", "steward", "cloud", "claim")
+    assert "cloud_pools is 0" in r.stdout
+    assert Store(root).get(TID).status == "ready"
+
+
+def test_report_delivered_on_cloud_reports_branch_lands_without_the_bridge(world, tmp_path):
+    root, repo, origin = world
+    _limits(root, cloud_pools=1, cloud_lean=1)
+    scr(root, "--actor", "steward", "cloud", "claim")
+    sha = _cloud_branch(tmp_path, origin)
+    pool = tmp_path / "pool"
+    git(pool, "checkout", "-q", "--orphan", f"cloud-reports/{TID}"); git(pool, "rm", "-rfq", ".")
+    (pool / "report.md").write_text("# Report\n\n## Result\nJOINT.md written; verdict open.\n\n## Statement changes\nNone\n\n## unlocks\n```yaml\non_success: []\n```\n", encoding="utf-8")
+    (pool / "log.md").write_text("- ran in the cloud\n", encoding="utf-8")
+    git(pool, "add", "-A"); git(pool, "commit", "-q", "-m", f"cloud report {TID}"); git(pool, "push", "-q", "origin", f"cloud-reports/{TID}")
+    w = Watcher(root, quiet=True)
+    assert w.cloud_landing_checks(None, w.store.load_all()) == 1
+    t = Store(root).get(TID)
+    assert t.status == "submitted" and "lane" not in t.rec
+    assert "ran in the cloud" in (t.dir / "log.md").read_text(encoding="utf-8")
+    assert "verdict open" in (t.dir / "report.md").read_text(encoding="utf-8")
+    assert git(repo / ".worktrees" / TID, "rev-parse", "--short", "HEAD") == sha
