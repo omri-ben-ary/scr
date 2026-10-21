@@ -30,6 +30,12 @@ def eligible(rec: dict, lean_ok: bool = False) -> str | None:
         return "hotfix"
     if (rec.get("lane") or "auto") == "pc":
         return "lane: pc"
+    if int(rec.get("attempts") or 0) > 0:
+        return "attempt 2+ runs on the PC lane (its worktree is attached there; 21 Oct: a re-claim re-landed T-0457's stale branch)"
+    if not files:
+        return "no scope files (housekeeping / PC-local work)"
+    if "housekeeping" in str(rec.get("title") or "").lower():
+        return "housekeeping task is PC-local"
     heavy = [f for f in files if f.startswith(("QuantumInsertion/FourQuery/", "numerics/certificates", "numerics/qi3/"))]
     if heavy:
         return f"heavy certificate paths: {', '.join(heavy[:2])}"
