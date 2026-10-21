@@ -449,7 +449,7 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
     # watcher read "rc 0 but not merged" as a test failure, and auto-fix dispatched a scriber on a merged task.
     mg0 = Git(wl.repo)
     mg0.fetch()
-    if mg0.remote_contains(f"origin/{wl.main}", br):
+    if mg0.remote_contains(f"origin/{wl.main}", br) and _merged_off_first_parent(mg0, f"origin/{wl.main}", g.head()):
         out.append(f"  already in origin/{wl.main}: nothing to push, no PR")
         if t.status == "submitted":
             from . import lifecycle
@@ -514,6 +514,16 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
         out.append(f"  merged -> {wl.main}; {tid} marked merged")
         out += _record_merged(root, store, tid, f"auto-land: {url}", report)
     return {"ok": True, "url": url, "out": out}
+
+
+def _merged_off_first_parent(mg: Git, main_ref: str, tip: str | None) -> bool:
+    """True when `tip` is reachable from `main_ref` but NOT on its first-parent line: the signature of a branch
+    merged by a merge commit (a PR). A branch with no commits of its own sits ON the first-parent line and is
+    not "already merged" — it is simply empty (2026-10-21 hotfix; keeps `land` of a fresh branch unchanged)."""
+    if not tip:
+        return False
+    r = mg.run("rev-list", "--first-parent", main_ref)
+    return r.ok and tip not in {l.strip() for l in r.out.splitlines()}
 
 
 def _record_merged(root: Path, store: Store, tid: str, note: str, report: str = "") -> list[str]:
