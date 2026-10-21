@@ -161,7 +161,10 @@ def test_land_all_submitted_skips_unreviewed_tasks_and_reports_them(world):
     skipped = [l for l in out if l.startswith("T-0001: skipped")]
     assert len(skipped) == 1 and "review.md" in skipped[0] and "no Decision" in skipped[0], text
     assert "=== T-0002 [submitted]" in text and "T-0002: NOT landed" not in text and "T-0002: failed" not in text, text
-    assert Store(root).get("T-0001").status == "submitted" and Store(root).get("T-0002").status == "accepted"
+    # 2026-10-21 hotfix: with no GitHub behind the origin the PR cannot open, and `land --merge` now merges directly
+    # instead of leaving the task `accepted` with nothing merged (before: accepted here, and the watcher's "rc 0 but
+    # not merged" then sent a scriber after a merged branch — T-0560).
+    assert Store(root).get("T-0001").status == "submitted" and Store(root).get("T-0002").status == "merged"
     assert "task/T-0001" not in git(repo, "branch", "-r") and "task/T-0002" in git(repo, "branch", "-r")
 
 
@@ -687,7 +690,7 @@ def test_land_merges_directly_when_the_pr_cannot_be_opened(world, monkeypatch):
     wl = ops.workload_for(root, Store(root), Store(root).get("T-0001"))
     wt = ops.task_worktree(wl, Store(root).get("T-0001"))
     g = Git(wt)
-    (wt / "QuantumInsertion" / "B.lean").write_text("theorem b : True := trivial\n", encoding="utf-8")
+    (wt / "QuantumInsertion" / "A.lean").write_text("theorem a : True := trivial\ntheorem a2 : True := trivial\n", encoding="utf-8")
     g.run("add", "-A"); g.run("commit", "-q", "-m", "work")
     # the trunk moves on independently (no conflict)
     mg = Git(wl.repo)
@@ -706,4 +709,4 @@ def test_land_merges_directly_when_the_pr_cannot_be_opened(world, monkeypatch):
     mg.fetch()
     assert mg.remote_contains(f"origin/{wl.main}", "task/T-0001")
     # the pushed trunk carries both the trunk's own commit and the task's file
-    assert "B.lean" in mg.run("ls-tree", "--name-only", "-r", f"origin/{wl.main}").out
+    assert "theorem a2" in mg.run("show", f"origin/{wl.main}:QuantumInsertion/A.lean").out
