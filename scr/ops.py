@@ -490,9 +490,29 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
                 url = pr_create(wl.main, br, f"[{tid}] {title}", bf, wt, draft=draft)
                 out.append(f"  PR: {url}" if url else "  PR creation failed (see gh output)")
                 if not url and merge:
-                    # 2026-10-21 hotfix: a landing asked to merge cannot succeed without a PR; say so as a
-                    # FAILED (pr) line so the watcher names the right reason instead of guessing "tests".
-                    out.append("  FAILED (pr): PR creation failed; not merged")
+                    # 2026-10-21 hotfix: a landing asked to merge does not stop at a PR that would not open (gh, auth,
+                    # a stale PR state) and does not route the branch to Omri: it merges directly — origin/<main> into
+                    # the branch in the worktree (a conflict is aborted and reported as such), then the branch pushed
+                    # as <main> (a fast-forward of the remote trunk onto the branch tip). Only when that fails too is
+                    # it a FAILED (pr) line, which the watcher retries on later ticks before raising a card.
+                    direct = _direct_merge_to_main(g, wl.main, br, tid)
+                    out += direct["out"]
+                    if direct["ok"]:
+                        mg = Git(wl.repo)
+                        mg.fetch()
+                        if mg.remote_contains(f"origin/{wl.main}", br):
+                            if t.status == "submitted":
+                                from . import lifecycle
+                                lifecycle.apply(t.rec, "accepted"); t.save()
+                                log.append("state", task=tid, **{"from": "submitted"}, to="accepted", actor=f"steward:{tid}", note=f"landed on {br} (direct merge)")
+                            out.append(f"  merged -> {wl.main} (direct, no PR); {tid} marked merged")
+                            out += _record_merged(root, store, tid, f"auto-land: direct merge into {wl.main} (PR creation failed)", report)
+                            return {"ok": True, "url": None, "out": out}
+                        out.append(f"  WARNING: origin/{wl.main} does not contain {br} after the direct merge — not marking merged")
+                    if direct.get("conflict"):
+                        out.append(f"  merge failed: {direct.get('why', '')[:300]}")
+                    else:
+                        out.append(f"  FAILED (pr): PR creation failed and the direct merge did not land; {direct.get('why', '')[:300]}")
                     return {"ok": False, "url": None, "out": out}
     if t.status == "submitted":
         from . import lifecycle
@@ -514,6 +534,28 @@ def land(root: Path, tid: str, no_pr: bool = False, draft: bool = False, dry_run
         out.append(f"  merged -> {wl.main}; {tid} marked merged")
         out += _record_merged(root, store, tid, f"auto-land: {url}", report)
     return {"ok": True, "url": url, "out": out}
+
+
+def _direct_merge_to_main(g: Git, main: str, br: str, tid: str) -> dict:
+    """2026-10-21 hotfix: land `br` on `main` without a PR. In the worktree: fetch, merge origin/<main> INTO the branch
+    (nothing to do when the branch already contains it; a conflict is aborted, nothing is pushed, `conflict` is set),
+    then push the branch tip as origin/<main> — a fast-forward, since the tip now contains the trunk. Never touches
+    the trusted branch, never force-pushes, never checks out <main> anywhere."""
+    out: list[str] = []
+    r = g.run("fetch", "--quiet", "origin", main, timeout=600)
+    if not r.ok:
+        return {"ok": False, "out": out, "why": f"fetch origin {main}: {r.out[-300:]}"}
+    if not g.ok("merge-base", "--is-ancestor", f"origin/{main}", "HEAD"):
+        m = g.run("merge", "--no-ff", "--no-edit", "-m", f"merge origin/{main} into {br} (direct landing of {tid}; PR creation failed)", f"origin/{main}", timeout=600)
+        if not m.ok:
+            g.run("merge", "--abort")
+            return {"ok": False, "conflict": True, "out": out + [f"  direct merge: origin/{main} conflicts with {br}; aborted"], "why": m.out[-300:]}
+        out.append(f"  direct merge: origin/{main} merged into {br} ({g.head(short=True)})")
+    p = g.run("push", "origin", f"HEAD:refs/heads/{main}", timeout=600)
+    if not p.ok:
+        return {"ok": False, "out": out, "why": f"push {br} -> {main}: {p.out[-300:]}"}
+    out.append(f"  direct merge: pushed {br} as origin/{main} (fast-forward)")
+    return {"ok": True, "out": out}
 
 
 def _merged_off_first_parent(mg: Git, main_ref: str, tip: str | None) -> bool:

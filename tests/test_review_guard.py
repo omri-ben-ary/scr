@@ -674,3 +674,36 @@ def test_land_of_a_branch_already_in_main_records_merged_without_a_pr(world, mon
     assert calls == [], "no PR is created for a branch main already contains"
     assert Store(root).get("T-0001").status == "merged"
     assert _events(root, "T-0001", "state", to="merged"), "the merge is recorded"
+
+
+def test_land_merges_directly_when_the_pr_cannot_be_opened(world, monkeypatch):
+    """2026-10-21 hotfix (Omri: a PR that will not open must not be routed to him): with `merge=True` and `pr_create`
+    returning None, `land` merges origin/<main> into the branch in the worktree and pushes the branch as <main>
+    (fast-forward), records merged, and opens no PR. A conflicting trunk is aborted and reported as a merge failure."""
+    from scr import ops
+    root, repo, origin = world
+    t = _submit(root)
+    (t.dir / "review.md").write_text(_review("accepted"), encoding="utf-8")
+    wl = ops.workload_for(root, Store(root), Store(root).get("T-0001"))
+    wt = ops.task_worktree(wl, Store(root).get("T-0001"))
+    g = Git(wt)
+    (wt / "QuantumInsertion" / "B.lean").write_text("theorem b : True := trivial\n", encoding="utf-8")
+    g.run("add", "-A"); g.run("commit", "-q", "-m", "work")
+    # the trunk moves on independently (no conflict)
+    mg = Git(wl.repo)
+    (wl.repo / "README.md").write_text("qi\nmoved\n", encoding="utf-8")
+    mg.run("add", "-A"); mg.run("commit", "-q", "-m", "trunk moves"); mg.run("push", "-q", "origin", wl.main)
+    monkeypatch.setattr(ops, "gh_available", lambda: True)
+    monkeypatch.setattr(ops, "pr_url_for", lambda *a, **k: None)
+    monkeypatch.setattr(ops, "pr_create", lambda *a, **k: None)
+    merged_calls: list = []
+    monkeypatch.setattr(ops, "pr_merge", lambda *a, **k: merged_calls.append(a))
+    res = land(root, "T-0001", merge=True)
+    assert res["ok"], res["out"]
+    assert any("direct merge" in l and "pushed" in l for l in res["out"]), res["out"]
+    assert merged_calls == []
+    assert Store(root).get("T-0001").status == "merged"
+    mg.fetch()
+    assert mg.remote_contains(f"origin/{wl.main}", "task/T-0001")
+    # the pushed trunk carries both the trunk's own commit and the task's file
+    assert "B.lean" in mg.run("ls-tree", "--name-only", "-r", f"origin/{wl.main}").out

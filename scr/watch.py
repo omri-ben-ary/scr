@@ -1782,9 +1782,16 @@ class Watcher:
             fix = (f"landing refused for out-of-scope paths ({why[:200]}): either widen scope.files in the record "
                    f"(`scr task field {t.id} scope.files <list>`) when the task owns them, or revert the drift commit; then resubmit.")
         elif reason == "pr":
-            # 2026-10-21 hotfix: a failed PR creation (gh, auth, an existing PR state) is not something a scriber
-            # can fix on the branch; it goes to Omri, and the task stays accepted.
-            self.need(f"land_pr_failed:{t.id}", f"{t.id} accepted but PR creation failed ({why[:200]}) — check gh / the PR state and rerun `scr land {t.id} --merge`", t.id)
+            # 2026-10-21 hotfix: a landing that could neither open a PR nor merge directly is a transient (gh, auth,
+            # network) — not a scriber's problem and not Omri's on the first miss. The task stays accepted and the
+            # `land:` flag is already cleared, so the next tick submits the landing again; after LAND_PR_RETRIES
+            # misses in a row it is a NEEDS-YOU card.
+            n = len([k for k in self.flags if k.startswith(f"land_pr_retry:{t.id}:")]) + 1
+            self.flags.add(f"land_pr_retry:{t.id}:{n}:{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}")
+            if n < self.LAND_PR_RETRIES:
+                self.log(f"{t.id} landing: PR creation and direct merge both failed ({why[:120]}); retry {n}/{self.LAND_PR_RETRIES} on the next tick")
+                return "failed"
+            self.need(f"land_pr_failed:{t.id}", f"{t.id} accepted but its landing failed {n} times at the PR/merge step ({why[:160]}) — check gh / network and rerun `scr land {t.id} --merge`", t.id)
             return "failed"
         else:
             fix = f"landing failed ({why[:300] or reason}); fix the branch and resubmit."
@@ -2084,6 +2091,8 @@ class Watcher:
         return True
 
     REVIEW_RETRIES = 2
+
+    LAND_PR_RETRIES = 3     # 2026-10-21 hotfix: landings that fail at the PR/merge step are retried this many ticks before a card
 
     def rerun_review(self, t, why: str) -> bool:
         """A review that ended without a Decision is run again (up to REVIEW_RETRIES times per submission episode) instead
