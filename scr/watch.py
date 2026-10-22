@@ -1757,6 +1757,13 @@ class Watcher:
         else:
             m = re.search(r"FAILED \((\w+)\)", why)
             reason = m.group(1) if m else ("conflict" if "merge failed" in why or "conflict" in why.lower() else "scope" if "REFUSED" in why else "tests")
+        timed_out = reason == "timeout" or ("exited 124" in why and "timed out after" in why)
+        if timed_out:
+            # 2026-10-22 hotfix (T-0579): a landing whose job deadline or test-run cap ran out is a capacity problem
+            # (concurrent suites on the 16 GB box), not a branch failure: same route as a kill, logged as such.
+            self.log(f"{t.id} landing job {job['id']} timed out ({why[:120]}); task stays accepted, landing resubmitted on a later tick")
+            self.unflag(f"land:{t.id}")
+            return "failed"
         if reason == "killed":
             # 2026-10-22 hotfix (T-0574): a landing job someone killed is not a failure of the branch. Before this, Omri's
             # kill of a stuck J-0457 sent the reviewed, accepted T-0574 back to a scriber via auto-fix (11 h wasted). The
