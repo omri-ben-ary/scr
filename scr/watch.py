@@ -1757,6 +1757,14 @@ class Watcher:
         else:
             m = re.search(r"FAILED \((\w+)\)", why)
             reason = m.group(1) if m else ("conflict" if "merge failed" in why or "conflict" in why.lower() else "scope" if "REFUSED" in why else "tests")
+        if reason == "killed":
+            # 2026-10-22 hotfix (T-0574): a landing job someone killed is not a failure of the branch. Before this, Omri's
+            # kill of a stuck J-0457 sent the reviewed, accepted T-0574 back to a scriber via auto-fix (11 h wasted). The
+            # task stays accepted, the `land:` flag is cleared so a later tick submits the landing again (unless it was
+            # landed by hand meanwhile, which makes it merged and ends this), no auto-fix, no card.
+            self.unflag(f"land:{t.id}")
+            self.log(f"{t.id} landing job {job['id']} was killed ({why[:120]}); task stays accepted, landing resubmitted on a later tick")
+            return "failed"
         tip = job.get("land_tip")
         if scriptorium:
             try:                                    # the landing commits the dirty tree first: the tip that failed is the one after it
