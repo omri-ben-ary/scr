@@ -280,6 +280,15 @@ def _link_venv(repo: Path, wt: Path, out: list[str]) -> None:
     else:
         os.symlink(src, dst, target_is_directory=True)
         out.append("  symlink .venv -> checkout .venv")
+        # a `.venv/` ignore rule matches directories only, and git sees a POSIX symlink as a file: without this the
+        # checkpoint commits the link and the landing refuses it as out of scope (a junction is a directory to git)
+        r = subprocess.run(["git", "rev-parse", "--git-path", "info/exclude"], cwd=wt, capture_output=True, text=True)
+        if r.returncode == 0:
+            ex = (wt / r.stdout.strip()).resolve()
+            have = ex.read_text(encoding="utf-8").splitlines() if ex.exists() else []
+            if "/.venv" not in have:
+                ex.parent.mkdir(parents=True, exist_ok=True)
+                ex.write_text("\n".join([*have, "/.venv"]) + "\n", encoding="utf-8")
 
 
 def spawn(root: Path, tids: list[str] | None = None, lake: bool | None = None, wl_name: str | None = None) -> list[str]:
