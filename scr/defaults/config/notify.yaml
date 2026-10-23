@@ -1,0 +1,20 @@
+# Push channel for needs-you cards (T-0090; reader: scr/notify.py). The watcher pushes every card the UI page
+# shows that no earlier tick pushed, once per card key; `scr ack <key>` (Dismiss on the page) silences a card.
+# Each channel is on/off here; a failure is a `notify FAILED:` line in reports/steward_watch.log.
+# Try it: `scr notify --test` (one test message per enabled channel); `scr notify` lists what stands and what was pushed.
+ui_url: http://127.0.0.1:8765/
+retry_minutes: 10          # a card whose push failed on EVERY channel is sent once more this long after (T-0171);
+                           # if that fails too: one `notify GAVE UP: <key>` log line, never again
+
+toast:                     # Windows toast through powershell + WinRT; no module to install
+  enabled: true
+
+email:                     # SMTP. Never put a password here: password_env is the NAME of an environment variable
+  enabled: false
+  host: smtp.gmail.com
+  port: 587
+  starttls: true           # ssl: true instead for an SMTP_SSL port (465)
+  from: ""                 # e.g. the account's own address
+  to: []                   # list of addresses
+  user: ""                 # SMTP login; empty = no login
+  password_env: SCR_SMTP_PASSWORD   # for Gmail: an app password, set with `setx SCR_SMTP_PASSWORD <app password>`

@@ -17,6 +17,7 @@ import yaml
 from scr.ops import spawn
 from scr.store import Store
 from test_journal_ops import REPO, accepted_review, world, scr  # noqa: F401  (the shared fixture: scriptorium + workload repo + origin)
+from _paths import CONFIG  # noqa: E402
 
 FAKE_CLAUDE = str(Path(sys.executable).with_name("claude.exe"))   # a .exe path: claude_argv must not wrap it in `cmd /c`
 
@@ -204,7 +205,7 @@ def test_review_brief_uses_default_base_and_fetch(world, monkeypatch):
 
 
 def test_workloads_yaml_checker_comment_has_no_bare_base():
-    text = (REPO / "config" / "workloads.yaml").read_text(encoding="utf-8")
+    text = (CONFIG / "workloads.yaml").read_text(encoding="utf-8")
     assert "--base master" not in text
     line = next(l for l in text.splitlines() if l.strip().startswith("done_when_checker:"))
     assert "--fetch" in line and "merge-base" in line, line
@@ -1775,7 +1776,7 @@ def test_dispatch_timeout_frees_the_slot_for_the_next_ready_task(world, monkeypa
 def test_dispatch_timeout_key_is_read_and_mirrored():
     src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
     assert "dispatch_timeout_minutes" in src and "dispatch_timeout" in src
-    limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    limits = yaml.safe_load((CONFIG / "limits.yaml").read_text(encoding="utf-8"))
     assert float(limits["dispatch_timeout_minutes"]) == DISPATCH_TIMEOUT_MINUTES == 30
     # T-0127: the rounds limit, read by dispatch_rounds_needs, mirrored the same way
     assert "dispatch_timeout_rounds" in src
@@ -2261,7 +2262,7 @@ def test_email_password_comes_from_the_named_env_var_only(monkeypatch):
     monkeypatch.delenv("SCR_TEST_SMTP_PW", raising=False)
     with pytest.raises(RuntimeError, match="SCR_TEST_SMTP_PW"):
         notify.email([CARD_A], ch, {})
-    live = yaml.safe_load((REPO / "config" / "notify.yaml").read_text(encoding="utf-8"))
+    live = yaml.safe_load((CONFIG / "notify.yaml").read_text(encoding="utf-8"))
     assert set(live["email"]) >= {"host", "port", "from", "to", "password_env"} and "password" not in live["email"]
 
 
@@ -3304,7 +3305,7 @@ def test_did_work_counts_only_this_launch():
 
 def test_credits_pause_key_is_read_and_mirrored():
     src = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
-    limits = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    limits = yaml.safe_load((CONFIG / "limits.yaml").read_text(encoding="utf-8"))
     assert 'self.limits.get("credits_pause_minutes", CREDITS_PAUSE_MINUTES)' in src
     assert limits["credits_pause_minutes"] == CREDITS_PAUSE_MINUTES
 
@@ -4306,7 +4307,7 @@ def test_frozen_flag_absent_is_false(world):
 
 def test_live_config_leaves_every_workload_unfrozen_and_intake_names_the_note():
     """T-0272 builds the switch only (T-0276 throws it); the Intake rule names the parking note verbatim."""
-    wls = yaml.safe_load((REPO / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    wls = yaml.safe_load((CONFIG / "workloads.yaml").read_text(encoding="utf-8"))
     assert all(not cfg.get("frozen") for cfg in wls.values())
     assert '"frozen workload: parked for the thaw"' in (REPO / "agents" / "intake.md").read_text(encoding="utf-8")
 

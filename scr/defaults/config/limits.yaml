@@ -1,0 +1,19 @@
+concurrency: 3   # scribers running at once
+wip_ready_scribers: 12    # Intake must rank and drop beyond this (reader: the Intake agent via its brief, scr/launch.py INTAKE_BRIEF and agents/intake.md; allowlisted in tests/test_config.py)
+# wip_open_omri (was 8) deleted 2026-09-23 by T-0125: nothing in scr/, agents/ or any brief read it; put it back only together with its reader.
+max_successors_per_task: 4   # reader: the Intake agent via agents/intake.md ("Respect max_successors_per_task and max_depth"); allowlisted in tests/test_config.py
+max_depth: 4              # generations from a human-authored root before Gate 2 (reader: the Intake agent via scr/launch.py INTAKE_BRIEF and agents/intake.md; allowlisted in tests/test_config.py)
+default_max_attempts: 3   # budget.max_attempts of `scr task new` without --max-attempts (scr/cli.py cmd_task_new; T-0125)
+omri_stale_hours: 48      # reader: the Concierge agent via agents/concierge.md until T-0126 wires it into scr/watch.py; allowlisted in tests/test_config.py until then
+dispatch_timeout_minutes: 30   # a dispatched task with no launch event after this long goes back to ready (scr/watch.py dispatch_checks; T-0122)
+dispatch_timeout_rounds: 3     # that many dispatch_timeouts in a row with no launch -> one needs line quoting the launcher's reason (reader: scr/watch.py dispatch_rounds_needs; T-0127)
+checkpoint_every_minutes: 30
+land_test_timeout_seconds: 14400   # the landing's full test run (step 4) fails as `tests` after this long (scr/ops.py land_test_timeout / _run_tests; also scr/hotfix.py run_tests for `scr hotfix test`/`close`, T-0131; was a hardcoded 1800, T-0170 timed out 2026-09-24; T-0186)
+review_stale_hours: 2.5     # a submitted task with no Decision written after this long is stuck -> escalated (T-0092; shared with T-0089)
+help_stale_hours: 3       # an in_progress task whose blocking HELP line is unanswered this long is stuck -> escalated (T-0092)
+statement_window: "00:00-23:59"   # only window where may_touch_statements tasks are dispatched, even with --allow-statements (Asia/Jerusalem, local time without tzdata; scr/cli.py statement_window_open; T-0125)
+credits_pause_minutes: 60      # a session that printed "You're out of usage credits" pauses auto-dispatch and reviews this long, or until a credits_resumed / watcher_resumed event; the next dispatch after it is the probe (scr/watch.py credits_pause; T-0187)
+jobs_concurrency: 2   # detached jobs running at once (scr/jobs.py submit/poll); a third lake build OOM'd the 16 GB box on 2026-09-15
+review_bg_wait_minutes: 120   # background-wait ceiling of review sessions (scr/watch.py review_env); the 600 s default lost every review of 9-10 Oct 2026
+# cloud_pools: 3   # shipped commented out: absent = 0 = the lane is off until the live config sets it; cloud lane (docs/proposals/cloud-pool.md): ready tasks handed to the cloud pool at once (scr/cloud.py cloud_limits; `scr cloud claim` from the watcher tick); 0 disables the lane
+cloud_lean: 1   # 1 = the pool may take Lean tasks, 0 = hand-analysis/numerics only (it restores .lake/cloud-cache/master over the bridge; scr/cloud.py eligible); kernel-replay certificate paths stay on the PC

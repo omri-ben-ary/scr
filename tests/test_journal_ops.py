@@ -20,6 +20,7 @@ from scr.gitops import Git, GitError
 from scr.journal import journal
 from scr.ops import checkpoint_commit, land, park, retire, spawn, sweep
 from scr.store import Store
+from _paths import FIXTURES, asset  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -48,7 +49,8 @@ def world(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SCR_NO_JOURNAL", "1")
     root = tmp_path / "scriptorium"; root.mkdir()
     for d in ("config", "templates", "agents", "ui"):
-        shutil.copytree(REPO / d, root / d)
+        shutil.copytree(asset(d), root / d)
+    shutil.copy(FIXTURES / "chores.yaml", root / "ui" / "chores.yaml")   # the live list is state; a fixture stands in
     scr(root, "init", "--quiet", journal_on=False)
     git(root, "init", "-q", "-b", "main"); git(root, "add", "-A"); git(root, "commit", "-q", "-m", "seed")
     # workload repo + bare origin

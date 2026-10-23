@@ -1,0 +1,35 @@
+id: T-0021
+title: 'Replayed record: a merged task whose review.md is still the blank template'
+queue: scribers
+kind: refactor
+status: merged
+workload: quantum-insertion
+scope:
+  files:
+  - QuantumInsertion/A.lean
+  decls: []
+  may_touch_statements: false
+done_when:
+  mechanical: []
+  judgment: []
+budget:
+  max_attempts: 3
+  max_tokens: 1000000
+  max_wall_hours: 6
+priority:
+  omri_weight: 0.0
+  verifiability: 1.0
+  risk: 0.1
+blocked_by: []
+origin: omri
+related: []
+supersedes: []
+unlocks:
+  on_success: []
+  on_failure: []
+attempts: 1
+tokens_used: 0
+created: '2026-09-03T11:28:25Z'
+updated: '2026-09-22T10:03:03Z'
+branch: task/T-0021
+worktree: ../worktrees/T-0021

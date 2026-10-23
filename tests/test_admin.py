@@ -77,25 +77,27 @@ def test_stop_failed_reads_the_stop_lines():
     assert not admin.stop_failed([])
 
 
-def _up_stop(monkeypatch, capsys, lines_for):
+def _up_stop(monkeypatch, capsys, lines_for, root):
     import argparse
     import pytest
     import scr.cli as cli
     monkeypatch.setattr(admin, "stop", lambda root, what: list(lines_for[what]))
-    args = argparse.Namespace(stop=True, root=str(Path(__file__).resolve().parents[1]), actor="omri")
+    for d in ("tasks", "config"):                     # a minimal state root: the code repo is not one any more
+        (root / d).mkdir(exist_ok=True)
+    args = argparse.Namespace(stop=True, root=str(root), actor="omri")
     with pytest.raises(SystemExit) as e:
         cli.cmd_up(args)
     return e.value.code, capsys.readouterr().out
 
 
-def test_up_stop_exits_nonzero_when_a_stop_failed(monkeypatch, capsys):
+def test_up_stop_exits_nonzero_when_a_stop_failed(monkeypatch, capsys, tmp_path):
     failed = "FAILED to stop watch pid 111 (it may still be running; stop it by hand)"
-    code, out = _up_stop(monkeypatch, capsys, {"ui": ["stopped ui pid 222"], "watch": [failed]})
+    code, out = _up_stop(monkeypatch, capsys, {"ui": ["stopped ui pid 222"], "watch": [failed]}, tmp_path)
     assert code == 1
     assert "stopped ui pid 222" in out and failed in out
 
 
-def test_up_stop_exits_zero_when_every_stop_was_made(monkeypatch, capsys):
-    code, out = _up_stop(monkeypatch, capsys, {"ui": ["stopped ui pid 222"], "watch": ["no watch running"]})
+def test_up_stop_exits_zero_when_every_stop_was_made(monkeypatch, capsys, tmp_path):
+    code, out = _up_stop(monkeypatch, capsys, {"ui": ["stopped ui pid 222"], "watch": ["no watch running"]}, tmp_path)
     assert code == 0
     assert "stopped ui pid 222" in out and "no watch running" in out
