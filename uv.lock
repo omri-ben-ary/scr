@@ -143,7 +143,6 @@ wheels = [
 
 [[package]]
 name = "scriptorium"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "pyyaml" },

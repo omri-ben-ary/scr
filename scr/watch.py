@@ -74,7 +74,7 @@ from .journal import journal
 from .lifecycle import requeue
 from .ops import (FINISHED_STATUSES, LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, retire, TOOLING_LANDS_AS_PR,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
-from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_exe, session_argv, start_claude
+from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_display, scr_exe, session_argv, start_claude
 from .state import State
 from .store import Store
 
@@ -2038,7 +2038,7 @@ class Watcher:
         brief = (f"You are resuming Scriptorium task {t.id} after the job(s) you submitted finished. Results:\n{summary}\n"
                  f"Read the full log(s) if the tail is not enough, then continue the task exactly where you stopped: your brief, "
                  f"{t.dir / 'spec.md'}, {t.dir / 'log.md'} and {t.dir / 'report.md'} are unchanged. Submit further long "
-                 f"commands the same way ({self.root / '.venv' / 'Scripts' / 'scr.exe'} --root {self.root.resolve()} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
+                 f"commands the same way ({scr_display(self.root)} --root {self.root.resolve()} job submit --task {t.id} ... then `WAITING: job <id>` as the last "
                  f"line of log.md and end your turn).\n")
         bf = t.dir / f"resume-brief-{now:%Y%m%d-%H%M%S}.txt"
         bf.write_text(brief, encoding="utf-8")
@@ -2092,9 +2092,9 @@ class Watcher:
                  f"Run every check in the FOREGROUND and wait for it; never background check_done.py or a build and end your turn "
                  f"(this headless session is killed {int(self.limits.get('review_bg_wait_minutes', REVIEW_BG_WAIT_MINUTES))} min after "
                  f"your turn ends, and a review that ends without a Decision is lost). A check you expect to take over an hour: "
-                 f"`{self.root / '.venv' / 'Scripts' / 'scr.exe'} job submit --task {t.id} --name <name> -- <command>` then "
+                 f"`{scr_display(self.root)} job submit --task {t.id} --name <name> -- <command>` then "
                  f"`scr job wait <J-id>` keeps it under the watcher's eye while you wait here.\n"
-                 f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; never run git in the scriptorium folder (it journals itself).\n")
+                 f"Use `{scr_display(self.root)} --actor steward:{t.id} ...` for every record change; never run git in the scriptorium folder (it journals itself).\n")
         bf = t.dir / "review-brief.txt"
         bf.write_text(brief, encoding="utf-8")
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"
@@ -2124,13 +2124,13 @@ class Watcher:
                  f"Record: {t.dir}  (spec.md = the symptom; log.md lists the journal commits that make up the fix; report.md = the fixer's summary "
                  f"and test output; write review.md there).\n"
                  f"Checkout: {self.root} (this IS the task's tree; `git log --oneline -20` and `git show <sha>` for the commits named in log.md are read-only and fine).\n"
-                 f"Do: (1) read spec, report, log; (2) `git show` each commit; (3) run `{self.root / '.venv' / 'Scripts' / 'scr.exe'} hotfix test`; "
+                 f"Do: (1) read spec, report, log; (2) `git show` each commit; (3) run `{scr_display(self.root)} hotfix test`; "
                  f"(4) judge: does the change fix the symptom, is it minimal, is there a test that would have caught it, what else has the same bug class; "
                  f"(5) fill review.md and add an `unlocks` block of follow-up tasks (title, why, files) — regression tests, root cause, the same pattern "
                  f"elsewhere — which Intake turns into records; (6) end with a Decision line: accepted | returned (feedback) | escalated (reason).\n{decide}\n"
                  f"Run `hotfix test` in the FOREGROUND and wait for it (this session is killed "
                  f"{int(self.limits.get('review_bg_wait_minutes', REVIEW_BG_WAIT_MINUTES))} min after your turn ends; a review without a Decision is lost).\n"
-                 f"Use `{self.root / '.venv' / 'Scripts' / 'scr.exe'} --actor steward:{t.id} ...` for every record change; the tree journals itself.\n")
+                 f"Use `{scr_display(self.root)} --actor steward:{t.id} ...` for every record change; the tree journals itself.\n")
         bf = t.dir / "review-brief.txt"
         bf.write_text(brief, encoding="utf-8")
         tr = t.dir / f"review-session-{datetime.now():%Y%m%d-%H%M%S}.txt"

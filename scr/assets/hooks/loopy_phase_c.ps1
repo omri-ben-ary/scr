@@ -15,6 +15,7 @@ param(
   [string]$Worktree,                     # run inside .worktrees/<name> (the task's worktree) instead of the main checkout
   [string]$Workload = 'quantum-insertion',
   [string]$Root,                         # the scriptorium state root (default: SCRIPTORIUM_ROOT, else the current folder)
+  [string]$Runtime,                      # the release folder (default: SCR_RUNTIME, else <root>\..\scr-runtime)
   [Parameter(ValueFromRemainingArguments = $true)][string[]]$LoopyArgs
 )
 $ErrorActionPreference = 'Stop'
@@ -23,8 +24,10 @@ $ErrorActionPreference = 'Stop'
 if (-not $Root) { $Root = if ($env:SCRIPTORIUM_ROOT) { $env:SCRIPTORIUM_ROOT } else { (Get-Location).Path } }
 $Root = (Resolve-Path $Root).Path
 $Actor = "steward:$Task"
-# Prefer the repo's own venv (uv sync creates .venv\Scripts\scr.exe); fall back to `python -m scr`.
-$ScrExe = Join-Path $Root '.venv\Scripts\scr.exe'
+# The scr to run: the live release (<runtime>\current, scr upgrade) once one is installed, else the state root's .venv; else `python -m scr`.
+if (-not $Runtime) { $Runtime = if ($env:SCR_RUNTIME) { $env:SCR_RUNTIME } else { Join-Path (Split-Path $Root -Parent) 'scr-runtime' } }
+$ScrExe = Join-Path $Runtime 'current\Scripts\scr.exe'
+if (-not (Test-Path $ScrExe)) { $ScrExe = Join-Path $Root '.venv\Scripts\scr.exe' }
 function Scr { param([string[]]$a)
   if (Test-Path $ScrExe) { & $ScrExe --root $Root --actor $Actor --quiet @a } else { & python -m scr --root $Root --actor $Actor --quiet @a }
   if ($LASTEXITCODE -ne 0) { throw "scr $($a -join ' ') failed" } }

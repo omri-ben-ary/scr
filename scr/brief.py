@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import bgwait
+from .run import scr_display
 from .store import Store, Task
 
 BRIEF_TEMPLATE = """Use the scriber agent. This is Scriptorium task {id}: {title}
@@ -40,8 +41,8 @@ def brief_for(root: Path, store: Store, t: Task) -> str:
     except ValueError:
         bg = "default (600 s)"
     bg = "10 min (the default)" if bg.startswith("default") else bg
-    scr = root / ".venv" / "Scripts" / "scr.exe"
+    scr = scr_display(root)                       # the live release once a runtime exists (scr/runtime.py)
     return BRIEF_TEMPLATE.format(
-        id=t.id, title=t.rec.get("title", ""), spec=(d / "spec.md").resolve(), worktree=wt_abs, scr=scr if scr.exists() else "scr", root=root.resolve(),
+        id=t.id, title=t.rec.get("title", ""), spec=(d / "spec.md").resolve(), worktree=wt_abs, scr=scr, root=root.resolve(),
         log=(d / "log.md").resolve(), report=(d / "report.md").resolve(),
         attempts=b.get("max_attempts", 3), tokens=int(b.get("max_tokens", 0)), hours=b.get("max_wall_hours", 6), bgwait=bg, stmt=stmt)

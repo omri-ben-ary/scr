@@ -13,7 +13,7 @@ from .brief import brief_for
 from .assets import asset_path
 from .events import EventLog
 from .ops import spawn, task_worktree, workload_for
-from .run import (claude_bin, new_session_id, permission_mode_for, process_created, record_launch, scr_cmd, session_argv,
+from .run import (claude_bin, scr_display, new_session_id, permission_mode_for, process_created, record_launch, scr_cmd, session_argv,
                   start_claude)
 from .store import Store
 
@@ -140,8 +140,8 @@ def intake(root: Path, dry_run: bool = False, timeout: int = 3600) -> list[str]:
     argv = session_argv(root, root=root, session_id=sid)   # the config permission mode (scr/run.py), cwd = the root
     if not argv:
         return ["claude not on PATH — intake skipped"]
-    scr = root / ".venv" / "Scripts" / "scr.exe"
-    brief = INTAKE_BRIEF.format(root=root, agents=asset_path("agents"), scr=scr if scr.exists() else "scr", dry="DRY RUN: do not create anything; print what you would create." if dry_run else "")
+    scr = scr_display(root)
+    brief = INTAKE_BRIEF.format(root=root, agents=asset_path("agents"), scr=scr, dry="DRY RUN: do not create anything; print what you would create." if dry_run else "")
     stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
     out_file = root / "reports" / f"intake-{stamp}.txt"
     out_file.parent.mkdir(parents=True, exist_ok=True)

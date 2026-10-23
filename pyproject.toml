@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=69", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "scriptorium"
-version = "0.1.0"
+dynamic = ["version"]   # from the release tag (setuptools-scm; scr release)
 description = "Git-backed research task queues with a hashed dependency graph"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -22,3 +22,6 @@ scr = ["assets/**/*", "defaults/config/*.yaml"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0"   # a checkout or archive with no tags in reach

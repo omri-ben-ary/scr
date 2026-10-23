@@ -17,21 +17,32 @@ from .assets import ASSETS
 _LOCK = threading.Lock()
 
 
+def live_venv(root: Path) -> Path:
+    """The venv the system runs: `<runtime>/current` once a release is installed (scr/runtime.py), else the
+    checkout's .venv (the layout before the cut-over)."""
+    from .runtime import current_venv
+    return current_venv(root) or Path(root) / ".venv"
+
+
 def scr_exe(root: Path) -> list[str]:
-    exe = root / ".venv" / "Scripts" / "scr.exe"
-    if exe.exists():
-        return [str(exe)]
-    exe = root / ".venv" / "bin" / "scr"
-    if exe.exists():
-        return [str(exe)]
+    venv = live_venv(root)
+    for exe in (venv / "Scripts" / "scr.exe", venv / "bin" / "scr"):
+        if exe.exists():
+            return [str(exe)]
     return [sys.executable, "-m", "scr"]
+
+
+def scr_display(root: Path) -> str:
+    """The scr command to print in a brief: the live executable's path, or `scr` when none is found."""
+    argv = scr_exe(root)
+    return argv[0] if len(argv) == 1 else "scr"
 
 
 def service_argv(root: Path) -> list[str]:
     """How to run scr for a long-lived background service: on Windows through pythonw (no console
     window at all); elsewhere the normal scr."""
     if os.name == "nt":
-        pyw = root / ".venv" / "Scripts" / "pythonw.exe"
+        pyw = live_venv(root) / "Scripts" / "pythonw.exe"
         if pyw.exists():
             return [str(pyw), "-m", "scr"]
     return scr_exe(root)
@@ -173,6 +184,12 @@ def argv_values(argv: list[str], flag: str) -> list[str]:
     return [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == flag]
 
 
+def _scr_version() -> str:
+    """The running release, recorded on every launch so the post-cut-over drain can list sessions still on an older one."""
+    from .runtime import installed_version
+    return installed_version()[0]
+
+
 def record_launch(root: Path, kind: str, task: str | None, pid: int | None, session_id: str | None, cwd: Path,
                   argv: list[str] | None = None, note: str | None = None, actor: str | None = None,
                   data: dict | None = None) -> None:
@@ -186,7 +203,7 @@ def record_launch(root: Path, kind: str, task: str | None, pid: int | None, sess
     argv = argv or []
     body = {"kind": kind, "session_id": session_id, "pid": pid, "cwd": str(Path(cwd).resolve()),
             "agent": argv_value(argv, "--agent"), "add_dirs": argv_values(argv, "--add-dir"),
-            "permission_mode": argv_value(argv, "--permission-mode"), **(data or {})}
+            "permission_mode": argv_value(argv, "--permission-mode"), "scr_version": _scr_version(), **(data or {})}
     if pid and "created" not in body:
         body["created"] = process_created(pid)                   # every kind: takeover --stop checks it (T-0147)
     args = ["event", "system", "--name", "launch", "--note", note or f"{kind} pid {pid}, session {session_id}",

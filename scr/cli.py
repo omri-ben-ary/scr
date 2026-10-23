@@ -562,6 +562,8 @@ def cmd_checkpoint(args):
 def cmd_watch(args):
     root, _, _ = _ctx(args)
     from .watch import Watcher
+    if args.dry_run:
+        sys.exit(_watch_dry_run(root, args))
     store = Store(root)
     limits = store.config("limits") or {}
     interval = args.interval or int(limits.get("checkpoint_every_minutes", 30))
@@ -573,6 +575,82 @@ def cmd_watch(args):
                 auto_dispatch=un or args.auto_dispatch, allow_statements=allow_statements, auto_land=un or args.auto_land,
                 auto_intake=un or args.auto_intake, permission_mode=args.permission_mode, push=args.push, quiet=args.quiet)
     w.loop(interval, once=args.once)
+
+
+def _watch_dry_run(root: Path, args) -> int:
+    """One watcher tick on a throwaway copy of the state: the live state is only read (a clone of its repo, or a
+    copy). No dispatch, review, landing, intake, push or notification; a tick that raises fails the run. The smoke
+    check `scr upgrade` runs against a new release before and after the switch (scr/runtime.py)."""
+    import shutil
+    import tempfile
+    from .gitops import Git
+    from .watch import Watcher
+    tmp = Path(tempfile.mkdtemp(prefix="scr-dry-"))
+    copy = tmp / root.name
+    try:
+        if Git(root).is_repo():
+            r = subprocess.run(["git", "clone", "--quiet", "--local", "--no-checkout", str(root), str(copy)], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"dry tick: clone failed: {(r.stdout + r.stderr).strip()[-300:]}")
+                return 1
+            subprocess.run(["git", "-C", str(copy), "checkout", "--quiet", "HEAD"], capture_output=True, text=True)
+            for rel in ("events", "tasks", "config", "state", "queues", "ui"):      # uncommitted record changes too
+                if (root / rel).is_dir():
+                    shutil.copytree(root / rel, copy / rel, dirs_exist_ok=True)
+        else:
+            shutil.copytree(root, copy, ignore=shutil.ignore_patterns(".scr", "*.lock"))
+        os.environ["SCR_NO_NOTIFY"] = "1"
+        os.environ["SCR_NO_JOURNAL"] = "1"
+        w = Watcher(copy, quiet=True)
+        res = w.tick()
+        print(f"dry tick: ok ({len(res.get('needs') or [])} needs line(s)) on a copy of {root}")
+        return 0
+    except Exception as e:  # noqa: BLE001 — a crash is the result this check exists to report
+        print(f"dry tick: CRASHED: {e!r}")
+        return 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_version(args):
+    from .runtime import version_lines
+    try:
+        root = find_root(Path(args.root) if getattr(args, "root", None) else None)
+    except RepoError:
+        root = None
+    print("\n".join(version_lines(root)))
+
+
+def cmd_upgrade(args):
+    root, _, _ = _ctx(args)
+    from .runtime import REPO_URL, upgrade
+    tag = args.tag
+    if args.latest:
+        r = subprocess.run(["git", "ls-remote", "--tags", "--refs", args.repo_url or REPO_URL], capture_output=True, text=True)
+        tags = [ln.split("refs/tags/")[-1] for ln in r.stdout.splitlines() if re.search(r"refs/tags/v\d+\.\d+\.\d+$", ln)]
+        if not tags:
+            raise RepoError(f"no release tags at {args.repo_url or REPO_URL}")
+        tag = max(tags, key=lambda s: tuple(int(x) for x in s[1:].split(".")))
+    if not tag:
+        raise RepoError("scr upgrade <vX.Y.Z> | --latest")
+    rc, lines = upgrade(root, tag, actor=args.actor, repo_url=args.repo_url or REPO_URL)
+    print("\n".join(lines))
+    sys.exit(rc)
+
+
+def cmd_rollback(args):
+    root, _, _ = _ctx(args)
+    from .runtime import rollback
+    rc, lines = rollback(root, actor=args.actor)
+    print("\n".join(lines))
+    sys.exit(rc)
+
+
+def cmd_release(args):
+    from .runtime import release
+    rc, lines = release(Path(args.repo or "."), "minor" if args.minor else "patch")
+    print("\n".join(lines))
+    sys.exit(rc)
 
 
 def cmd_chore(args):
@@ -991,12 +1069,20 @@ def build_parser() -> argparse.ArgumentParser:
     ik = sub.add_parser("intake", parents=[common], help="run the Intake agent once (headless)"); ik.add_argument("--dry-run", action="store_true"); ik.set_defaults(fn=cmd_intake)
     ck = sub.add_parser("checkpoint", parents=[common], help="commit a running task's worktree on its branch"); ck.add_argument("id"); ck.add_argument("--push", action="store_true"); ck.set_defaults(fn=cmd_checkpoint)
     w = sub.add_parser("watch", parents=[common], help="the Steward's mechanical loop (--once for a single tick)")
+    w.add_argument("--dry-run", action="store_true", help="one tick on a throwaway copy of the state: read-only smoke check (scr upgrade)")
     w.add_argument("--once", action="store_true"); w.add_argument("--interval", type=int, default=0); w.add_argument("--stale", type=int, default=45)
     for flag in ("auto-review", "auto-decide", "auto-dispatch", "allow-statements", "auto-land", "auto-intake", "unattended", "push"):
         w.add_argument("--" + flag, action="store_true")
     w.add_argument("--permission-mode", default=None, help="override the config default for the sessions this watcher starts (limits.yaml claude_permission_mode)"); w.set_defaults(fn=cmd_watch)
     ch = sub.add_parser("chore", parents=[common], help="chores from ui/chores.yaml"); ch.add_argument("op", choices=["list", "run", "check"]); ch.add_argument("id", nargs="?"); ch.set_defaults(fn=cmd_chore)
     upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
+    sub.add_parser("version", parents=[common], help="the running release, the state schema version, the releases installed side by side").set_defaults(fn=cmd_version)
+    ug = sub.add_parser("upgrade", parents=[common], help="install a release beside the live one, smoke it, switch, smoke again; rolls back on failure")
+    ug.add_argument("tag", nargs="?"); ug.add_argument("--latest", action="store_true"); ug.add_argument("--repo-url"); ug.set_defaults(fn=cmd_upgrade)
+    sub.add_parser("rollback", parents=[common], help="point the runtime back at the release that was live before the last switch").set_defaults(fn=cmd_rollback)
+    rl = sub.add_parser("release", parents=[common], help="tag the code repo's HEAD as the next release (notes from merged PRs); prints the push command")
+    rl.add_argument("--patch", action="store_true"); rl.add_argument("--minor", action="store_true"); rl.add_argument("--repo", help="the code repo (default: cwd)")
+    rl.set_defaults(fn=cmd_release)
     mg = sub.add_parser("migrate", parents=[common], help="journal-mode setup (idempotent), then the pending state-schema migrations")
     mg.add_argument("--dry-run", action="store_true", help="list the pending schema migrations, change nothing"); mg.set_defaults(fn=cmd_migrate)
     iss = sub.add_parser("issue", parents=[common], help='known issues: add "<text>" [--urgent] | list [--all] | close <id> --note <why>')
@@ -1039,7 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
 MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire", "worktrees",
-            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix", "job", "issue"}
+            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix", "job", "issue", "upgrade", "rollback"}
 
 
 def main(argv=None):
