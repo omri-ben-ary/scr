@@ -455,21 +455,11 @@ def _print(lines):
 
 
 def cmd_land(args):
-    """One command for both landings (T-0119): ops.land_any routes a scriptorium task to land_scriptorium
-    (the watcher's land step), every other workload to the QI push/PR land()."""
+    """One command for every landing (T-0119): ops.land_any sends a workload task through the push/PR land();
+    a tooling task (workload repo = this checkout) is refused, because tooling lands as a PR in the scr repo."""
     root, store, _ = _ctx(args)
-    from .ops import is_scriptorium_task, land_any
-    scriptorium = is_scriptorium_task(root, store, store.get(args.id))
-    if scriptorium and (args.no_pr or args.draft or args.merge):
-        print("scriptorium task: --merge is implied, --no-pr/--draft do not apply")
-    if args.skip_main_failing:
-        # T-0404: landing with failing tests is Omri's call, like --force-accept; the watcher only retries (watch.py)
-        if args.actor != "omri":
-            raise RepoError(f"{args.id}: --skip-main-failing is Omri's alone (--actor omri), not {args.actor}'s")
-        if not scriptorium:
-            raise RepoError(f"{args.id}: --skip-main-failing applies to a scriptorium landing only")
-    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge,
-                 skip_main_failing=args.skip_main_failing)
+    from .ops import land_any
+    r = land_any(root, args.id, no_pr=args.no_pr, draft=args.draft, dry_run=args.dry_run, merge=args.merge)
     _print(r["out"])
     if not r["ok"]:
         sys.exit(1)
@@ -913,13 +903,10 @@ def build_parser() -> argparse.ArgumentParser:
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)
     j = sub.add_parser("journal", parents=[common], help="commit the scriptorium tree if dirty (journal mode; every mutating command does this itself)")
     j.add_argument("--note", default="journal"); j.add_argument("--push", action="store_true"); j.set_defaults(fn=cmd_journal)
-    land_help = ("land a task: a scriptorium task via land_scriptorium (commit, merge the trunk in, tests, merge into the trunk, merged; "
-                 "--dry-run prints the plan, --no-pr/--draft/--merge do not apply); any other workload via the PR path "
-                 "(commit + push, open its PR; --merge: merge and mark merged)")
+    land_help = ("land a task through the PR path (commit + push, open its PR; --merge: merge and mark merged); "
+                 "a tooling task of this checkout is refused: tooling lands as a PR in the scr repo")
     ld = sub.add_parser("land", parents=[common], help=land_help, description=land_help)
     ld.add_argument("id"); ld.add_argument("--no-pr", action="store_true"); ld.add_argument("--draft", action="store_true"); ld.add_argument("--dry-run", action="store_true"); ld.add_argument("--merge", action="store_true")
-    ld.add_argument("--skip-main-failing", action="store_true", help="scriptorium, Omri only: land although tests fail, when every "
-                    "failing id also fails when rerun on the trunk (the MAIN_FAILING_MARK verdict); the land event names them")
     ld.set_defaults(fn=cmd_land)
     sw = sub.add_parser("sweep", parents=[common], help="commit uncommitted work in non-task worktrees (--merge: PR + merge into main)")
     sw.add_argument("--merge", action="store_true"); sw.add_argument("--dry-run", action="store_true")

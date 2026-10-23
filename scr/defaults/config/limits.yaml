@@ -8,7 +8,7 @@ omri_stale_hours: 48      # reader: the Concierge agent via agents/concierge.md 
 dispatch_timeout_minutes: 30   # a dispatched task with no launch event after this long goes back to ready (scr/watch.py dispatch_checks; T-0122)
 dispatch_timeout_rounds: 3     # that many dispatch_timeouts in a row with no launch -> one needs line quoting the launcher's reason (reader: scr/watch.py dispatch_rounds_needs; T-0127)
 checkpoint_every_minutes: 30
-land_test_timeout_seconds: 14400   # the landing's full test run (step 4) fails as `tests` after this long (scr/ops.py land_test_timeout / _run_tests; also scr/hotfix.py run_tests for `scr hotfix test`/`close`, T-0131; was a hardcoded 1800, T-0170 timed out 2026-09-24; T-0186)
+land_test_timeout_seconds: 14400   # the full test run of `scr hotfix test`/`close` fails after this long (scr/ops.py land_test_timeout, read by scr/hotfix.py run_tests, T-0131; was a hardcoded 1800, T-0170 timed out 2026-09-24; T-0186)
 review_stale_hours: 2.5     # a submitted task with no Decision written after this long is stuck -> escalated (T-0092; shared with T-0089)
 help_stale_hours: 3       # an in_progress task whose blocking HELP line is unanswered this long is stuck -> escalated (T-0092)
 statement_window: "00:00-23:59"   # only window where may_touch_statements tasks are dispatched, even with --allow-statements (Asia/Jerusalem, local time without tzdata; scr/cli.py statement_window_open; T-0125)
