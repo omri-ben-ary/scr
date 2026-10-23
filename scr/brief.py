@@ -21,7 +21,9 @@ a test suite, an LP or certificate run) submit it as a JOB instead of running it
 (always with --root, before `job`: run it from your worktree, which becomes the job's cwd; without --root scr writes its records into the worktree)
 then append the line `WAITING: job <J-id>` as the LAST line of {log} and END YOUR TURN. The watcher runs the
 job outside this session (its log: {scr} --root {root} job tail <J-id>), frees your slot meanwhile, and resumes THIS session
-with the result when the job ends. Never background a long command inside this session.{stmt}"""
+with the result when the job ends. Never background a long command inside this session.
+Every Python script you write calls sys.stdout.reconfigure(encoding="utf-8") and sys.stderr.reconfigure(encoding="utf-8") first
+and opens every text file with encoding="utf-8": the review runs it as `python -I <script>` on a cp1255 console without -X utf8.{stmt}"""
 
 
 def brief_for(root: Path, store: Store, t: Task) -> str:

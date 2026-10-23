@@ -2086,6 +2086,8 @@ class Watcher:
                  f"origin/{wl.main} and HEAD; never pass a bare {wl.main}: the stale local ref names every file merged since the branch point as out of scope), "
                  f"fill review.md completely, and end with a "
                  f"Decision line: accepted | returned (feedback) | escalated (Gate N, reason).\n{decide}\n"
+                 f"Run every done_when script as `python -I <script>` WITHOUT -X utf8 and with PYTHONUTF8 / PYTHONIOENCODING unset; "
+                 f"a UnicodeEncodeError or decode error is a failed mechanical check.\n"
                  f"Run every check in the FOREGROUND and wait for it; never background check_done.py or a build and end your turn "
                  f"(this headless session is killed {int(self.limits.get('review_bg_wait_minutes', REVIEW_BG_WAIT_MINUTES))} min after "
                  f"your turn ends, and a review that ends without a Decision is lost). A check you expect to take over an hour: "
