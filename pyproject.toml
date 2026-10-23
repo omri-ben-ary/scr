@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,6 +15,10 @@ scr = "scr.cli:main"
 
 [tool.setuptools]
 packages = ["scr"]
+
+[tool.setuptools.package-data]
+# the code's own files (scr/assets.py) and the shipped default config travel in the wheel
+scr = ["assets/**/*", "defaults/config/*.yaml"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

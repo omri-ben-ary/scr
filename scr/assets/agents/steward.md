@@ -53,9 +53,10 @@ loopy-prover (`../quantum-insertion/missions/LOOPY/README.md`) may close the `so
 frozen target instead of the scriber's own prover rounds. Use it only when the task's
 statements are frozen (TARGETS.md written and, if `may_touch_statements`, already through
 Gate 1) and the remaining work is proof search. Run it through the hook so the run is an event:
+(the hook ships inside the scr package; `scr assets hooks` prints its folder):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File hooks\loopy_phase_c.ps1 -Task <id> `
+powershell -ExecutionPolicy Bypass -File <hooks folder>\loopy_phase_c.ps1 -Root <scriptorium root> -Task <id> `
     -File QuantumInsertion/Foo/Bar.lean -Target <decl> [-Worktree <name>] [-- --max-iterations 3]
 ```
 

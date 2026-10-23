@@ -6,7 +6,7 @@ quantum-insertion:
   done_when_checker: missions/SCRIPTORIUM/scripts/check_done.py     # --decls <names> [--files <scope>] [--fetch] (default base: merge-base of origin/<main_branch> and HEAD; never --base <main_branch>) [--json out]
   statement_diff: missions/SCRIPTORIUM/scripts/statement_diff.py    # exit 0 = proof-only (auto-merge eligible); exit 1 = Gate 1 (default base: merge-base of origin/<main_branch> and HEAD; never --base <main_branch>)
   # ci_gates (missions/AUDIT/scripts/check_gates.py: --placeholders --coverage --axioms) deleted 2026-09-23 by T-0133: no scr/ or agents/ reader; the workload's own CI runs it
-  loopy: missions/LOOPY/scripts/run_loopy.ps1                        # optional Phase C engine; Steward runs it via hooks/loopy_phase_c.ps1 (see agents/steward.md)
+  loopy: missions/LOOPY/scripts/run_loopy.ps1                        # optional Phase C engine; Steward runs it via the packaged hooks/loopy_phase_c.ps1 (`scr assets hooks`) (see agents/steward.md)
   allowed_axioms: [propext, Classical.choice, Quot.sound]
   roadmap: docs/ROADMAP.md                # the phase/task ledger Intake scans for open items (- [ ])
   # audit_surface (missions/AUDIT/AUDIT.md, changes always Gate 1) deleted 2026-09-23 by T-0133: no reader; a scope rule for T-0082's scr/scope.py, re-add with a reader then

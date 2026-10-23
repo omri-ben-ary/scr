@@ -17,7 +17,7 @@ import yaml
 from scr.ops import spawn
 from scr.store import Store
 from test_journal_ops import REPO, accepted_review, world, scr  # noqa: F401  (the shared fixture: scriptorium + workload repo + origin)
-from _paths import CONFIG  # noqa: E402
+from _paths import ASSETS, CONFIG, asset  # noqa: E402
 
 FAKE_CLAUDE = str(Path(sys.executable).with_name("claude.exe"))   # a .exe path: claude_argv must not wrap it in `cmd /c`
 
@@ -164,12 +164,12 @@ def test_sessions_in_a_worktree_get_add_dir_root(world, monkeypatch):
     for name in ("launch", "start_review", "watch_dispatch"):          # cwd = the task worktree
         c = sites[name]
         assert c["cwd"].resolve() == wt, (name, c["cwd"])
-        assert _add_dirs(c["argv"]) == [str(root)], (name, c["argv"])
-        assert (Path(_add_dirs(c["argv"])[0]) / "tasks").is_dir() and (Path(_add_dirs(c["argv"])[0]) / "agents" / "steward.md").exists()
-    for name in ("start_tooling_review", "intake"):                    # cwd = the scriptorium root: nothing to add
+        assert _add_dirs(c["argv"]) == [str(root), str(ASSETS)], (name, c["argv"])
+        assert (Path(_add_dirs(c["argv"])[0]) / "tasks").is_dir() and (Path(_add_dirs(c["argv"])[1]) / "agents" / "steward.md").exists()
+    for name in ("start_tooling_review", "intake"):                    # cwd = the scriptorium root: no root to add
         c = sites[name]
         assert c["cwd"].resolve() == root.resolve(), (name, c["cwd"])
-        assert _add_dirs(c["argv"]) == [], (name, c["argv"])
+        assert _add_dirs(c["argv"]) == [str(ASSETS)], (name, c["argv"])          # only the packaged agents/ and templates/
 
 
 def test_explicit_override_beats_the_config_default(world, monkeypatch):
@@ -393,7 +393,7 @@ def test_scr_land_qi_task_still_reaches_ops_land(tmp_path: Path, monkeypatch):
 # every submitted task on a tick with auto_decide on and applies the verdict as steward:<id>.
 from scr.watch import DECISION_NOTE, decision_of, read_decision  # noqa: E402
 
-TEMPLATE = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+TEMPLATE = (asset("templates") / "review.md").read_text(encoding="utf-8")
 LOG = Path("reports") / "steward_watch.log"
 
 
@@ -928,7 +928,7 @@ def test_stuck_escalated_and_returned_never_count_against_the_cap(world, monkeyp
 
 def test_stuck_rule_is_written_in_the_agent_docs():
     for name in ("_common.md", "steward.md"):
-        text = (REPO / "agents" / name).read_text(encoding="utf-8")
+        text = (asset("agents") / name).read_text(encoding="utf-8")
         assert "never held" in text and "same tick" in text, name
     assert submitted_since([{"kind": "state", "task": "T-1", "to": "submitted", "ts": "2026-09-19T16:11:02Z"}], "T-1") == datetime(2026, 9, 19, 16, 11, 2, tzinfo=timezone.utc)
     assert REVIEW_STALE_HOURS == 2.0
@@ -2031,7 +2031,7 @@ informs:
   - {task: T-0171, weight: 0.2, reason: "toast_argv gained dry= and $ErrorActionPreference='Stop'; a failing toast now raises reliably, which feeds the T-0171 retry path"}
 ```
 """
-REPORT_TPL = (REPO / "templates" / "report.md").read_text(encoding="utf-8").strip()
+REPORT_TPL = (asset("templates") / "report.md").read_text(encoding="utf-8").strip()
 
 
 def test_report_unfinished_names_a_placeholder_an_empty_result_and_the_template_prompt():
@@ -3285,7 +3285,7 @@ def test_wall_running_time_over_budget_escalates_once_quoting_running_time(world
 
 
 def test_wall_rule_is_written_in_the_agent_docs():
-    text = (REPO / "agents" / "_common.md").read_text(encoding="utf-8")
+    text = (asset("agents") / "_common.md").read_text(encoding="utf-8")
     assert any("max_wall_hours" in l and "watcher" in l for l in text.splitlines())
 
 
@@ -3583,7 +3583,7 @@ def test_live_config_leaves_every_workload_unfrozen_and_intake_names_the_note():
     """T-0272 builds the switch only (T-0276 throws it); the Intake rule names the parking note verbatim."""
     wls = yaml.safe_load((CONFIG / "workloads.yaml").read_text(encoding="utf-8"))
     assert all(not cfg.get("frozen") for cfg in wls.values())
-    assert '"frozen workload: parked for the thaw"' in (REPO / "agents" / "intake.md").read_text(encoding="utf-8")
+    assert '"frozen workload: parked for the thaw"' in (asset("agents") / "intake.md").read_text(encoding="utf-8")
 
 
 # ---- T-0274: taking over a review session holds the review; its end relaunches it or applies the Decision -------

@@ -12,6 +12,8 @@ import threading
 import uuid
 from pathlib import Path
 
+from .assets import ASSETS
+
 _LOCK = threading.Lock()
 
 
@@ -133,7 +135,7 @@ def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | Non
                  extra: list[str] | None = None, session_id: str | None = None, resume: str | None = None) -> list[str] | None:
     """The argv of a headless session: `claude -p --session-id <uuid> --permission-mode <mode> --output-format text`,
     plus `--add-dir <root>` when it runs somewhere other than the scriptorium root (a task worktree) so it can
-    read tasks/<id>/ and agents/. `permission_mode=None` means the config default (permission_mode_for).
+    read tasks/<id>/, and `--add-dir <the package's assets/>` so it can read agents/*.md and templates/. `permission_mode=None` means the config default (permission_mode_for).
     `session_id=None` means a new one: every session gets an id the launcher knows, so it can be resumed
     (`scr takeover`, T-0247); a caller that records the id passes it in (new_session_id)."""
     mode = permission_mode or permission_mode_for(root)
@@ -145,10 +147,20 @@ def session_argv(cwd: Path, root: Path | None = None, permission_mode: str | Non
         return None
     if root is not None and Path(cwd).resolve() != Path(root).resolve():
         args += ["--add-dir", str(root)]
+    if not _inside(ASSETS, cwd):                    # agents/*.md and templates/ ship in the package, not the state root
+        args += ["--add-dir", str(ASSETS)]
     if model:
         args += ["--model", model]
     args += extra or []
     return args
+
+
+def _inside(path: Path, folder: Path | str) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(folder).resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def argv_value(argv: list[str], flag: str) -> str | None:

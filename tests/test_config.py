@@ -21,7 +21,7 @@ import yaml
 
 from scr.cli import statement_window_open
 from test_journal_ops import REPO, world, scr  # noqa: F401  (the shared fixture)
-from _paths import CONFIG  # noqa: E402
+from _paths import CONFIG, asset  # noqa: E402
 
 # key -> who reads it and where. Only keys an agent reads through its brief belong here; a yaml comment is
 # not a reader. Each entry must also be a key in limits.yaml, with a comment on its line naming the reader.
@@ -195,7 +195,7 @@ def test_ci_gates_and_audit_surface_are_wired_or_gone():
     """The two unread keys of 2026-09-23: each is now read in scr/ or agents/, or gone from workloads.yaml
     (deleted with a dated note). Neither may sit in WORKLOADS_READERS unless a brief names it."""
     keys = config_keys(REPO, "workloads.yaml")
-    briefs = _scr_text(REPO) + "".join(p.read_text(encoding="utf-8") for p in (REPO / "agents").glob("*.md"))
+    briefs = _scr_text(REPO) + "".join(p.read_text(encoding="utf-8") for p in asset("agents").glob("*.md"))
     src = (CONFIG / "workloads.yaml").read_text(encoding="utf-8")
     for key in ("ci_gates", "audit_surface"):
         if f"quantum-insertion.{key}" in keys:

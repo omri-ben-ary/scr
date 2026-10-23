@@ -6,8 +6,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "scr" / "defaults" / "config"     # the shipped defaults; the live config/ stays in the state folder
 FIXTURES = REPO / "tests" / "fixtures"           # task records the tests replay (copied from the state repo)
+ASSETS = REPO / "scr" / "assets"                 # templates, ui, agents, hooks: package data (scr/assets.py)
 
 
 def asset(d: str) -> Path:
-    """The source of a folder a test world copies in: config from the shipped defaults, the rest from the repo."""
-    return CONFIG if d == "config" else REPO / d
+    """config from the shipped defaults; templates, ui, agents and hooks from the package's assets."""
+    return CONFIG if d == "config" else ASSETS / d
