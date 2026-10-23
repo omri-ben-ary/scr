@@ -72,6 +72,8 @@ jobs:
           $state = Join-Path $env:RUNNER_TEMP "desk\scriptorium"
           New-Item -ItemType Directory -Path $state -Force | Out-Null
           uv run scr --root $state init --quiet
+          # scr init leaves config/ empty; a real state has Omri's config, so seed the shipped defaults
+          Copy-Item scr\defaults\config\*.yaml (Join-Path $state "config") -Force
           # Windows PowerShell 5.1 reads this step as ANSI: build the non-ASCII title from code points
           $title = "Rehearsal smoke: arrows " + [char]0x2192 + " and dashes " + [char]0x2014
           uv run scr --root $state --quiet task new $title --id T-0001 --origin omri
