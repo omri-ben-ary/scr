@@ -239,6 +239,7 @@ def _discuss_lines(root: Path, items: list[str], monkeypatch) -> dict[str, str]:
 DISCUSS_ITEMS = ["plan", "T-0001", "events:T-0001:stale:2099-01-01T00:00:00", "general"]
 
 
+@pytest.mark.windows
 def test_discuss_sessions_default_to_auto_mode(world, monkeypatch):
     root, repo, _ = world
     lines = _discuss_lines(root, DISCUSS_ITEMS, monkeypatch)
@@ -250,6 +251,7 @@ def test_discuss_sessions_default_to_auto_mode(world, monkeypatch):
         assert "acceptEdits" not in line and "bypassPermissions" not in line
 
 
+@pytest.mark.windows
 def test_discuss_sessions_take_the_config_override(world, monkeypatch):
     root, _, _ = world
     _set_limit(root, "claude_permission_mode", "bypassPermissions")
@@ -1222,6 +1224,7 @@ def test_escalation_does_not_depend_on_the_kill(world, monkeypatch, result):
     assert len(ev) == 1 and "stopping session pid 4242 FAILED" in ev[0]["note"] and "may still be running" in ev[0]["note"], ev
 
 
+@pytest.mark.windows
 @pytest.mark.skipif(os.name != "nt", reason="taskkill is the Windows path")
 def test_run_kill_reports_a_refused_taskkill(monkeypatch):
     """run.kill's return value is what the note trusts: a non-zero taskkill exit (no such pid) is False."""
@@ -1529,6 +1532,7 @@ def test_notify_config_absent_or_all_off_calls_nothing(world, monkeypatch, cfg):
     assert "notify" not in (root / LOG).read_text(encoding="utf-8")
 
 
+@pytest.mark.windows
 def test_toast_argv_names_the_card_title_and_task_id():
     card = _card("gate:T-0042", "T-0042", "Omri's gate: accept the <new> lemma & go")
     argv = notify.toast_argv([card, CARD_A])
@@ -1540,6 +1544,7 @@ def test_toast_argv_names_the_card_title_and_task_id():
     assert "ToastNotificationManager" in cmd and notify.TOAST_APP_ID in cmd
 
 
+@pytest.mark.windows
 @pytest.mark.skipif(os.name != "nt" or not shutil.which("powershell"), reason="needs Windows and powershell on PATH")
 def test_toast_smoke_runs_the_real_script_through_powershell():
     """T-0172: toast() is skipped under pytest, so this is the one test that runs the WinRT script itself
@@ -1553,6 +1558,7 @@ def test_toast_smoke_runs_the_real_script_through_powershell():
     assert r.returncode == 0 and not r.stderr.strip(), f"rc {r.returncode}: {r.stderr or r.stdout}"
 
 
+@pytest.mark.windows
 def test_toast_without_windows_powershell_raises(monkeypatch):
     """T-0179: pwsh cannot load the WinRT types, so a box with only pwsh gets a clear error and no process."""
     monkeypatch.setattr(notify, "_under_pytest", lambda: False)
@@ -2679,6 +2685,7 @@ def _sid(argv: list[str]) -> str:
     return argv[argv.index("--session-id") + 1]
 
 
+@pytest.mark.windows
 def test_session_argv_carries_a_fresh_uuid_session_id(world, monkeypatch):
     import scr.run as run_mod
     root, repo, _ = world

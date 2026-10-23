@@ -22,3 +22,8 @@ scr = ["assets/**/*", "defaults/config/*.yaml"]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+markers = [
+    "windows: Windows-specific behaviour (junctions, taskkill, powershell, CRLF, cmd /c); also run by the tests (windows) CI job",
+]

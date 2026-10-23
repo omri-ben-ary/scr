@@ -22,3 +22,32 @@ jobs:
       - run: uv run python -m pytest tests -q -p no:cacheprovider
       - name: wheel installs non-editable and finds its own files
         run: uv run python tools/check_wheel.py
+
+  windows:
+    name: tests (windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - name: git identity for the test worlds
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+          git config --global init.defaultBranch main
+      - name: Windows-specific tests (junctions, taskkill, powershell, CRLF, cmd /c)
+        run: uv run python -m pytest tests -q -p no:cacheprovider -m windows
+      - name: smoke on a cp1255 console with no utf-8 overrides
+        shell: cmd
+        env:
+          SCR_NO_JOURNAL: "1"
+          PYTHONUTF8: "0"
+        run: |
+          chcp 1255
+          set ROOT=%RUNNER_TEMP%\state
+          uv run scr --root "%ROOT%" init || exit /b 1
+          uv run scr --root "%ROOT%" task new "Smoke: arrows → and dashes —" --id T-0001 --origin omri || exit /b 1
+          uv run scr --root "%ROOT%" verify || exit /b 1
+      - name: wheel installs non-editable and finds its own files
+        run: uv run python tools/check_wheel.py
