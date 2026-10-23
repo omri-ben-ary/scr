@@ -1,6 +1,8 @@
 """scr admin stop reports what the kill actually did (T-0148)."""
 from pathlib import Path
 
+import pytest
+
 import scr.admin as admin
 
 
@@ -11,6 +13,7 @@ def _stub(monkeypatch, pids, killed):
     return calls
 
 
+@pytest.mark.windows
 def test_admin_stop_reports_a_failed_kill(monkeypatch):
     calls = _stub(monkeypatch, [111], False)
     lines = admin.stop(Path("."), "watch")
