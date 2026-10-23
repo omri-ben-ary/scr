@@ -31,12 +31,12 @@ def _ctx(args) -> tuple[Path, Store, EventLog]:
     return root, Store(root), EventLog(root / "events" / "events.jsonl")
 
 
-def refresh(root: Path, quiet: bool = False, note: str | None = None) -> dict:
+def refresh(root: Path, quiet: bool = False, note: str | None = None, schema_version: int | None = None) -> dict:
     st = State(root)
     store = Store(root)
     g = Graph.build(store.load_all())
     write_queues(root, g, store.config("weights"), store.config("limits"))
-    snap = st.snapshot(note)
+    snap = st.snapshot(note, schema_version=schema_version)
     if not quiet:
         print(f"state_root {snap['state_root'][:16]}  tasks_root {snap['tasks_root'][:12]}  graph_root {snap['graph']['graph_root'][:12]}  events {snap['events_count']}")
     return snap
@@ -600,9 +600,60 @@ def cmd_update(args):
 
 
 def cmd_migrate(args):
+    """Journal-mode setup (idempotent), then the pending state-schema migrations (scr/schema.py), each its own
+    journaled commit. `--dry-run` lists the pending migrations and changes nothing."""
     root, _, _ = _ctx(args)
+    from .schema import migrate_schema
+    if args.dry_run:
+        _print(migrate_schema(root, args.actor, dry_run=True))
+        return
     from .admin import migrate
     _print(migrate(root))
+    try:
+        _print(migrate_schema(root, args.actor))
+    except RuntimeError as e:
+        raise RepoError(str(e))
+
+
+def cmd_issue(args):
+    """Known issues (scr/issues.py): add | list | close. `add --urgent` also files a tooling task at the top of
+    the queue (ready, omri_weight 2), the fast track for a real outage."""
+    root, store, _ = _ctx(args)
+    from . import issues
+    if args.op == "list":
+        items = [i for i in issues.issues(root) if args.all or i["status"] == "open"]
+        if args.json:
+            _out(items, True)
+            return
+        print("\n".join(f"{i['id']} [{i['status']}]{' urgent' if i['urgent'] else ''} {i['text']}" + (f" -> {i['task']}" if i["task"] else "")
+                        for i in items) or "no open issues")
+        return
+    if args.op == "close":
+        try:
+            i = issues.close(root, args.id, args.actor, args.note)
+        except (KeyError, ValueError) as e:
+            raise RepoError(str(e))
+        print(f"closed {i['id']}")
+        return
+    text = " ".join(args.rest).strip()
+    if not text.strip():
+        raise RepoError('scr issue add "<what is wrong>" [--urgent]')
+    task = None
+    if args.urgent:
+        tid = store.next_id()
+        wl = issues.tooling_workload(store.config("workloads"))
+        argv = ["--root", str(root), "--actor", args.actor, "--quiet", "task", "new", f"Urgent known issue: {' '.join(text.split())}"[:200],
+                "--id", tid, "--kind", "refactor", "--origin", "omri", "--omri-weight", "2.0", "--note", "scr issue add --urgent"]
+        if wl:
+            argv += ["--workload", wl]
+        p = build_parser()
+        for a in (argv, ["--root", str(root), "--actor", args.actor, "--quiet", "task", "set", tid, "triaged"],
+                  ["--root", str(root), "--actor", args.actor, "--quiet", "task", "set", tid, "ready", "--note", "urgent known issue"]):
+            ns = p.parse_args(a)
+            ns.fn(ns)
+        task = tid
+    i = issues.add(root, text, args.actor, urgent=args.urgent, task=task)
+    print(f"added {i['id']}" + (f" and filed {task} at the top of the queue" if task else "") + f" ({issues.VIEW.as_posix()})")
 
 
 def cmd_ensure_main(args):
@@ -944,7 +995,14 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--permission-mode", default=None, help="override the config default for the sessions this watcher starts (limits.yaml claude_permission_mode)"); w.set_defaults(fn=cmd_watch)
     ch = sub.add_parser("chore", parents=[common], help="chores from ui/chores.yaml"); ch.add_argument("op", choices=["list", "run", "check"]); ch.add_argument("id", nargs="?"); ch.set_defaults(fn=cmd_chore)
     upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
-    sub.add_parser("migrate", parents=[common], help="bring this checkout to journal mode (idempotent)").set_defaults(fn=cmd_migrate)
+    mg = sub.add_parser("migrate", parents=[common], help="journal-mode setup (idempotent), then the pending state-schema migrations")
+    mg.add_argument("--dry-run", action="store_true", help="list the pending schema migrations, change nothing"); mg.set_defaults(fn=cmd_migrate)
+    iss = sub.add_parser("issue", parents=[common], help='known issues: add "<text>" [--urgent] | list [--all] | close <id> --note <why>').add_subparsers(dest="op", required=True)
+    ia = iss.add_parser("add", parents=[common], help="record a bug for the next release (--urgent: also file a tooling task now)")
+    ia.add_argument("rest", nargs="+", metavar="text"); ia.add_argument("--urgent", action="store_true"); ia.set_defaults(fn=cmd_issue)
+    il = iss.add_parser("list", parents=[common], help="open issues (--all: closed too)"); il.add_argument("--all", action="store_true"); il.set_defaults(fn=cmd_issue)
+    ic = iss.add_parser("close", parents=[common], help="close an issue with the reason"); ic.add_argument("id"); ic.add_argument("--note", required=True)
+    ic.set_defaults(fn=cmd_issue)
     em = sub.add_parser("ensure-main", parents=[common], help="fold a side branch into main (fast-forward, else merge) and, with --push, push main to origin")
     em.add_argument("--main", help="branch name (default: the scriptorium workload's main_branch)"); em.add_argument("--push", action="store_true"); em.set_defaults(fn=cmd_ensure_main)
     upp = sub.add_parser("up", parents=[common], help="start (and register at logon) the UI and the watcher")
@@ -981,7 +1039,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # Commands that change the tree and therefore end with a journal commit (journal mode).
 MUTATING = {"init", "task", "edge", "dispatch", "event", "checkin", "land", "sweep", "park", "retire", "worktrees",
-            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix", "job"}
+            "spawn", "launch", "chore", "update", "migrate", "ensure-main", "intake", "checkpoint", "discuss", "answer", "inbox", "ack", "config", "plan", "hotfix", "job", "issue"}
 
 
 def main(argv=None):
