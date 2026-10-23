@@ -13,7 +13,7 @@ from scr.events import EventLog
 from scr.run import scr_display, scr_exe
 from test_journal_ops import git, scr, world  # noqa: F401  (the shared fixture)
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="the fake releases are POSIX venvs (bin/scr); the junction path is exercised on the PC")
+posix_only = pytest.mark.skipif(os.name == "nt", reason="the checkout-venv fallback written here is the POSIX bin/scr")
 
 
 class FakeOps(runtime.Ops):
@@ -72,6 +72,7 @@ def test_runtime_dir_defaults_beside_the_state_root(tmp_path, monkeypatch):
     assert runtime.runtime_dir(tmp_path / "scriptorium") == tmp_path / "elsewhere"
 
 
+@posix_only
 def test_scr_exe_prefers_the_live_release_and_falls_back_to_the_checkout_venv(world, rt):
     root, _, _ = world
     assert scr_display(root) == "scr" and scr_exe(root)[1:] == ["-m", "scr"]      # neither exists: python -m scr
@@ -257,3 +258,19 @@ def test_launch_events_record_the_running_release(world, monkeypatch):
     record_launch(root, "scriber", "T-0001", None, "sid-1", root)
     ev = [e for e in EventLog(root / "events" / "events.jsonl").read() if e.get("name") == "launch"][-1]
     assert ev["data"]["scr_version"] == runtime.installed_version()[0]
+
+
+@pytest.mark.windows
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions (mklink /J)")
+def test_current_is_a_junction_that_switches_and_rolls_back(world, rt):
+    """The real point_current on Windows: `current` is a junction (not a copy), realpath follows it, a switch
+    replaces it without touching the release behind it, and scr_exe resolves current\\Scripts\\scr.exe."""
+    root, _, _ = world
+    runtime.upgrade(root, "v0.2.0", ops=FakeOps())
+    runtime.upgrade(root, "v0.2.1", ops=FakeOps())
+    link = rt / "current"
+    assert runtime.current_target(root).name == "v0.2.1" and link.is_dir()
+    assert (rt / "v0.2.0" / "Scripts" / "scr.exe").exists()                      # the old release is intact
+    assert scr_exe(root) == [str(link / "Scripts" / "scr.exe")]
+    assert runtime.rollback(root, ops=FakeOps())[0] == 0
+    assert runtime.current_target(root).name == "v0.2.0" and (rt / "v0.2.1" / "Scripts" / "scr.exe").exists()
