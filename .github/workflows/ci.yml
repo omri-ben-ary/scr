@@ -49,5 +49,33 @@ jobs:
           uv run scr --root "%ROOT%" init || exit /b 1
           uv run scr --root "%ROOT%" task new "Smoke: arrows → and dashes —" --id T-0001 --origin omri || exit /b 1
           uv run scr --root "%ROOT%" verify || exit /b 1
+      - name: both PowerShell scripts parse under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          foreach ($f in "tools\rehearse.ps1", "tools\cutover.ps1") {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
+            if ($errs) { $errs | ForEach-Object { Write-Host "$f : $_" }; exit 1 }
+            Write-Host "$f parses"
+          }
+      - name: rehearse.ps1 end to end against a synthetic state (a locally built wheel, Windows PowerShell 5.1)
+        shell: powershell
+        env:
+          SCR_NO_NOTIFY: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          uv build --wheel --out-dir dist
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $wheel = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          $state = Join-Path $env:RUNNER_TEMP "desk\scriptorium"
+          New-Item -ItemType Directory -Path $state -Force | Out-Null
+          uv run scr --root $state init --quiet
+          uv run scr --root $state --quiet task new "Rehearsal smoke: arrows → and dashes —" --id T-0001 --origin omri
+          git -C $state init -q -b main; git -C $state add -A; git -C $state commit -q -m seed
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\rehearse.ps1 -Tag v0.0.0 -State $state `
+            -Runtime (Join-Path $env:RUNNER_TEMP "desk\scr-runtime") -Wheel $wheel -Python (Resolve-Path .venv\Scripts\python.exe).Path
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (Test-Path (Join-Path $env:RUNNER_TEMP "desk\scr-runtime\current")) { Write-Host "rehearse.ps1 must not create current"; exit 1 }
+          if (git -C $state status --porcelain) { Write-Host "rehearse.ps1 wrote to the live state"; git -C $state status; exit 1 }
       - name: wheel installs non-editable and finds its own files
         run: uv run python tools/check_wheel.py
