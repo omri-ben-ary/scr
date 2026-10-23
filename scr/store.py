@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from .assets import asset_path
 from .canon import H, canon, sha256_bytes
 
 STATES = [
@@ -161,7 +162,7 @@ class Store:
         d = self.tasks_dir / f"{tid}-{slugify(rec.get('title', ''))}"
         t = Task(d, rec)
         t.save()
-        tpl = self.root / "templates"
+        tpl = asset_path("templates")
         for f in DOC_FILES:
             p = d / f
             if not p.exists():

@@ -7,6 +7,7 @@ import re
 import time
 from pathlib import Path
 
+from .assets import asset_path
 from .events import now_iso
 from .run import claude_bin, new_session_id, record_launch, scr_cmd, session_argv, start_claude
 from .store import RepoError, Store
@@ -87,7 +88,7 @@ def start_concierge(root: Path, tid: str, answer: str) -> int | None:
     """Detached headless Concierge run: apply the consequences of an answer (new tasks, edges)."""
     if not claude_bin():
         return None
-    brief = (f"You are the Concierge (read {root / 'agents' / 'concierge.md'} and agents/_common.md and follow them). "
+    brief = (f"You are the Concierge (read {asset_path('agents', 'concierge.md')} and {asset_path('agents', '_common.md')} and follow them). "
              f"Omri answered {tid} with: {answer!r}. The decision brief is tasks/{Store(root).get(tid).dir.name}/spec.md. "
              f"Apply the answer with scr calls (--actor concierge, run `{root / '.venv' / 'Scripts' / 'scr.exe'}` from {root}): unblock or create the tasks "
              f"the answer implies (scr task new ... --origin {tid}), add edges, log a system event 'concierge_applied' with --task {tid}. "

@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .assets import asset_path
 from .events import EventLog
 from .ops import task_worktree, workload, workload_for
 from .review import read_decision
@@ -49,7 +50,7 @@ Do nothing he has not decided. Commands (run from anywhere; `--root` is set):
   chores         {scr} --actor omri chore run <id>
   status         {scr} --actor omri task set <id> <status> --note "<why>"
   new task       {scr} --actor omri task new "<title>" --kind prove|audit|survey|decide|refactor --files <paths...> --decls <names...> [--blocked-by T-...] [--origin T-...|omri] [--may-touch-statements]
-                 then fill tasks/<id>-*/spec.md from templates/spec.md (Goal, Scope, Definition of done with mechanical lines, Context),
+                 then fill tasks/<id>-*/spec.md (task new writes it from the spec template: Goal, Scope, Definition of done with mechanical lines, Context),
                  then {scr} --actor omri task set <id> triaged and ready (or blocked)
   edges          {scr} --actor omri edge add blocks|informs|supersedes <from> <to> --reason "<why>" [--weight w]
   inbox line     {scr} --actor omri inbox "<one line>"      (when a thought is not ready to be a task)
@@ -61,24 +62,24 @@ mission files, notes, tooling or config in this session — you never implement 
 """
 
 ROLES = {
-    "steward": ("Steward", "You are the Steward of the Scriptorium research operation (read {root}/agents/steward.md and "
-                "{root}/agents/_common.md when Omri's request calls for it). You judge submissions and stuck tasks against "
+    "steward": ("Steward", "You are the Steward of the Scriptorium research operation (read {agents}/steward.md and "
+                "{agents}/_common.md when Omri's request calls for it). You judge submissions and stuck tasks against "
                 "their spec and the mechanical checks, and you answer scribers' HELP: questions with precise, honest "
                 "guidance. You are in the task's worktree: read the actual code, run `lake build` or the workload's "
                 "checkers when it helps."),
-    "concierge": ("Concierge", "You are the Concierge of the Scriptorium research operation (read {root}/agents/concierge.md and "
-                  "{root}/agents/_common.md when Omri's request calls for it). Omri's queue holds decisions about research "
+    "concierge": ("Concierge", "You are the Concierge of the Scriptorium research operation (read {agents}/concierge.md and "
+                  "{agents}/_common.md when Omri's request calls for it). Omri's queue holds decisions about research "
                   "direction; you make each one a one-screen choice: the question, the options, what each unlocks, your "
                   "recommendation, and you apply the answer."),
-    "intake": ("Intake + Prioritizer", "You are Intake and the Prioritizer of the Scriptorium research operation (read {root}/agents/intake.md, "
-               "{root}/agents/prioritizer.md and {root}/agents/_common.md when Omri's request calls for it). You turn a "
+    "intake": ("Intake + Prioritizer", "You are Intake and the Prioritizer of the Scriptorium research operation (read {agents}/intake.md, "
+               "{agents}/prioritizer.md and {agents}/_common.md when Omri's request calls for it). You turn a "
                "conversation about what to work on next into well-formed task records with real scope, mechanical "
                "done-conditions and edges, deduplicated against the open graph, and you say what you would dispatch first and why."),
     "toolsmith": ("Toolsmith", "You are the Toolsmith of the Scriptorium research operation: you fix the operation's OWN tooling "
                   "(scr/, ui/, tests/, agents/, templates/, config/) in place, in the live checkout {root}, as a recorded hotfix task. "
                   "You reproduce before you change, you change minimally, you add the test that would have caught it, and you close "
                   "the hotfix yourself with `scr hotfix close`. This is the ONE session kind that edits tooling."),
-    "operator": ("Operator", "You are the operator's assistant for the Scriptorium research operation (read {root}/agents/_common.md "
+    "operator": ("Operator", "You are the operator's assistant for the Scriptorium research operation (read {agents}/_common.md "
                  "when Omri's request calls for it). You know the records, the event log and the chores; you explain and "
                  "you execute exactly what Omri decides."),
 }
@@ -351,8 +352,8 @@ test, and close the hotfix with `scr hotfix close` as the brief says. Ask Omri o
 def _system_prompt(root: Path, s: Session, brief_file: Path) -> str:
     name, text = ROLES[s.role]
     if s.role == "toolsmith":
-        return text.format(root=root) + "\n\n" + TOOLSMITH_FLOW.format(root=root, brief=brief_file)
-    return text.format(root=root) + "\n\n" + FLOW.format(root=root, repo=s.repo or workload(root).repo, brief=brief_file)
+        return text.format(root=root, agents=asset_path("agents")) + "\n\n" + TOOLSMITH_FLOW.format(root=root, brief=brief_file)
+    return text.format(root=root, agents=asset_path("agents")) + "\n\n" + FLOW.format(root=root, repo=s.repo or workload(root).repo, brief=brief_file)
 
 
 def install_agents(root: Path, agents_dir: Path | None = None) -> list[Path]:
@@ -366,7 +367,7 @@ def install_agents(root: Path, agents_dir: Path | None = None) -> list[Path]:
         p = agents_dir / f"{agent_name(role)}.md"
         body = (f"---\nname: {agent_name(role)}\ndescription: Scriptorium {name} — interactive session opened by the Scriptorium UI's Discuss button; "
                 f"waits for Omri, then works from the ticket's brief. Written by scr discuss; do not hand-edit.\n---\n"
-                f"{text.format(root=root)}\n\nScriptorium root: {root}. Workload repo: {repo}. The session's brief and flow rules arrive "
+                f"{text.format(root=root, agents=asset_path('agents'))}\n\nScriptorium root: {root}. Workload repo: {repo}. The session's brief and flow rules arrive "
                 f"in the appended system prompt; follow them. "
                 + ("You DO implement: this is the one session kind that edits the tooling, as a recorded hotfix.\n" if role == "toolsmith" else
                    "You never implement a fix in a Discuss session: your only output is a task list Omri approves, recorded with scr.\n"))
@@ -412,7 +413,7 @@ def discuss(root: Path, item: str, open_terminal: bool = True) -> list[str]:
              "then wait for Omri's instruction.")
     if s.role == "toolsmith":
         first = f"Read {bf} in full now, then begin as it says."
-    add_dirs = [str(root), str(s.repo or workload(root).repo)]
+    add_dirs = [str(root), str(s.repo or workload(root).repo), str(asset_path("agents").parent)]   # agents/*.md ship in the package
     flags_ps = session_flags(root, agent, add_dirs, ps_quote)
     flags_sh = session_flags(root, agent, add_dirs, lambda x: f'"{x}"')
     if os.name == "nt":

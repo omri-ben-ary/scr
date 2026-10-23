@@ -52,7 +52,7 @@ def _out(x, as_json: bool):
 # ---- commands ------------------------------------------------------------------
 def cmd_init(args):
     root = Path(args.root or ".").resolve()
-    for d in ("tasks", "config", "graph", "events", "state", "queues", "agents", "templates", "reports/daily", "reports/weekly"):
+    for d in ("tasks", "config", "graph", "events", "state", "queues", "reports/daily", "reports/weekly"):
         (root / d).mkdir(parents=True, exist_ok=True)
     log = EventLog(root / "events" / "events.jsonl")
     if not log.path.exists() or log.head()[1] == 0:
@@ -398,6 +398,16 @@ def cmd_event(args):
 def cmd_refresh(args):
     root, _, _ = _ctx(args)
     refresh(root, args.quiet, args.note)
+
+
+def cmd_assets(args):
+    """Print where the package's own files are (scr/assets.py): scripts and agents that need a hook or an
+    agents/*.md path ask here instead of assuming a checkout."""
+    from .assets import ASSETS, NAMES, asset_path
+    print(asset_path(args.name) if args.name else ASSETS)
+    if not args.name and not args.quiet:
+        for n in NAMES:
+            print(f"  {n}: {asset_path(n)}")
 
 
 def cmd_verify(args):
@@ -898,6 +908,8 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("refresh", parents=[common], help="regenerate graph.json, queues, STATE.json"); r.add_argument("--note"); r.set_defaults(fn=cmd_refresh)
     sub.add_parser("snapshot", parents=[common], help="alias of refresh").set_defaults(fn=cmd_refresh, note=None)
     sub.add_parser("verify", parents=[common], help="check snapshot, chain, replay, invariants; exit 1 on error").set_defaults(fn=cmd_verify)
+    asp = sub.add_parser("assets", parents=[common], help="print the folder of the package's own files (templates, ui, agents, hooks)")
+    asp.add_argument("name", nargs="?", choices=["templates", "ui", "agents", "hooks"]); asp.set_defaults(fn=cmd_assets)
     rp = sub.add_parser("replay", parents=[common], help="derived state from the event log"); rp.add_argument("--task"); rp.set_defaults(fn=cmd_replay)
     h = sub.add_parser("history", parents=[common], help="snapshot chain across git commits"); h.add_argument("-n", type=int, default=20); h.set_defaults(fn=cmd_history)
     df = sub.add_parser("diff-state", parents=[common], help="compare two snapshots by hash (git refs, or WORKTREE)"); df.add_argument("a"); df.add_argument("b", nargs="?", default="WORKTREE"); df.set_defaults(fn=cmd_diff)

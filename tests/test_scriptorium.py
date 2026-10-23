@@ -30,8 +30,7 @@ def scr(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "s"
     root.mkdir()
-    for d in ("config", "templates", "agents"):
-        shutil.copytree(asset(d), root / d)
+    shutil.copytree(asset("config"), root / "config")
     scr(root, "init", "--quiet")
     return root
 
@@ -136,7 +135,7 @@ def test_verify_warns_on_missing_workload(repo: Path):
     # a merged record is closed: its workload no longer resolves anything, so no warning
     for s in ("dispatched", "in_progress", "submitted"):
         scr(repo, "--quiet", "task", "set", "T-0002", s)
-    review = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    review = (asset("templates") / "review.md").read_text(encoding="utf-8")
     review = review.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted").replace("|---|---|\n", "|---|---|\n| build | ok |\n")
     (Store(repo).get("T-0002").dir / "review.md").write_text(review, encoding="utf-8")
     scr(repo, "--quiet", "task", "set", "T-0002", "accepted")
@@ -152,7 +151,7 @@ def test_merge_cascades_to_ready(repo: Path):
     for s in ("dispatched", "in_progress", "submitted"):
         scr(repo, "--quiet", "task", "set", "T-0002", s)
     # T-0081: submitted -> accepted needs review.md to decide `accepted` with a mechanical row
-    review = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    review = (asset("templates") / "review.md").read_text(encoding="utf-8")
     review = review.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted").replace("|---|---|\n", "|---|---|\n| build | ok |\n")
     (Store(repo).get("T-0002").dir / "review.md").write_text(review, encoding="utf-8")
     scr(repo, "--quiet", "task", "set", "T-0002", "accepted")
@@ -253,8 +252,7 @@ def autocrlf_clone(tmp_path: Path, gitattributes: bytes) -> Path:
     .gitattributes, committed and then cloned with core.autocrlf=true. Returns the clone."""
     src = tmp_path / "src"
     src.mkdir()
-    for d in ("config", "templates", "agents"):
-        shutil.copytree(asset(d), src / d)
+    shutil.copytree(asset("config"), src / "config")
     scr(src, "init", "--quiet")
     scr(src, "--quiet", "task", "new", "A", "--id", "T-0001", "--origin", "omri")
     for p in (p for sub in ("tasks", "config") for p in (src / sub).rglob("*") if p.is_file()):
@@ -386,8 +384,7 @@ def self_world(tmp_path: Path) -> tuple[Path, Path]:
     with a fake .venv to link — the Desktop layout of 2026-09-19."""
     root = tmp_path / "scriptorium"
     root.mkdir()
-    for d in ("config", "templates", "agents"):
-        shutil.copytree(asset(d), root / d)
+    shutil.copytree(asset("config"), root / "config")
     scr(root, "init", "--quiet")
     wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
     wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "venv": "link", "push": True}

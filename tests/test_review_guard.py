@@ -22,9 +22,9 @@ from scr.ops import land, land_all_submitted, spawn
 from scr.review import acceptance_problem, mechanical_rows, review_decision
 from scr.store import RepoError, Store
 from test_journal_ops import REPO, git, scr, world  # noqa: F401  (scriptorium + workload repo + origin)
-from _paths import FIXTURES  # noqa: E402
+from _paths import FIXTURES, asset  # noqa: E402
 
-TEMPLATE = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+TEMPLATE = (asset("templates") / "review.md").read_text(encoding="utf-8")
 PLACEHOLDER = "accepted | returned (feedback below) | escalated (Gate N, reason)"
 ROW = "| `pytest tests -q` | 95 passed |"
 LOG = Path("reports") / "steward_watch.log"

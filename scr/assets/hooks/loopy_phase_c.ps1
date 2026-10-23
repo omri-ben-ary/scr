@@ -14,10 +14,14 @@ param(
   [string]$Target,
   [string]$Worktree,                     # run inside .worktrees/<name> (the task's worktree) instead of the main checkout
   [string]$Workload = 'quantum-insertion',
+  [string]$Root,                         # the scriptorium state root (default: SCRIPTORIUM_ROOT, else the current folder)
   [Parameter(ValueFromRemainingArguments = $true)][string[]]$LoopyArgs
 )
 $ErrorActionPreference = 'Stop'
-$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# The state root: -Root, else SCRIPTORIUM_ROOT, else the current folder (this file ships inside the scr package,
+# so the folder above it is no longer the scriptorium root).
+if (-not $Root) { $Root = if ($env:SCRIPTORIUM_ROOT) { $env:SCRIPTORIUM_ROOT } else { (Get-Location).Path } }
+$Root = (Resolve-Path $Root).Path
 $Actor = "steward:$Task"
 # Prefer the repo's own venv (uv sync creates .venv\Scripts\scr.exe); fall back to `python -m scr`.
 $ScrExe = Join-Path $Root '.venv\Scripts\scr.exe'

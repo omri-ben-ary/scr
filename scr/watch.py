@@ -67,6 +67,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import bgwait, jobs
+from .assets import asset_path
 from .events import EventLog, now_iso
 from .gitops import Git
 from .journal import journal
@@ -524,7 +525,7 @@ class Watcher:
         sf = root / STATE_FILE
         if sf.exists():
             self.flags = {l.strip() for l in sf.read_text(encoding="utf-8").splitlines() if l.strip()}
-        tpl = root / "templates" / "report.md"
+        tpl = asset_path("templates", "report.md")
         self.report_tpl = tpl.read_text(encoding="utf-8").strip() if tpl.exists() else ""
         self.needs: list[str] = []
         self.need_items: list[dict] = []           # the same lines with their stable keys, published each tick (T-0173)
@@ -2079,7 +2080,7 @@ class Watcher:
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): accepted only if the statement diff is EMPTY and every "
                   "mechanical check passes; otherwise returned or escalated. Never merge a branch yourself; never edit Lean."
                   if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")
-        brief = (f"You are the Steward for Scriptorium task {t.id} (see {self.root / 'agents' / 'steward.md'} — follow its \"On submission\" section exactly).\n"
+        brief = (f"You are the Steward for Scriptorium task {t.id} (see {asset_path('agents', 'steward.md')} — follow its \"On submission\" section exactly).\n"
                  f"Record: {t.dir}  (spec.md, report.md, log.md; write review.md there).\n"
                  f"Worktree: {wt}   Workload config: {self.root / 'config' / 'workloads.yaml'} (done_when_checker, statement_diff, allowed_axioms, main_branch).\n"
                  f"Run the mechanical checks from the worktree, run check_done.py and statement_diff.py with --fetch and their default base (the merge-base of "
@@ -2119,7 +2120,7 @@ class Watcher:
                   f"`scr hotfix open`."
                   if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")
         brief = (f"You are the Steward reviewing a TOOLING task of the Scriptorium itself: {t.id} — {t.rec.get('title', '')} "
-                 f"(see {self.root / 'agents' / 'steward.md'}, section \"On submission\", adapted: no Lean, no statement diff).\n"
+                 f"(see {asset_path('agents', 'steward.md')}, section \"On submission\", adapted: no Lean, no statement diff).\n"
                  f"Record: {t.dir}  (spec.md = the symptom; log.md lists the journal commits that make up the fix; report.md = the fixer's summary "
                  f"and test output; write review.md there).\n"
                  f"Checkout: {self.root} (this IS the task's tree; `git log --oneline -20` and `git show <sha>` for the commits named in log.md are read-only and fine).\n"

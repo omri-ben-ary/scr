@@ -28,12 +28,13 @@ from pathlib import Path
 
 import yaml
 
+from .assets import asset_path
 from .events import EventLog
 from .gitops import Git
 from .run import scr_cmd
 from .store import Store
 
-UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+UI_DIR = asset_path("ui")
 
 
 def load(root: Path) -> list[dict]:

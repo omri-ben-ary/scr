@@ -28,6 +28,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import chores as chores_mod
+from .assets import asset_path
 from .events import EventLog, now_iso
 from .graph import Graph
 from .journal import last_failure
@@ -37,7 +38,7 @@ from .run import _env, scr_cmd, scr_exe
 from .state import State
 from .store import Store, find_root
 
-UI_DIR = Path(__file__).resolve().parent.parent / "ui"
+UI_DIR = asset_path("ui")
 CODE_DIR = Path(__file__).resolve().parent
 RELOAD_EXIT = 3
 

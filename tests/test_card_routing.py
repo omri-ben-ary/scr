@@ -6,6 +6,7 @@ from pathlib import Path
 
 from scr.store import Store
 from test_journal_ops import world, scr  # noqa: F401
+from _paths import asset  # noqa: E402
 
 
 def test_parked_task_is_not_readied_by_the_cascade(world):
@@ -79,14 +80,14 @@ def test_additions_only_gate1_is_accepted_by_the_watcher(world):
     for st in ("dispatched", "in_progress", "submitted"):
         scr(root, "--quiet", "--actor", "s", "task", "set", "T-0001", st)
     d = Store(root).get("T-0001").dir
-    rev = (root / "templates" / "review.md").read_text(encoding="utf-8").replace(
+    rev = (asset("templates") / "review.md").read_text(encoding="utf-8").replace(
         "accepted | returned (feedback below) | escalated (Gate N, reason)",
         "escalated (Gate 1, statement_diff non-empty: 12 ADDED / 0 MODIFIED / 0 REMOVED; all mechanical checks pass; recommend force-accept)")
     assert additions_only_gate1(rev)
     (d / "review.md").write_text(rev, encoding="utf-8")
     Watcher(root, quiet=True, auto_decide=True).tick()
     assert Store(root).get("T-0001").status == "accepted"
-    other = (root / "templates" / "review.md").read_text(encoding="utf-8").replace(
+    other = (asset("templates") / "review.md").read_text(encoding="utf-8").replace(
         "accepted | returned (feedback below) | escalated (Gate N, reason)", "escalated (Gate 1, 3 CHANGED statements need approval)")
     assert not additions_only_gate1(other)
 
@@ -94,7 +95,7 @@ def test_additions_only_gate1_is_accepted_by_the_watcher(world):
 def test_additions_only_gate1_rejects_negated_prose():
     """T-0367 review: a Decision line explaining why the diff is NOT additions-only, or that checks do not pass, never qualifies."""
     from scr.review import additions_only_gate1
-    tpl = (Path(__file__).resolve().parent.parent / "templates" / "review.md").read_text(encoding="utf-8")
+    tpl = (asset("templates") / "review.md").read_text(encoding="utf-8")
     mk = lambda line: tpl.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", line)
     assert additions_only_gate1(mk("escalated (Gate 1: 2 ADDED, 0 MODIFIED, 0 REMOVED; mechanical checks pass)"))
     assert additions_only_gate1(mk("escalated (Gate 1: 4 Gate-1-approved decls, PROOF-ONLY vs d256396; recommend --force-accept and land)"))

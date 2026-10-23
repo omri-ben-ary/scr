@@ -1,5 +1,7 @@
 __pycache__/
 *.egg-info/
+build/
+dist/
 .pytest_cache/
 .venv/
 # UI / watcher working files (not part of the hash tree; Observer reports under reports/daily|weekly ARE tracked)

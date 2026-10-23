@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import bgwait
 from .brief import brief_for
+from .assets import asset_path
 from .events import EventLog
 from .ops import spawn, task_worktree, workload_for
 from .run import (claude_bin, new_session_id, permission_mode_for, process_created, record_launch, scr_cmd, session_argv,
@@ -121,7 +122,7 @@ def park_unauthorized(root: Path, t, problem: str) -> list[str]:
     return out
 
 
-INTAKE_BRIEF = """You are Intake. Read {root}/agents/intake.md and {root}/agents/_common.md and follow them exactly.
+INTAKE_BRIEF = """You are Intake. Read {agents}/intake.md and {agents}/_common.md and follow them exactly.
 Scriptorium root: {root} (run scr from there: `{scr} --actor intake ...`; the tree journals itself — never run git here).
 Sources this run: (1) every line under '## Inbox' in queues/omri.md — one task each, then remove the line;
 (2) the unlocks block of every report.md whose task reached merged or rejected since the last intake run
@@ -140,7 +141,7 @@ def intake(root: Path, dry_run: bool = False, timeout: int = 3600) -> list[str]:
     if not argv:
         return ["claude not on PATH — intake skipped"]
     scr = root / ".venv" / "Scripts" / "scr.exe"
-    brief = INTAKE_BRIEF.format(root=root, scr=scr if scr.exists() else "scr", dry="DRY RUN: do not create anything; print what you would create." if dry_run else "")
+    brief = INTAKE_BRIEF.format(root=root, agents=asset_path("agents"), scr=scr if scr.exists() else "scr", dry="DRY RUN: do not create anything; print what you would create." if dry_run else "")
     stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
     out_file = root / "reports" / f"intake-{stamp}.txt"
     out_file.parent.mkdir(parents=True, exist_ok=True)

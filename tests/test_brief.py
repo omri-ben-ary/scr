@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from test_journal_ops import REPO, scr, world  # noqa: F401  (the shared fixture)
+from _paths import asset  # noqa: E402
 
 
 def test_task_brief_carries_the_utf8_script_rule(world):
@@ -15,7 +16,7 @@ def test_task_brief_carries_the_utf8_script_rule(world):
 
 def test_steward_review_brief_and_runbook_carry_the_utf8_check():
     """The review side of the rule: steward.md, the watcher's review brief and the cloud runbook all say it."""
-    steward = (REPO / "agents" / "steward.md").read_text(encoding="utf-8")
+    steward = (asset("agents") / "steward.md").read_text(encoding="utf-8")
     assert "python -I <script>` WITHOUT `-X utf8`" in steward and "UnicodeEncodeError" in steward
     watch = (REPO / "scr" / "watch.py").read_text(encoding="utf-8")
     assert "WITHOUT -X utf8 and with PYTHONUTF8 / PYTHONIOENCODING unset" in watch

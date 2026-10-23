@@ -28,7 +28,7 @@ REPO = Path(__file__).resolve().parents[1]
 def accepted_review(row: str = "| `pytest tests -q` | passed |") -> str:
     """templates/review.md with `## Decision` reading `accepted` and one mechanical row: what T-0081's guard
     needs before a submitted task may become accepted or land."""
-    text = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
+    text = (asset("templates") / "review.md").read_text(encoding="utf-8")
     text = text.replace("accepted | returned (feedback below) | escalated (Gate N, reason)", "accepted")
     return text.replace("|---|---|\n", "|---|---|\n" + row + "\n")
 
@@ -48,8 +48,8 @@ def world(tmp_path: Path, monkeypatch):
     """scriptorium (git) + a workload repo with an origin, like the Desktop layout."""
     monkeypatch.setenv("SCR_NO_JOURNAL", "1")
     root = tmp_path / "scriptorium"; root.mkdir()
-    for d in ("config", "templates", "agents", "ui"):
-        shutil.copytree(asset(d), root / d)
+    shutil.copytree(asset("config"), root / "config")
+    (root / "ui").mkdir()                                              # the live chore list is state
     shutil.copy(FIXTURES / "chores.yaml", root / "ui" / "chores.yaml")   # the live list is state; a fixture stands in
     scr(root, "init", "--quiet", journal_on=False)
     git(root, "init", "-q", "-b", "main"); git(root, "add", "-A"); git(root, "commit", "-q", "-m", "seed")
