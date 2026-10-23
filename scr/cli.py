@@ -629,15 +629,13 @@ def cmd_issue(args):
                         for i in items) or "no open issues")
         return
     if args.op == "close":
-        if not args.id or not args.note:
-            raise RepoError("scr issue close <id> --note <why>")
         try:
             i = issues.close(root, args.id, args.actor, args.note)
         except (KeyError, ValueError) as e:
             raise RepoError(str(e))
         print(f"closed {i['id']}")
         return
-    text = " ".join([args.id or "", *(args.text or [])]).strip()   # `add` has no id: its first word lands in `id`
+    text = " ".join(args.rest).strip()
     if not text.strip():
         raise RepoError('scr issue add "<what is wrong>" [--urgent]')
     task = None
@@ -999,10 +997,12 @@ def build_parser() -> argparse.ArgumentParser:
     upd = sub.add_parser("update", parents=[common], help="apply an update bundle (zip or folder) and migrate"); upd.add_argument("bundle"); upd.set_defaults(fn=cmd_update)
     mg = sub.add_parser("migrate", parents=[common], help="journal-mode setup (idempotent), then the pending state-schema migrations")
     mg.add_argument("--dry-run", action="store_true", help="list the pending schema migrations, change nothing"); mg.set_defaults(fn=cmd_migrate)
-    iss = sub.add_parser("issue", parents=[common], help='known issues: add "<text>" [--urgent] | list [--all] | close <id> --note <why>')
-    iss.add_argument("op", choices=["add", "list", "close"]); iss.add_argument("id", nargs="?", help="close: the issue id")
-    iss.add_argument("text", nargs="*", help=argparse.SUPPRESS); iss.add_argument("--urgent", action="store_true")
-    iss.add_argument("--note"); iss.add_argument("--all", action="store_true"); iss.set_defaults(fn=cmd_issue)
+    iss = sub.add_parser("issue", parents=[common], help='known issues: add "<text>" [--urgent] | list [--all] | close <id> --note <why>').add_subparsers(dest="op", required=True)
+    ia = iss.add_parser("add", parents=[common], help="record a bug for the next release (--urgent: also file a tooling task now)")
+    ia.add_argument("rest", nargs="+", metavar="text"); ia.add_argument("--urgent", action="store_true"); ia.set_defaults(fn=cmd_issue)
+    il = iss.add_parser("list", parents=[common], help="open issues (--all: closed too)"); il.add_argument("--all", action="store_true"); il.set_defaults(fn=cmd_issue)
+    ic = iss.add_parser("close", parents=[common], help="close an issue with the reason"); ic.add_argument("id"); ic.add_argument("--note", required=True)
+    ic.set_defaults(fn=cmd_issue)
     em = sub.add_parser("ensure-main", parents=[common], help="fold a side branch into main (fast-forward, else merge) and, with --push, push main to origin")
     em.add_argument("--main", help="branch name (default: the scriptorium workload's main_branch)"); em.add_argument("--push", action="store_true"); em.set_defaults(fn=cmd_ensure_main)
     upp = sub.add_parser("up", parents=[common], help="start (and register at logon) the UI and the watcher")
