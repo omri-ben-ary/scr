@@ -23,5 +23,10 @@ scr = ["assets/**/*", "defaults/config/*.yaml"]
 [dependency-groups]
 dev = ["pytest>=8"]
 
+[tool.pytest.ini_options]
+markers = [
+    "windows: Windows-specific behaviour (junctions, taskkill, powershell, CRLF, cmd /c); also run by the tests (windows) CI job",
+]
+
 [tool.setuptools_scm]
 fallback_version = "0.1.0"   # a checkout or archive with no tags in reach

@@ -250,9 +250,10 @@ def escalation_episodes(root: Path) -> dict[str, dict]:
         tid = e.get("task")
         if not tid:
             continue
-        ep = out.setdefault(tid, {"since": "", "action": None})
+        ep = out.setdefault(tid, {"since": "", "seq": None, "action": None})
         if e.get("kind") == "state":
             ep["since"] = e.get("ts") or ""
+            ep["seq"] = e.get("seq")
             if e.get("to") in ESCALATED_STATUSES and e.get("from") not in ESCALATED_STATUSES:
                 ep["action"] = None
         elif e.get("kind") == "system" and e.get("name") == "slot_freed" and e.get("note"):
@@ -269,7 +270,8 @@ def escalated_card(t, ep: dict, acked: set[str]) -> list[dict]:
     separate slot_freed alarm card, so an escalated task has exactly one card."""
     rec, d = t.rec, t.dir
     since = ep.get("since") or rec.get("updated") or ""
-    h = f"task:{t.id}:escalated:{since}"
+    # the event's seq too: two status changes in the same second (an ack, then a re-escalation) are two episodes
+    h = f"task:{t.id}:escalated:{since}" + (f"#{ep['seq']}" if ep.get("seq") else "")
     if h in acked:
         return []
     decision = decision_line(d)

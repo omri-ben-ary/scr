@@ -205,6 +205,7 @@ def _write_eol(p: Path, text: str, eol: str) -> None:
     p.write_bytes(text.replace("\n", eol).encode("utf-8"))
 
 
+@pytest.mark.windows
 def test_docs_and_config_hash_ignore_crlf(tmp_path: Path):
     from scr.store import DOC_FILES, Task
     docs = {f: f"# {f}\n\nline one\nline two\n" for f in DOC_FILES}
@@ -230,6 +231,7 @@ def test_docs_and_config_hash_ignore_crlf(tmp_path: Path):
     assert Store(crlf).config_hash() != before_cfg
 
 
+@pytest.mark.windows
 def test_verify_clean_after_crlf_rewrite(repo: Path):
     seed(repo)
     texts = [p for sub in ("tasks", "config") for p in (repo / sub).rglob("*") if p.is_file() and p.suffix in (".md", ".yaml")]
@@ -268,6 +270,7 @@ def autocrlf_clone(tmp_path: Path, gitattributes: bytes) -> Path:
     return clone
 
 
+@pytest.mark.windows
 def test_autocrlf_clone_checks_out_lf_and_verifies(tmp_path: Path):
     """T-0177: the root .gitattributes (`* text=auto eol=lf`, T-0100) keeps a core.autocrlf=true checkout
     of tasks/ and config/ LF, and a read-only verify of that checkout is clean and leaves it clean."""
@@ -403,6 +406,7 @@ def self_world(tmp_path: Path) -> tuple[Path, Path]:
     return root, origin
 
 
+@pytest.mark.windows
 def test_scr_under_test_is_this_checkout():
     """pytest must exercise THIS tree's scr, not the checkout's: a spawned worktree links the checkout's
     .venv (editable install of the checkout), and `python -m pytest` run there still imports the worktree's
@@ -432,6 +436,7 @@ def test_ensure_main_cli_folds_and_pushes(tmp_path: Path):
     assert git(root, "rev-parse", "main") == git(origin, "rev-parse", "main") == git(root, "rev-parse", "worktree-retirement")
 
 
+@pytest.mark.windows
 def test_spawn_self_workload_from_checkout_head_with_linked_venv(tmp_path: Path):
     from scr.ops import spawn
     root, origin = self_world(tmp_path)
