@@ -20,6 +20,7 @@ from scr.gitops import Git, GitError
 from scr.journal import journal
 from scr.ops import checkpoint_commit, land, park, retire, spawn, sweep
 from scr.store import Store
+from _paths import FIXTURES, asset  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -48,7 +49,8 @@ def world(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SCR_NO_JOURNAL", "1")
     root = tmp_path / "scriptorium"; root.mkdir()
     for d in ("config", "templates", "agents", "ui"):
-        shutil.copytree(REPO / d, root / d)
+        shutil.copytree(asset(d), root / d)
+    shutil.copy(FIXTURES / "chores.yaml", root / "ui" / "chores.yaml")   # the live list is state; a fixture stands in
     scr(root, "init", "--quiet", journal_on=False)
     git(root, "init", "-q", "-b", "main"); git(root, "add", "-A"); git(root, "commit", "-q", "-m", "seed")
     # workload repo + bare origin
@@ -772,11 +774,15 @@ def test_hotfix_lifecycle(world, monkeypatch):
     rep = (t.dir / "report.md").read_text()
     assert "was x=1" in rep and "Tests: PASS" in rep and "add a regression test" in rep
     assert "0 errors" in scr(root, "verify").stdout
-    # 4. the watcher lands a tooling task without a worktree: accepted -> merged
+    # 4. the watcher does not land a tooling task into the checkout any more: it stays accepted with one
+    #    NEEDS-YOU line (tooling lands as a PR in the scr repo), and Omri records it merged
     from scr.watch import Watcher
     (t.dir / "review.md").write_text(accepted_review(), encoding="utf-8")        # T-0081: the review is written first
     scr(root, "--actor", "steward:" + tid, "task", "set", tid, "accepted")
-    Watcher(root, quiet=True, auto_land=True).tick()
+    res = Watcher(root, quiet=True, auto_land=True).tick()
+    assert Store(root).get(tid).status == "accepted"
+    assert any(l.startswith(f"{tid} accepted tooling task") and "scr code repo" in l for l in res["needs"]), res["needs"]
+    scr(root, "--actor", "omri", "task", "set", tid, "merged", "--note", "landed as a PR in the scr repo")
     assert Store(root).get(tid).status == "merged"
     # 5. an explicit open from the UI/CLI, then a failing test command escalates instead of submitting
     r = scr(root, "--actor", "hotfix:omri", "hotfix", "open", "Discuss button fails to launch")
@@ -831,9 +837,8 @@ def test_hotfix_run_tests_resolves_relative_command_against_root(world, monkeypa
     """T-0131: `tests: .venv/Scripts/python.exe -m pytest tests -q` is relative to the checkout. Windows'
     CreateProcess does not resolve a relative forward-slash program name even with cwd=root, so run_tests
     hands subprocess an absolute native path; the process cwd is irrelevant. The resolution is
-    scr.run.resolve_test_argv, shared with ops._run_tests (T-0255), so the landing launches the same argv."""
-    from types import SimpleNamespace
-    from scr import hotfix, ops
+    scr.run.resolve_test_argv (T-0255)."""
+    from scr import hotfix
     root, _, _ = world
     (root / "tools").mkdir(); (root / "tools" / "fake-python.exe").write_bytes(b"")
     _set_tests_cmd(root, "tools/fake-python.exe -m pytest tests -q")
@@ -851,11 +856,6 @@ def test_hotfix_run_tests_resolves_relative_command_against_root(world, monkeypa
     assert seen["argv"][1:] == ["-m", "pytest", "tests", "-q"] and Path(seen["cwd"]) == root
     assert seen["env"]["SCR_NO_JOURNAL"] == "1"
     assert not out.startswith("note:")                            # no substitution, no note
-    # the landing's runner resolves the same command against its cwd to the same argv
-    hotfix_argv = seen["argv"]
-    monkeypatch.setattr(ops.subprocess, "run", fake_run)
-    ops._run_tests(SimpleNamespace(cfg={"tests": "tools/fake-python.exe -m pytest tests -q"}), root)
-    assert seen["argv"] == hotfix_argv and Path(seen["cwd"]) == root
     # a bare name is left to the PATH lookup, untouched
     _set_tests_cmd(root, "pytest tests -q")
     hotfix.run_tests(root)
@@ -918,118 +918,6 @@ def test_resolve_test_argv_cases(tmp_path, monkeypatch):
     assert ".venv/Scripts/python.exe" in note and str(tmp_path) in note and sys.executable in note
     argv, note = resolve_test_argv("no-such-runner-t0255 tests -q", tmp_path)
     assert argv == ["no-such-runner-t0255", "tests", "-q"] and note is None
-
-
-def test_ops_run_tests_names_substituted_interpreter(tmp_path, monkeypatch):
-    """T-0255: a `tests:` line naming an interpreter that is not in the worktree still runs (on this python),
-    but the landing log's text now says so on its first line instead of substituting silently."""
-    from types import SimpleNamespace
-    from scr import ops
-    seen: dict = {}
-
-    def fake_run(argv, **kw):
-        seen["argv"] = list(argv)
-        return subprocess.CompletedProcess(argv, 0, "5 passed", "")
-    monkeypatch.setattr(ops.subprocess, "run", fake_run)
-    rc, out = ops._run_tests(SimpleNamespace(cfg={"tests": "tools/python.exe -m pytest tests -q"}), tmp_path)
-    first, _, rest = out.partition("\n")
-    assert rc == 0 and seen["argv"][0] == sys.executable and "5 passed" in rest
-    assert first.startswith("note:") and "tools/python.exe" in first and sys.executable in first and str(tmp_path) in first, out
-
-
-PYTEST_Q_OUT = """\
-..F.....E..F
-=================================== FAILURES ===================================
-____________________________ test_ui_http_and_reload ___________________________
-E   AssertionError: boom
-=========================== short test summary info ============================
-FAILED tests/test_journal_ops.py::test_ui_http_and_reload - AssertionError: boom
-ERROR tests/test_watch.py::test_setup_breaks - OSError: no
-FAILED tests/test_ui.py::test_ui_state_carries_watch_cards_and_nothing_else_changes
-FAILED tests/test_p.py::test_param[a - b] - ValueError: x
-3 failed, 361 passed, 2 skipped, 1 error in 2477.10s (0:41:17)
-"""
-
-
-def test_failing_test_ids_are_parsed_from_pytest_q_output():
-    """T-0382 DoD: the ids come from pytest -q's short summary (FAILED / ERROR lines), in order, without the
-    ` - why` part; the list is complete only when the final `N failed, M error` count matches it."""
-    from scr.ops import failed_test_ids, rerun_argv
-    ids, complete = failed_test_ids(PYTEST_Q_OUT)
-    assert ids == ["tests/test_journal_ops.py::test_ui_http_and_reload", "tests/test_watch.py::test_setup_breaks",
-                   "tests/test_ui.py::test_ui_state_carries_watch_cards_and_nothing_else_changes", "tests/test_p.py::test_param[a - b]"], ids
-    assert complete
-    cut = PYTEST_Q_OUT.replace("FAILED tests/test_ui.py::test_ui_state_carries_watch_cards_and_nothing_else_changes\n", "")
-    assert failed_test_ids(cut) == (["tests/test_journal_ops.py::test_ui_http_and_reload", "tests/test_watch.py::test_setup_breaks",
-                                     "tests/test_p.py::test_param[a - b]"], False)      # a lost line: never complete
-    assert failed_test_ids("tests timed out after 5s") == ([], False)
-    assert rerun_argv(["py", "-m", "pytest", "tests", "-q"], ["tests/a.py::x", "tests/b.py::y"]) == ["py", "-m", "pytest", "-q", "tests/a.py::x", "tests/b.py::y"]
-
-
-def _main_check_run(monkeypatch, branch_out: str, main_out: str | None, rc: int = 1):
-    """ops._main_check with the test runner faked: `main_out` is what the rerun on the trunk prints (None: it
-    must not run). Returns (lines, the ids the rerun was given)."""
-    from types import SimpleNamespace
-    from scr import ops
-    seen: dict = {}
-
-    def fake(wl, cwd, timeout=0, ids=None):
-        assert main_out is not None, "the main rerun ran"
-        seen["ids"], seen["cwd"] = ids, cwd
-        return (1 if "FAILED" in main_out else 0), main_out
-    monkeypatch.setattr(ops, "_run_tests_full", fake)
-    lines = ops._main_check(SimpleNamespace(cfg={}), Path("ROOT"), "task/T-1", "main", rc, branch_out, 3600)
-    return lines, seen
-
-
-def test_main_check_names_only_ids_that_fail_on_the_trunk(monkeypatch):
-    """T-0382: the rerun on the checkout is of just the failing ids; the trunk mark is written only when EVERY id
-    fails there too, and land_test_failures reads the decision back from the lines (a job log's, too)."""
-    from scr.ops import land_test_failures
-    two = "FAILED tests/x.py::a - E\nFAILED tests/x.py::b\n2 failed, 9 passed in 1s\n"
-    lines, seen = _main_check_run(monkeypatch, two, "FAILED tests/x.py::a\nFAILED tests/x.py::b - E\n2 failed in 1s\n")
-    assert seen == {"ids": ["tests/x.py::a", "tests/x.py::b"], "cwd": Path("ROOT")}
-    assert land_test_failures(lines + ["  FAILED (tests): ..."]) == (["tests/x.py::a", "tests/x.py::b"], True), lines
-    # b passes on the trunk: it is the branch's failure
-    lines, _ = _main_check_run(monkeypatch, two, "FAILED tests/x.py::a\n1 failed, 1 passed in 1s\n")
-    assert land_test_failures(lines) == (["tests/x.py::a", "tests/x.py::b"], False) and "tests/x.py::b" in lines[-1], lines
-    # an id the trunk does not have (pytest rc 4/5, nothing failed) is new
-    lines, _ = _main_check_run(monkeypatch, two, "ERROR: not found: tests/x.py::b\nno tests ran in 0.1s\n")
-    assert land_test_failures(lines)[1] is False
-    # an incomplete list, a non-1 rc, or too many failures: no rerun at all
-    for out, rc in (("FAILED tests/x.py::a\n2 failed in 1s\n", 1), (two, 2),
-                    ("".join(f"FAILED tests/x.py::t{i}\n" for i in range(11)) + "11 failed in 1s\n", 1)):
-        lines, _ = _main_check_run(monkeypatch, out, None, rc)
-        assert land_test_failures(lines)[1] is False and "main check skipped" in lines[-1], lines
-
-
-def test_land_skip_main_failing_lands_when_every_failure_is_the_trunks(tmp_path: Path, monkeypatch):
-    """T-0404 DoD 3: `scr land <id> --merge --skip-main-failing` on a landing whose only failures (A, B) carry the
-    MAIN_FAILING_MARK verdict merges, and the landed event names the skipped ids. Without the flag it fails; a
-    Steward actor may not use it."""
-    from test_watch import MAIN_A, MAIN_B, _events, _main_failing_world, sgit, sscr
-    root, _ = _main_failing_world(tmp_path, monkeypatch, "ok\n")
-    plain = sscr(root, "--actor", "omri", "land", "T-0007", "--merge", check=False)
-    assert plain.returncode == 1 and "FAILED (tests)" in plain.stdout and Store(root).get("T-0007").status == "accepted", plain.stdout
-    st = sscr(root, "--actor", "steward:T-0007", "land", "T-0007", "--merge", "--skip-main-failing", check=False)
-    assert st.returncode != 0 and "Omri's alone" in st.stdout + st.stderr, (st.stdout, st.stderr)
-    r = sscr(root, "--actor", "omri", "land", "T-0007", "--merge", "--skip-main-failing", check=False)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert Store(root).get("T-0007").status == "merged"
-    assert sgit(root, "merge-base", "--is-ancestor", "task/T-0007", "main") == ""
-    ev = _events(root, "landed", "T-0007")
-    assert len(ev) == 1 and MAIN_A in ev[0]["note"] and MAIN_B in ev[0]["note"] and "--skip-main-failing" in ev[0]["note"], ev
-
-
-def test_land_skip_main_failing_refuses_a_branch_new_failure(tmp_path: Path, monkeypatch):
-    """T-0404 DoD 3: the branch also fails C, which passes on the trunk: --skip-main-failing refuses, nothing lands."""
-    from test_watch import NEW_C, _events, _main_failing_world, sgit, sscr
-    root, _ = _main_failing_world(tmp_path, monkeypatch, f"{NEW_C}\n")
-    main_before = sgit(root, "rev-parse", "main")
-    r = sscr(root, "--actor", "omri", "land", "T-0007", "--merge", "--skip-main-failing", check=False)
-    assert r.returncode == 1 and "--skip-main-failing refused" in r.stdout and "FAILED (tests)" in r.stdout, r.stdout
-    assert Store(root).get("T-0007").status == "accepted" and sgit(root, "rev-parse", "main") == main_before
-    assert not _events(root, "landed", "T-0007")
 
 
 def test_discuss_hotfix_is_toolsmith_in_root(world):

@@ -60,7 +60,6 @@ Never deletes anything; never edits Lean; never answers a HELP: line itself.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
@@ -72,7 +71,7 @@ from .events import EventLog, now_iso
 from .gitops import Git
 from .journal import journal
 from .lifecycle import requeue
-from .ops import (FINISHED_STATUSES, LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_record_path, is_scriptorium_task, land, land_any, land_scriptorium, retire,
+from .ops import (FINISHED_STATUSES, LOG_PATHS, HYGIENE_KINDS, checkpoint, hygiene_digest, is_scriptorium_task, retire, TOOLING_LANDS_AS_PR,
                   scope_drift, self_workload, sweep, task_frozen, task_worktree, workload, workload_for)
 from .run import kill, new_session_id, pid_alive, process_created, record_launch, scr_cmd, scr_exe, session_argv, start_claude
 from .state import State
@@ -80,7 +79,6 @@ from .store import Store
 
 STATE_FILE = ".scr/watch.state.txt"
 LOG_FILE = "reports/steward_watch.log"
-LAND_RETRY = "landretry:"                  # landretry:<id>:<trunk sha>: the trunk head a held landing was last tried on (T-0404)
 NEEDS_FILE = ".scr/watch.needs.json"      # the tick's NEEDS-YOU list, read by scr/ui.py needs_cards (T-0173)
 # claude -p writes this to stderr when it kills the session at its background-task ceiling (T-0067 owns the ceiling)
 DEAD_LINE = "Background tasks still running after"
@@ -1653,68 +1651,38 @@ class Watcher:
 
     def land_via_job(self, t) -> str | None:
         """The landing of an accepted task as a detached job: `scr --actor steward:<id> land <id> --merge` (ops.land_any:
-        the scriptorium landing with its test run, or the QI push/PR/merge), submitted once per attempt and applied when
-        it ends (apply_land_job). Returns "merged" when a finished job landed the task this tick, "submitted" when a job
-        was started, "failed" when a finished job was applied as a failure, None otherwise (job still running, nothing
-        to do, or the task is held back by a known-failed tip)."""
+        push, PR, merge), submitted once per attempt and applied when it ends (apply_land_job). An accepted tooling
+        task (workload repo = this checkout) is not landed here: one NEEDS-YOU line says it lands as a PR in the scr
+        repo. Returns "merged" when a finished job landed the task this tick, "submitted" when a job was started,
+        "failed" when a finished job was applied as a failure, None otherwise."""
         if any(j["status"] in jobs.ACTIVE for j in self.land_jobs(t.id)):
             return None                                 # its landing is running; the tick applies it when it ends
-        scriptorium = is_scriptorium_task(self.root, self.store, t)
+        if is_scriptorium_task(self.root, self.store, t):
+            # since the code/state split, tooling lands as a PR in the scr repo; nothing merges into this checkout
+            self.need(f"land_tooling:{t.id}", f"{t.id} accepted tooling task — " + TOOLING_LANDS_AS_PR.format(tid=t.id), t.id)
+            return None
         wl = workload_for(self.root, self.store, t)
         wt = task_worktree(wl, t)
-        tip, scope_sig, failed = None, "", set()
-        if scriptorium:
-            if not wt.exists():                 # no worktree: ops.land_any decides in-process, no tests (T-0158)
-                return "merged" if self.land_scriptorium_task(t) else None
-            sc = t.rec.get("scope") or {}
-            scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
-            failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
-            g, mg = Git(wt), Git(self.root)
-            tip = g.head() if not g.dirty() else None
-            if tip and f"land_failed:{t.id}:{tip}+{scope_sig}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
-                if f"landhold:{t.id}" not in self.flags and not [k for k in self.flags if k.startswith(f"autofix:{t.id}:land:")]:
-                    if self.autofix(t, "land", f"landing of task/{t.id} failed at {tip[:8]} (see the land_failed event); merge the trunk in, make the tests pass, commit, resubmit"):
-                        for k in failed:
-                            self.unflag(k)
-                        self.unflag(f"land:{t.id}")
-                        return "failed"
-                held = next((k.split(":", 2)[2] for k in self.flags if k.startswith(f"landmain:{t.id}:")), None)   # T-0382
-                if held and self.land_retry_due(t, mg, wl.main):   # T-0404: the trunk's code moved since the hold
-                    self.unflag(f"land_failed:{t.id}:{tip}+{scope_sig}")
-                    self.log(f"{t.id} held landing retried: {wl.main} moved since the hold on {held}")
-                else:
-                    if not any(n["key"] == f"land_failed:{t.id}" for n in self.need_items):   # raised by land_failed this tick
-                        self.need(f"land_failed:{t.id}", self.land_main_need(t, held.split(", ")) if held else
-                                  f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
-                    self.unflag(f"land:{t.id}")
-                    return None
-        elif not wt.exists():
+        if not wt.exists():
             self.need(f"auto_land_failed:{t.id}", f"{t.id} accepted but its worktree {wt} is missing — nothing to land", t.id)
             return None
         if not self.flag(f"land:{t.id}"):
             return None
-        from .ops import land_test_timeout
-        minutes = (land_test_timeout(self.store) + 900) // 60 if scriptorium else 90
+        minutes = 90
         cmd = scr_exe(self.root) + ["--root", str(self.root), "--actor", f"steward:{t.id}", "land", t.id, "--merge"]
-        trunk = self.trunk_head(wl.main) if scriptorium else None    # the trunk a main-only hold is keyed on (T-0404)
         try:
             job = jobs.submit(self.root, cmd, task=t.id, name=f"{jobs.LAND_PREFIX}{t.id}", timeout=f"{minutes}m", actor="steward-watch")
         except Exception as e:  # noqa: BLE001
             self.log(f"{t.id} landing job not submitted: {e}")
             self.unflag(f"land:{t.id}")
             return None
-        job["land_tip"], job["land_scope_sig"], job["land_scriptorium"] = tip, scope_sig, scriptorium
-        if trunk:
-            job["land_trunk"] = trunk
-        jobs.save(self.root, job)
-        self.log(f"{t.id} landing submitted as job {job['id']} ({'scriptorium: commit, merge trunk, tests, merge' if scriptorium else 'push, PR, merge'}; {minutes} min)")
+        self.log(f"{t.id} landing submitted as job {job['id']} (push, PR, merge; {minutes} min)")
         return "submitted"
 
     def apply_land_job(self, t, job: dict) -> str:
         """A finished landing job: on rc 0 `scr land` already recorded the merge (status merged, events, cascade) and
         the worktree is retired (deleted, T-0321) here; otherwise the job log's FAILED / REFUSED / merge-failed line is the reason and
-        the failure takes the same route as before (land_failed for the scriptorium, the QI conflict / scope / push
-        branches), i.e. auto-fix first, Omri third."""
+        the failure takes the conflict / scope / push branches, i.e. auto-fix first, Omri third."""
         job["applied"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         jobs.save(self.root, job)
         try:
@@ -1724,9 +1692,6 @@ class Watcher:
         out = [l.rstrip() for l in text.splitlines() if l.strip()][-40:]
         for line in out[-12:]:
             self.log(f"  land[{job['id']}]: {line[:200]}")
-        scriptorium = bool(job.get("land_scriptorium"))
-        scope_sig = job.get("land_scope_sig") or ""
-        failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
         if job["status"] == "done" and job.get("rc") == 0:
             try:
                 st = self.store.get(t.id).status
@@ -1735,9 +1700,6 @@ class Watcher:
             if st != "merged":
                 self.log(f"{t.id} landing job {job['id']} exited 0 but the task is {st}; treated as a failure")
             else:
-                for k in failed:
-                    self.unflag(k)
-                self.clear_land_hold(t.id)
                 try:
                     r = retire(self.root, t.id, execute=True)
                 except Exception as e:  # noqa: BLE001
@@ -1757,10 +1719,8 @@ class Watcher:
         else:
             m = re.search(r"FAILED \((\w+)\)", why)
             reason = m.group(1) if m else ("conflict" if "merge failed" in why or "conflict" in why.lower() else "scope" if "REFUSED" in why else "tests")
-        timed_out = reason == "timeout" or ("exited 124" in why and "timed out after" in why)
-        if timed_out:
-            # 2026-10-22 hotfix (T-0579): a landing whose job deadline or test-run cap ran out is a capacity problem
-            # (concurrent suites on the 16 GB box), not a branch failure: same route as a kill, logged as such.
+        if reason == "timeout":
+            # a landing whose job deadline ran out is a capacity problem, not a branch failure: same route as a kill
             self.log(f"{t.id} landing job {job['id']} timed out ({why[:120]}); task stays accepted, landing resubmitted on a later tick")
             self.unflag(f"land:{t.id}")
             return "failed"
@@ -1771,20 +1731,6 @@ class Watcher:
             # landed by hand meanwhile, which makes it merged and ends this), no auto-fix, no card.
             self.unflag(f"land:{t.id}")
             self.log(f"{t.id} landing job {job['id']} was killed ({why[:120]}); task stays accepted, landing resubmitted on a later tick")
-            return "failed"
-        tip = job.get("land_tip")
-        if scriptorium:
-            try:                                    # the landing commits the dirty tree first: the tip that failed is the one after it
-                wt = task_worktree(workload_for(self.root, self.store, t), t)
-                if wt.exists():
-                    g = Git(wt)
-                    tip = g.head() if not g.dirty() else tip
-            except Exception:  # noqa: BLE001
-                pass
-        res = {"ok": False, "reason": reason, "out": out or [why or f"landing job {job['id']} {job['status']}"], "tip": tip, "sha": None,
-               "trunk": job.get("land_trunk")}
-        if scriptorium:
-            self.land_failed(t, res, failed, scope_sig)
             return "failed"
         wl = workload_for(self.root, self.store, t)
         self.unflag(f"land:{t.id}")
@@ -1813,73 +1759,6 @@ class Watcher:
         if not self.autofix(t, "land", fix):
             self.need(f"auto_land_failed:{t.id}", f"{t.id} auto-land failed twice ({(why or reason)[:160]}) — see reports/steward_watch.log", t.id)
         return "failed"
-
-    def land_scriptorium_task(self, t) -> bool:
-        """accepted scriptorium task -> merged (T-0078). No worktree: ops.land_any decides, as for `scr land`
-        (T-0158) — a hotfix made in the checkout, whose commits the journal already put on the trunk, is merged
-        without a merge; a task/<id> with commits not on the trunk is a lost worktree, a landing failure. A spawned
-        worktree: ops.land_scriptorium (commit, merge the trunk in, tests, merge into the trunk), then
-        retire, like any other workload. A failure (conflict, failing tests, checkout off the trunk) leaves
-        the task accepted, logs the reason, raises ONE land_failed event per task-branch tip and a NEEDS-YOU
-        line every tick; the attempt is repeated only when task/<id> changes (a fix commit), since the same
-        tip would fail the same way — or when the branch reached the trunk by hand, which is then recorded."""
-        wl = workload_for(self.root, self.store, t)
-        wt = task_worktree(wl, t)
-        # The retry key is the branch tip PLUS the record's scope (T-0079): a landing refused for out-of-scope
-        # paths is retried when the Steward widens scope.files / scope.mission, not only on a new commit.
-        sc = t.rec.get("scope") or {}
-        scope_sig = hashlib.sha1(json.dumps([sc.get("files") or [], sc.get("mission") or ""], sort_keys=True).encode("utf-8")).hexdigest()[:8]
-        failed = {k for k in self.flags if k.startswith(f"land_failed:{t.id}:")}
-        if not wt.exists():
-            # T-0158: ops.land_any owns the no-worktree landing (note, actor, cascade, events): a checkout hotfix
-            # is recorded merged, a task/<id> with commits not on the trunk is refused (lost_worktree).
-            try:
-                res = land_any(self.root, t.id)
-            except Exception as e:  # noqa: BLE001
-                res = {"ok": False, "reason": "error", "out": [f"FAILED (error): {e}"], "sha": None, "tip": None}
-            for line in res["out"]:
-                self.log(f"  land: {line}")
-            if not res["ok"]:
-                return self.land_failed(t, res, failed, scope_sig)
-            for k in failed:
-                self.unflag(k)
-            from .cli import refresh            # local import: cli imports this module
-            refresh(self.root, quiet=True)      # the queues/STATE.json refresh the old `scr task set` subprocess did
-            self.log(f"{t.id} tooling task (no worktree) -> merged")
-            return True
-        g, mg = Git(wt), Git(self.root)
-        tip = f"{g.head()}+{scope_sig}" if not g.dirty() else None
-        if tip and f"land_failed:{t.id}:{tip}" in failed and not mg.is_ancestor(f"task/{t.id}", wl.main):
-            if not [k for k in self.flags if k.startswith(f"autofix:{t.id}:land:")]:
-                # 2026-10-14: a landing that failed before auto-fix existed gets its send-back now
-                if self.autofix(t, "land", f"landing of task/{t.id} failed at {tip[:8]} (see the land_failed event); merge the trunk in, make the tests pass, commit, resubmit"):
-                    for k in failed:
-                        self.unflag(k)
-                    self.unflag(f"land:{t.id}")
-                    return False
-            self.need(f"land_failed:{t.id}", f"{t.id} accepted but its landing failed at {tip[:8]} (event land_failed) — fix task/{t.id} (a new commit or a wider scope retries) or merge it into {wl.main} by hand", t.id)
-            self.unflag(f"land:{t.id}")
-            return False
-        self.log(f"{t.id} auto-land (scriptorium worktree): commit, merge {wl.main} in, tests, merge into {wl.main}")
-        try:
-            res = land_scriptorium(self.root, t.id)
-        except Exception as e:  # noqa: BLE001
-            res = {"ok": False, "reason": "error", "out": [f"FAILED (error): {e}"], "sha": None, "tip": g.head()}
-        for line in res["out"]:
-            self.log(f"  land: {line}")
-        if not res["ok"]:
-            return self.land_failed(t, res, failed, scope_sig)
-        for k in failed:
-            self.unflag(k)
-        try:
-            r = retire(self.root, t.id, execute=True)
-        except Exception as e:  # noqa: BLE001
-            r = {"ok": False, "code": "error", "out": [str(e)]}
-        for line in r["out"]:
-            self.log(f"  retire: {line}")
-        if not r["ok"]:
-            self.retire_refused(t.id, r["code"])
-        return True
 
     def retire_refused(self, tid: str, code: str) -> None:
         """A merged task whose worktree retire was refused: its landing never runs again, so the line would stand for
@@ -1987,93 +1866,6 @@ class Watcher:
             return None
         self.retire_refused(tid, new)
         return new
-
-    def land_failed(self, t, res: dict, failed: set, scope_sig: str) -> bool:
-        """A refused landing (land_scriptorium or the no-worktree land_any): ONE land_failed event per branch tip
-        (+ scope), then — 2026-10-14 — the task goes back to its scriber with the failure (autofix, at most
-        AUTOFIX_MAX times); only after that does the task stay accepted with a NEEDS-YOU line every tick. A lost
-        worktree or an internal error is Omri's at once. T-0382: a `tests` failure whose every failing id also failed
-        when rerun on the trunk (ops.land_test_failures) is held instead — no autofix, one NEEDS-YOU line naming the
-        tests (flags landhold + `landmain:<id>:<ids>`) — and its land_failed event lists the ids. Returns False."""
-        from .ops import land_test_failures
-        why = next((l for l in res["out"] if "FAILED" in l), res["reason"]).strip()
-        nxt = next((l.split("— next: ", 1)[1] for l in res["out"] if "— next: " in l), None)   # land_any's closing line
-        key = f"land_failed:{t.id}:{res.get('tip') or 'unknown'}+{scope_sig}"
-        for k in failed - {key}:                                        # only the current tip (+ scope) is remembered
-            self.unflag(k)
-        if failed - {key}:
-            self.clear_land_hold(t.id)                                  # a new tip: the hold belonged to the old one
-        # T-0382: the failing test ids (ops.land_test_failures reads them from the landing's lines) go into the event;
-        # when every one of them also failed when rerun on the trunk, the branch is not at fault: hold, no autofix
-        ids, on_main = land_test_failures(res["out"]) if res.get("reason") == "tests" else ([], False)
-        note = why[:900] if not ids else (f"{why[:500]} || " + ("all also fail on the trunk; " if on_main else "")
-                                          + f"failing tests ({len(ids)}): {', '.join(ids)}")[:900]
-        if self.flag(key):
-            self.scr(f"steward:{t.id}", "event", "system", "--name", "land_failed", "--task", t.id, "--note", note, "--quiet")
-        self.unflag(f"land:{t.id}")
-        if on_main:
-            self.clear_land_hold(t.id)
-            self.flags.add(f"landhold:{t.id}")
-            self.flags.add(f"landmain:{t.id}:{', '.join(ids)}")
-            trunk = res.get("trunk") or self.trunk_head(workload_for(self.root, self.store, t).main)
-            if trunk:                                                   # T-0404: retried once the trunk's code moves past it
-                self.flags.add(f"{LAND_RETRY}{t.id}:{trunk}")
-            self.need(f"land_failed:{t.id}", self.land_main_need(t, ids), t.id)
-            return False
-        self.clear_land_hold(t.id)                                      # a retried hold that failed on a branch-new test
-        if res.get("reason") in self.OMRI_LAND_REASONS:          # the checkout's problem, not the branch's: never sent to a scriber
-            self.flags.add(f"landhold:{t.id}")
-        else:
-            tail = "\n".join(res["out"][-12:])[-1500:]
-            fix = (f"landing failed ({res.get('reason')}): {why[:300]}. Merge the trunk into the branch, make the full test suite pass "
-                   f"(`.venv\\Scripts\\python.exe -m pytest tests -q`, as a scr job if long), fix only what the failure names, commit, "
-                   f"then resubmit with report.md stating the test result.\nLanding output tail:\n{tail}")
-            if self.autofix(t, "land", fix):
-                self.unflag(key)
-                return False
-        self.need(f"land_failed:{t.id}", f"{t.id} landing failed ({res['reason']}) — {why[:200]}" + (f"; next: {nxt}" if nxt else "") + "; see reports/steward_watch.log", t.id)
-        return False
-
-    def land_main_need(self, t, ids: list[str]) -> str:
-        """The NEEDS-YOU line of a landing held because every failing test also fails on the trunk (T-0382)."""
-        trunk = workload_for(self.root, self.store, t).main
-        return (f"{t.id} accepted; its landing failed only on test(s) that also fail on {trunk}: {', '.join(ids)} — "
-                f"`scr land {t.id} --merge --skip-main-failing` lands it anyway, or wait: a code commit on {trunk} (the fix of "
-                f"those tests) or a new commit on task/{t.id} retries")
-
-    def trunk_head(self, trunk: str) -> str | None:
-        r = Git(self.root).run("rev-parse", trunk)
-        return r.out.strip() if r.ok and r.out.strip() else None
-
-    def clear_land_hold(self, tid: str) -> None:
-        """Drop a landing hold: landhold, the T-0382 `landmain:<id>:<ids>` and the T-0404 retry mark."""
-        self.unflag(f"landhold:{tid}")
-        for k in [k for k in self.flags if k.startswith((f"landmain:{tid}:", f"{LAND_RETRY}{tid}:"))]:
-            self.unflag(k)
-
-    def land_retry_due(self, t, mg: Git, trunk: str) -> bool:
-        """T-0404: a landing held on main-only failures is retried once the trunk has moved past the commit it was
-        held on — by a commit outside the record paths and reports/ (the journal moves the trunk every tick; only
-        code can fix a test) — at most once per trunk commit: the mark `landretry:<id>:<sha>` moves to the head being tried.
-        A hold from before T-0404 (no mark) starts its clock at the current head and keeps holding."""
-        head = self.trunk_head(trunk)
-        if not head:
-            return False
-        marks = [k for k in self.flags if k.startswith(f"{LAND_RETRY}{t.id}:")]
-        since = marks[0].split(":", 2)[2] if marks else None
-        if since == head:
-            return False
-        for k in marks:
-            self.unflag(k)
-        self.flags.add(f"{LAND_RETRY}{t.id}:{head}")
-        if not since:
-            return False
-        d = mg.run("diff", "--name-only", since, head)
-        if not d.ok:                                    # an unknown hold commit (rewritten history): retry once
-            return True
-        return any(p.strip() and not is_record_path(p.strip()) and not p.strip().startswith("reports/") for p in d.out.splitlines())
-
-    OMRI_LAND_REASONS = {"lost_worktree", "error", "trunk", "busy"}
 
     AUTOFIX_MAX = 2
 
@@ -2319,8 +2111,8 @@ class Watcher:
         """A hotfix / tooling task: the 'worktree' is the checkout itself; the review reads the commits the
         record's log.md names, runs the tests, judges the fix, and proposes follow-ups in review.md."""
         decide = (f"Then apply the decision with scr (--actor steward:{t.id}): `task set {t.id} accepted` if the tests pass and the fix "
-                  f"addresses the symptom (the watcher then lands it: a hotfix made in the checkout is already on main; a task spawned into "
-                  f"a worktree is committed, merged into main and tested first — T-0078); otherwise `returned` with feedback "
+                  f"addresses the symptom (tooling no longer lands into this checkout: it lands as a PR in the scr code "
+                  f"repo, and the record is set merged once that PR is merged); otherwise `returned` with feedback "
                   f"or `escalated` then `omri_queue`. Never run git here; never edit the tooling in this session — a further fix is a new "
                   f"`scr hotfix open`."
                   if self.auto_decide else "Do NOT change the task status — Omri applies the decision.")

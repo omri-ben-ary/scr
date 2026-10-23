@@ -1,0 +1,6 @@
+# One-off chores that show up in the UI under "Needs you" until their OUTCOME check passes.
+# Each chore: id, title, why, and either `steps` (scr commands run in order by `scr chore run <id>`,
+# each journaled) or `manual: true` (you do it, then press "Mark done"). `done` is a declarative
+# outcome check (kinds listed in scr/chores.py) — never "is git clean". Agents may append chores here.
+# The live list is <state root>/ui/chores.yaml; this shipped copy is the empty fallback (scr/chores.py load).
+[]

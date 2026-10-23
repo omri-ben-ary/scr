@@ -38,7 +38,7 @@ def service_argv(root: Path) -> list[str]:
 def resolve_test_argv(cmd: str, cwd: Path) -> tuple[list[str], str | None]:
     """A workload `tests:` command as the argv to launch IN `cwd`, plus a one-line note when a missing
     `python*` interpreter was replaced by sys.executable (None otherwise). The one resolver behind
-    scr.hotfix.run_tests (cwd = the checkout) and scr.ops._run_tests (cwd = the worktree) (T-0255)."""
+    scr.hotfix.run_tests (cwd = the checkout) (T-0255)."""
     cwd = Path(cwd)
     argv = shlex.split(cmd, posix=(os.name != "nt"))
     if os.name == "nt":

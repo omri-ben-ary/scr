@@ -1,0 +1,29 @@
+quantum-insertion:
+  repo: ../quantum-insertion              # sibling of this repo on the Desktop; Lean 4 v4.28.0 + Mathlib + QuantumOptimization
+  main_branch: master                     # the AGENTS' branch: auto-merged task PRs land here; it is the full history log
+  trusted_branch: trusted                 # Omri's protected branch of sources of truth; agents never push, merge or branch from it
+  worktrees: ../quantum-insertion/.worktrees   # repo convention: .worktrees/<name>, branch per mission (e.g. qi10)
+  done_when_checker: missions/SCRIPTORIUM/scripts/check_done.py     # --decls <names> [--files <scope>] [--fetch] (default base: merge-base of origin/<main_branch> and HEAD; never --base <main_branch>) [--json out]
+  statement_diff: missions/SCRIPTORIUM/scripts/statement_diff.py    # exit 0 = proof-only (auto-merge eligible); exit 1 = Gate 1 (default base: merge-base of origin/<main_branch> and HEAD; never --base <main_branch>)
+  # ci_gates (missions/AUDIT/scripts/check_gates.py: --placeholders --coverage --axioms) deleted 2026-09-23 by T-0133: no scr/ or agents/ reader; the workload's own CI runs it
+  loopy: missions/LOOPY/scripts/run_loopy.ps1                        # optional Phase C engine; Steward runs it via hooks/loopy_phase_c.ps1 (see agents/steward.md)
+  allowed_axioms: [propext, Classical.choice, Quot.sound]
+  roadmap: docs/ROADMAP.md                # the phase/task ledger Intake scans for open items (- [ ])
+  # audit_surface (missions/AUDIT/AUDIT.md, changes always Gate 1) deleted 2026-09-23 by T-0133: no reader; a scope rule for T-0082's scr/scope.py, re-add with a reader then
+  notes:
+    - "Every mission has its own folder missions/QI*/ with PROMPT.md, TARGETS.md (FROZEN statements), plan docs, prover_log.md"
+    - "Never commit work in progress; a stage ships only when closed (review 0 CRITICAL, build green, axiom-clean, zero sorry)"
+    - "Probe scripts live under a mission folder, never repo-root scripts/"
+scriptorium:
+  repo: .                                  # the operation's own tooling (scr/, ui/, tests/, agents/, config/)
+  main_branch: main                        # canonical; the checkout sat on worktree-retirement until 2026-09-19, when T-0061 folded it back (admin.ensure_main) and pushed
+  worktrees: ../scriptorium-worktrees      # OUTSIDE the tree: the tree journals itself with every scr call. Spawned from the checkout's HEAD, never origin/main (T-0061)
+  venv: link                               # spawn links <worktree>/.venv -> ./.venv (junction on Windows, symlink elsewhere): same interpreter, same pytest/PyYAML, no install (T-0061)
+  push: true                               # the watcher pushes every journal commit of the checkout to origin (T-0061); --push on `scr watch` also works
+  frozen: false                           # shipped default unfrozen; T-0272 freeze switch (absent = false). true: the watcher does not auto-dispatch, auto-review or auto-land this workload's tasks, Intake parks its proposals at triaged ("frozen workload: parked for the thaw"), `scr dispatch` refuses them unless `--actor omri` (the freeze-hotfix exception path); `scr verify` prints an info line and the UI header says "<workload> frozen". Thaw: set false (or delete the key). T-0276 sets it for v1.0
+  tests: .venv/Scripts/python.exe -m pytest tests -q   # the mechanical gate for tooling tasks, run IN the worktree; keep `python -m` — a bare pytest.exe would import the checkout's scr through the linked venv. The relative path is resolved against the root it runs in (the checkout for `scr hotfix test`/`close`, the worktree for the watcher's landing) before launch: forward slashes and a foreign cwd are fine (T-0131)
+  notes:
+    - "Registered by T-0043 (Omri's decision, planning session 2026-09-16): tooling changes are tasks, never edits made inside a Discuss session"
+    - "Services resolve a task's own workload (T-0036); a task record naming an unregistered workload falls back to the first entry"
+    - "No Lean, no axioms; done_when is pytest plus the task's own grep/behaviour lines"
+    - "T-0061: `scr ensure-main --push` folds a side branch into main and pushes; spawn bases task branches on the checkout's HEAD so a scriber sees every record and the current code"

@@ -16,6 +16,7 @@ from scr.events import EventLog, event_hash
 from scr.graph import Graph
 from scr.state import State
 from scr.store import Store
+from _paths import asset  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -30,7 +31,7 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "s"
     root.mkdir()
     for d in ("config", "templates", "agents"):
-        shutil.copytree(REPO / d, root / d)
+        shutil.copytree(asset(d), root / d)
     scr(root, "init", "--quiet")
     return root
 
@@ -253,7 +254,7 @@ def autocrlf_clone(tmp_path: Path, gitattributes: bytes) -> Path:
     src = tmp_path / "src"
     src.mkdir()
     for d in ("config", "templates", "agents"):
-        shutil.copytree(REPO / d, src / d)
+        shutil.copytree(asset(d), src / d)
     scr(src, "init", "--quiet")
     scr(src, "--quiet", "task", "new", "A", "--id", "T-0001", "--origin", "omri")
     for p in (p for sub in ("tasks", "config") for p in (src / sub).rglob("*") if p.is_file()):
@@ -386,7 +387,7 @@ def self_world(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "scriptorium"
     root.mkdir()
     for d in ("config", "templates", "agents"):
-        shutil.copytree(REPO / d, root / d)
+        shutil.copytree(asset(d), root / d)
     scr(root, "init", "--quiet")
     wl = yaml.safe_load((root / "config" / "workloads.yaml").read_text(encoding="utf-8"))
     wl["scriptorium"] = {"repo": ".", "main_branch": "main", "worktrees": "../scriptorium-worktrees", "venv": "link", "push": True}

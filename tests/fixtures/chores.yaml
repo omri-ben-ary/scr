@@ -1,0 +1,7 @@
+# The chore list the test worlds start with (tests/test_journal_ops.py world): the live list is state,
+# so the code repo ships an empty one. One manual chore that is never done, so the UI raises a chore card.
+- id: example-manual
+  title: Example manual chore (test fixture)
+  why: The UI shows a chore card until its outcome check passes.
+  manual: true
+  done: {config_match: {file: limits, regex: '(?m)^never_set_by_any_test:'}}

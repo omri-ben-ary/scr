@@ -21,6 +21,7 @@ import yaml
 
 from scr.cli import statement_window_open
 from test_journal_ops import REPO, world, scr  # noqa: F401  (the shared fixture)
+from _paths import CONFIG  # noqa: E402
 
 # key -> who reads it and where. Only keys an agent reads through its brief belong here; a yaml comment is
 # not a reader. Each entry must also be a key in limits.yaml, with a comment on its line naming the reader.
@@ -45,7 +46,7 @@ def config_keys(root: Path, file: str) -> list[str]:
     """The keys of config/<file> the reader check covers. Top-level keys for limits.yaml and weights.yaml;
     for workloads.yaml every key under every workload, qualified as "<workload>.<key>" (the `notes` list is
     one key like any other)."""
-    data = yaml.safe_load((root / "config" / file).read_text(encoding="utf-8")) or {}
+    data = yaml.safe_load(((CONFIG if root == REPO else root / "config") / file).read_text(encoding="utf-8")) or {}
     if file == "workloads.yaml":
         return [f"{wl}.{k}" for wl, block in data.items() for k in (block or {})]
     return list(data.keys())
@@ -79,7 +80,7 @@ def _assert_allowlist_is_honest(file: str, readers: dict[str, str]) -> None:
     for key, who in readers.items():
         assert key in keys, f"the {file} allowlist names {key}, which is no longer in {file}: drop the entry"
         assert who and "agent" in who, f"the {file} allowlist entry for {key} must name the agent that reads it"
-        line = _yaml_line(REPO / "config" / file, key)
+        line = _yaml_line(CONFIG / file, key)
         assert "#" in line and "reader" in line, f"{file} line for {key} must carry a comment naming its reader"
 
 
@@ -124,7 +125,7 @@ def test_unread_limits_key_is_red(tmp_path: Path):
     root = tmp_path / "root"
     (root / "config").mkdir(parents=True)
     shutil.copytree(REPO / "scr", root / "scr", ignore=shutil.ignore_patterns("__pycache__"))
-    src = (REPO / "config" / "limits.yaml").read_text(encoding="utf-8")
+    src = (CONFIG / "limits.yaml").read_text(encoding="utf-8")
     (root / "config" / "limits.yaml").write_text(src + "nobody_reads_this_key: 7\n", encoding="utf-8")
     assert unread_limits_keys(root) == ["nobody_reads_this_key"]
     assert unread_limits_keys(REPO) == []       # the same check is green on the real tree
@@ -160,7 +161,7 @@ def test_unread_workload_key_is_red(tmp_path: Path):
     root = tmp_path / "root"
     (root / "config").mkdir(parents=True)
     shutil.copytree(REPO / "scr", root / "scr", ignore=shutil.ignore_patterns("__pycache__"))
-    data = yaml.safe_load((REPO / "config" / "workloads.yaml").read_text(encoding="utf-8"))
+    data = yaml.safe_load((CONFIG / "workloads.yaml").read_text(encoding="utf-8"))
     first = next(iter(data))
     data[first]["nobody_reads_this_key"] = 7
     (root / "config" / "workloads.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -175,7 +176,7 @@ def test_unread_weights_key_is_red(tmp_path: Path):
     root = tmp_path / "root"
     (root / "config").mkdir(parents=True)
     shutil.copytree(REPO / "scr", root / "scr", ignore=shutil.ignore_patterns("__pycache__"))
-    src = (REPO / "config" / "weights.yaml").read_text(encoding="utf-8")
+    src = (CONFIG / "weights.yaml").read_text(encoding="utf-8")
     (root / "config" / "weights.yaml").write_text(src + "nobody_reads_this_key: 7\n", encoding="utf-8")
     assert unread_config_keys(root, "weights.yaml") == ["nobody_reads_this_key"]
     assert unread_config_keys(REPO, "weights.yaml") == []
@@ -195,7 +196,7 @@ def test_ci_gates_and_audit_surface_are_wired_or_gone():
     (deleted with a dated note). Neither may sit in WORKLOADS_READERS unless a brief names it."""
     keys = config_keys(REPO, "workloads.yaml")
     briefs = _scr_text(REPO) + "".join(p.read_text(encoding="utf-8") for p in (REPO / "agents").glob("*.md"))
-    src = (REPO / "config" / "workloads.yaml").read_text(encoding="utf-8")
+    src = (CONFIG / "workloads.yaml").read_text(encoding="utf-8")
     for key in ("ci_gates", "audit_surface"):
         if f"quantum-insertion.{key}" in keys:
             assert key in briefs, f"{key} is still in workloads.yaml and nothing in scr/ or agents/ reads it"
@@ -270,7 +271,7 @@ def test_land_test_timeout_reads_limits_and_defaults_to_3600(tmp_path: Path):
     for bad in ("0", "-3", "soon", "null"):
         lim.write_text(f"land_test_timeout_seconds: {bad}\n", encoding="utf-8")
         assert land_test_timeout(Store(tmp_path)) == 3600, bad
-    line = [l for l in (REPO / "config" / "limits.yaml").read_text(encoding="utf-8").splitlines() if "land_test_timeout_seconds" in l]
+    line = [l for l in (CONFIG / "limits.yaml").read_text(encoding="utf-8").splitlines() if "land_test_timeout_seconds" in l]
     assert len(line) == 1 and line[0].startswith("land_test_timeout_seconds:") and "scr/ops.py" in line[0], line
 
 
@@ -303,7 +304,7 @@ def test_limits_invalid_values_warn_in_verify(tmp_path: Path):
 def test_limits_valid_real_file_and_floats_do_not_warn(tmp_path: Path):
     """The real config/limits.yaml gives no limits warning; a float is fine where the reader uses float()."""
     (tmp_path / "config").mkdir()
-    shutil.copy(REPO / "config" / "limits.yaml", tmp_path / "config" / "limits.yaml")
+    shutil.copy(CONFIG / "limits.yaml", tmp_path / "config" / "limits.yaml")
     assert _limits_lines(tmp_path)[0] == []
     (tmp_path / "config" / "limits.yaml").write_text("review_stale_hours: 1.5\nhelp_stale_hours: 0.25\n"
                                                       "dispatch_timeout_minutes: 7.5\nconcurrency: 2.0\n", encoding="utf-8")
@@ -324,5 +325,5 @@ def test_limits_table_defaults_match_the_readers_constants():
     assert LIMITS_NUMERIC["help_stale_hours"][1] == HELP_STALE_HOURS
     assert LIMITS_NUMERIC["credits_pause_minutes"][1] == CREDITS_PAUSE_MINUTES
     assert not set(READERS) & (set(LIMITS_NUMERIC) | LIMITS_NOT_NUMERIC)
-    real = yaml.safe_load((REPO / "config" / "limits.yaml").read_text(encoding="utf-8"))
+    real = yaml.safe_load((CONFIG / "limits.yaml").read_text(encoding="utf-8"))
     assert {k for k, v in real.items() if isinstance(v, str)} <= LIMITS_NOT_NUMERIC

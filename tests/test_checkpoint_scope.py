@@ -11,7 +11,6 @@ from scr.gitops import Git
 from scr.ops import checkpoint, checkpoint_commit, land, scope_drift, spawn
 from scr.store import Store
 from test_journal_ops import REPO, accepted_review, git, scr, world  # noqa: F401  (scriptorium + workload repo + origin)
-from test_watch import _events, _land_world, _tick, sgit, sscr
 
 DRIFT_FILE = "missions/SCRIPTORIUM/scripts/check_done.py"       # what T-0021 copied into its worktree
 
@@ -196,30 +195,3 @@ def test_land_refuses_a_branch_carrying_out_of_scope_paths_until_the_scope_is_wi
     assert "task/T-0001" in git(repo, "branch", "-r") and Store(root).get("T-0001").status == "accepted"
 
 
-def test_land_scriptorium_refuses_out_of_scope_paths_and_retries_when_the_scope_is_widened(tmp_path: Path, monkeypatch):
-    """The scriptorium's own landing (T-0078) applies the same rule: the branch carrying a [checkpoint-drift]
-    commit fails with reason `scope`, one land_failed event names the path, the trunk is untouched; the
-    same tip is not retried — until the record's scope is widened, which is a new retry key."""
-    root, origin, wt = _land_world(tmp_path, monkeypatch)
-    (wt / "tool.txt").write_text("ok\n", encoding="utf-8")
-    (wt / "extra.txt").write_text("not mine\n", encoding="utf-8")
-    main_before = sgit(root, "rev-parse", "main")
-    res = _tick(root)
-    assert res["ok"] and Store(root).get("T-0007").status == "ready", res      # 2026-10-14: back to the scriber with the refusal
-    ev = _events(root, "land_failed", "T-0007")
-    assert len(ev) == 1 and "FAILED (scope)" in ev[0]["note"] and "extra.txt" in ev[0]["note"] and "tool.txt" not in ev[0]["note"].split("scope:")[1], ev
-    assert not any("landing failed" in n for n in res["needs"]), res["needs"]
-    assert "landing failed (scope)" in (Store(root).get("T-0007").dir / "log.md").read_text(encoding="utf-8")
-    assert sgit(root, "rev-parse", "main") == main_before
-    log = sgit(wt, "log", "--format=%s", "main..HEAD").splitlines()
-    assert log[0].startswith("[checkpoint-drift] T-0007") and log[1].startswith("[T-0007] Tooling"), log
-    assert sgit(wt, "show", "--name-only", "--format=", "HEAD~1").strip() == "tool.txt"
-    assert sgit(wt, "status", "--porcelain") == ""
-    # the Steward widens the record at the next review and accepts: the next tick lands, drift commit included
-    sscr(root, "--quiet", "--actor", "omri", "task", "field", "T-0007", "scope.files", '["tool.txt", "extra.txt"]')
-    from test_watch import _resubmit_fixed
-    _resubmit_fixed(root)
-    res3 = _tick(root)
-    assert Store(root).get("T-0007").status == "merged", res3["needs"]
-    assert sgit(root, "show", "main:extra.txt").strip() == "not mine" and sgit(root, "show", "main:tool.txt").strip() == "ok"
-    assert len(_events(root, "land_failed", "T-0007")) == 1

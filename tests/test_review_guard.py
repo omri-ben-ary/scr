@@ -22,6 +22,7 @@ from scr.ops import land, land_all_submitted, spawn
 from scr.review import acceptance_problem, mechanical_rows, review_decision
 from scr.store import RepoError, Store
 from test_journal_ops import REPO, git, scr, world  # noqa: F401  (scriptorium + workload repo + origin)
+from _paths import FIXTURES  # noqa: E402
 
 TEMPLATE = (REPO / "templates" / "review.md").read_text(encoding="utf-8")
 PLACEHOLDER = "accepted | returned (feedback below) | escalated (Gate N, reason)"
@@ -358,7 +359,7 @@ def test_t0021_record_replay_is_refused(world):
     """DoD: T-0021's record folder (its review.md is the untouched template) copied in with status
     `submitted`; land refuses, and so does `task set accepted`."""
     root, repo, _ = world
-    src = next(REPO.glob("tasks/T-0021-*"))
+    src = next(FIXTURES.glob("T-0021-*"))
     dst = root / "tasks" / src.name
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns("session-*", "*.txt", "pr-body.md"))   # pr-body.md: PR #49's, the landing under test
     assert (dst / "review.md").read_text(encoding="utf-8").strip() == TEMPLATE.strip()      # the blank template, still

@@ -1,0 +1,10 @@
+# Prioritization weights. Observer proposes changes here (Gate 4); Omri edits.
+w_unlock: 2.0     # log(1 + weighted open descendants in G_blocks)
+w_path: 1.0       # share of the milestone's longest chain that runs through the task
+w_breadth: 0.5    # tasks that become ready the moment this one merges
+w_verify: 1.5     # 1.0 fully mechanical done_when … 0.2 judgment only
+w_omri: 1.0       # hand-set -2..+2
+w_age: 0.05       # days since ready
+w_risk: 1.5       # chance of needing a statement change
+w_retry: 1.0      # attempts so far
+w_cost: 0.3       # expected millions of tokens per attempt
