@@ -143,11 +143,12 @@ _CHORE_CACHE: dict[str, dict] = {}
 # is live too (T-0146): its card shows only while the task is still `accepted`, and counts only the events since
 # the task last became accepted, so a task returned for a rebase (or merged) drops the card without an ack.
 ALARM_EVENTS = {"verify_failed", "budget_wall", "blocker_rejected", "scope_drift", "leak", "checkpoint_skipped", "session_dead", "stale", "slot_freed",
-                "land_failed"}
+                "land_failed", "upgrade_failed"}
 QUIET_EVENTS = {"scope_drift", "stale", "session_dead", "checkpoint_skipped", "budget_wall", "blocker_rejected"}   # 2026-10-14: never a card of their own
 ALARM_TITLES = {"session_dead": "scriber session died — task returned", "stale": "STALE: session alive but silent",
                 "slot_freed": "escalated: a stuck task left its slot — one action for you",
-                "land_failed": "landing failed — code accepted but not on main"}
+                "land_failed": "landing failed — code accepted but not on main",
+                "upgrade_failed": "scr upgrade failed — the previous release is live again"}
 RUNNING = {"dispatched", "in_progress", "checkpoint"}
 
 

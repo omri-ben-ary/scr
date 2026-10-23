@@ -56,7 +56,8 @@ def _line(c: dict) -> str:
 
 def _under_pytest() -> bool:
     # the test fixtures copy the live config/ into every test world: a real toast or mail from a test is never wanted
-    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    # SCR_NO_NOTIFY: a smoke run (`scr watch --dry-run`, scr/runtime.py) ticks a copy of the live state
+    return bool(os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("SCR_NO_NOTIFY"))
 
 
 # ---- toast ---------------------------------------------------------------------------------------------
