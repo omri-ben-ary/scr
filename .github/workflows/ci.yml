@@ -56,6 +56,8 @@ jobs:
             $errs = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
             if ($errs) { $errs | ForEach-Object { Write-Host "$f : $_" }; exit 1 }
+            # 5.1 reads a BOM-less .ps1 as ANSI: a non-ASCII byte can end a string early
+            if ([IO.File]::ReadAllBytes((Resolve-Path $f)) | Where-Object { $_ -gt 127 } | Select-Object -First 1) { Write-Host "$f has non-ASCII bytes"; exit 1 }
             Write-Host "$f parses"
           }
       - name: rehearse.ps1 end to end against a synthetic state (a locally built wheel, Windows PowerShell 5.1)
@@ -70,7 +72,9 @@ jobs:
           $state = Join-Path $env:RUNNER_TEMP "desk\scriptorium"
           New-Item -ItemType Directory -Path $state -Force | Out-Null
           uv run scr --root $state init --quiet
-          uv run scr --root $state --quiet task new "Rehearsal smoke: arrows → and dashes —" --id T-0001 --origin omri
+          # Windows PowerShell 5.1 reads this step as ANSI: build the non-ASCII title from code points
+          $title = "Rehearsal smoke: arrows " + [char]0x2192 + " and dashes " + [char]0x2014
+          uv run scr --root $state --quiet task new $title --id T-0001 --origin omri
           git -C $state init -q -b main; git -C $state add -A; git -C $state commit -q -m seed
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\rehearse.ps1 -Tag v0.0.0 -State $state `
             -Runtime (Join-Path $env:RUNNER_TEMP "desk\scr-runtime") -Wheel $wheel -Python (Resolve-Path .venv\Scripts\python.exe).Path
