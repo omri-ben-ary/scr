@@ -47,6 +47,7 @@ def root(tmp_path, monkeypatch):
     return {"root": tmp_path, "started": started, "killed": killed}
 
 
+@pytest.mark.windows
 def test_submit_records_and_starts_the_wrapper_detached(root):
     j = jobs.submit(root["root"], ["lake", "build"], task="T-0001", name="build", timeout="2h", session="abc")
     assert j["id"] == "J-0001" and j["status"] == "running" and j["pid"] == 4242 and j["timeout_min"] == 120
@@ -67,6 +68,7 @@ def test_over_capacity_queues_and_poll_starts_the_next(root):
     assert jobs.load(root["root"], "J-0002")["status"] == "running" and len(root["started"]) == 2
 
 
+@pytest.mark.windows
 def test_poll_marks_a_dead_wrapper_failed_and_enforces_the_deadline(root, monkeypatch):
     jobs.submit(root["root"], ["a"], name="dies")
     monkeypatch.setattr(jobs, "pid_alive", lambda pid: False)
@@ -85,6 +87,7 @@ def test_over_twelve_hours_is_omris_alone(root):
     assert jobs.submit(root["root"], ["a"], timeout="13h", actor="omri")["timeout_min"] == 780
 
 
+@pytest.mark.windows
 def test_wrapper_runs_the_command_and_records_rc(tmp_path):
     tmp_path.joinpath(".scr").mkdir()
     rec = {"id": "J-0001", "task": None, "name": "echo", "cmd": [sys.executable, "-c", "print('hello from the job')"],
@@ -247,6 +250,7 @@ def test_landing_jobs_have_their_own_lane(tmp_path, monkeypatch):
     assert started == ["J-0003"]          # the landing lane; J-0002 waits for jobs_concurrency, J-0004 for the lane
 
 
+@pytest.mark.windows
 def test_event_appends_from_many_processes_never_fork(tmp_path):
     """T-0333 (done 2026-10-15): 8 processes appending 25 events each through EventLog.append leave one unbroken chain."""
     import subprocess, sys

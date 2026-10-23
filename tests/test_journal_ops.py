@@ -107,6 +107,7 @@ def test_no_journal_flag_and_env(world):
 
 
 # ---- stale locks ----------------------------------------------------------------------------
+@pytest.mark.windows
 def test_stale_lock_is_cleared_and_commit_retried(world):
     root, _, _ = world
     lock = root / ".git" / "index.lock"
@@ -129,6 +130,7 @@ def test_fresh_lock_is_respected(world):
 
 
 # ---- ops on real repos -----------------------------------------------------------------------
+@pytest.mark.windows
 def test_spawn_checkpoint_land_retire(world):
     root, repo, origin = world
     scr(root, "--actor", "steward:T-0001", "task", "set", "T-0001", "dispatched")
@@ -220,6 +222,7 @@ def _norm(p) -> str:
     return str(p).replace("\\", "/").lower()
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("status,merged", [("merged", True), ("closed", False), ("rejected", False)])
 def test_retire_deletes_a_finished_worktree(world, status, merged):
     """DoD 1-2: merged (branch in the trunk), closed, rejected -> the directory is gone, `git worktree list` no longer
@@ -240,6 +243,7 @@ def test_retire_deletes_a_finished_worktree(world, status, merged):
     assert not (repo.parent / "quantum-insertion-RETIRED").exists()                 # nothing kept, nothing quarantined
 
 
+@pytest.mark.windows
 @pytest.mark.parametrize("status", ["returned", "escalated", "omri_queue"])
 def test_retire_quarantines_a_live_worktree_without_lake_build(world, status):
     """DoD 3: a returned / escalated / omri_queue task's tree is moved to <repo>-RETIRED/ as before, minus .lake/build;
@@ -265,6 +269,7 @@ def test_retire_refuses_a_running_task(world, status):
     assert res["code"] == 4 and wt.exists() and not (repo.parent / "quantum-insertion-RETIRED").exists()
 
 
+@pytest.mark.windows
 def test_retire_unlinks_junctions_never_follows_them(world, tmp_path):
     """DoD 4: .venv and .lake/packages are junctions (symlinks off Windows) to a fixture directory -> after the delete the
     fixture and its files are intact; the same for a junction inside .lake/build when a live tree is quarantined."""
@@ -899,6 +904,7 @@ def test_hotfix_run_tests_timeout_follows_land_test_timeout(world, monkeypatch):
     assert rc == 124 and "4321" in out and "land_test_timeout_seconds" in out, out
 
 
+@pytest.mark.windows
 def test_resolve_test_argv_cases(tmp_path, monkeypatch):
     """T-0255: the one resolver behind hotfix.run_tests and ops._run_tests. Absolute stays; a relative path
     that exists under cwd becomes absolute (abspath, not resolve); a missing python* becomes sys.executable
