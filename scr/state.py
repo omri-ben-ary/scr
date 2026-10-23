@@ -89,13 +89,16 @@ class State:
             return None
         return json.loads(self.snapshot_path.read_text(encoding="utf-8"))
 
-    def snapshot(self, note: str | None = None) -> dict:
+    def snapshot(self, note: str | None = None, schema_version: int | None = None) -> dict:
+        """`schema_version` is set by a migration (scr/schema.py); otherwise the snapshot keeps the state's version
+        (absent = 1), and a brand-new state starts at the version this code writes."""
+        from .schema import SCHEMA_VERSION
         c = self.compute()
         prev = self.read_snapshot()
         g: Graph = c.pop("_graph")
         if prev and prev.get("state_root") == c["state_root"]:
             parent = prev.get("parent_state_root", ZERO)   # nothing changed: keep the chain link
-            if not note and self.graph_path.exists():
+            if not note and schema_version is None and self.graph_path.exists():
                 # Idempotent: the UI and the watcher refresh on every tick; rewriting an unchanged
                 # snapshot only bumps `ts`, which left state/STATE.json dirty after every commit
                 # (seen 2026-09-15). The snapshot describes the state, and the state did not change.
@@ -107,6 +110,7 @@ class State:
             "ts": now_iso(),
             "git_head_at_snapshot": git_head(self.root),
             "parent_state_root": parent,
+            "schema_version": schema_version or (prev.get("schema_version", 1) if prev else SCHEMA_VERSION),
             **c,
         }
         if note:
