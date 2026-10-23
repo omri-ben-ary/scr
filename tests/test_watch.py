@@ -55,6 +55,10 @@ def _record_launches(monkeypatch) -> list[dict]:
     import scr.run as run_mod
     calls: list[dict] = []
     monkeypatch.setattr(run_mod, "claude_bin", lambda: FAKE_CLAUDE)
+    import scr.answers as answers_mod
+    monkeypatch.setattr(launch_mod, "claude_bin", lambda: FAKE_CLAUDE)   # launch.py and answers.py bind the name at import: patch it
+    monkeypatch.setattr(answers_mod, "claude_bin", lambda: FAKE_CLAUDE)
+    # there too, or the tests pass only where a real `claude` is on PATH (the PC, not CI)
 
     def fake_popen(args, cwd=None, **kw):
         stdin_is_file = hasattr(kw.get("stdin"), "read")          # T-0330: Intake hands its brief in as a file, never a pipe
