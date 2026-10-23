@@ -42,6 +42,14 @@ a newer master repacks (`pack`) and ships the parts back with `device_commit_fil
 - `reports/steward_watch.log`: `cloud claim:` and `cloud branch … landed into review` lines.
 - A task that must stay local: `lane: pc` in its task.yaml.
 
+## Encoding rule for scripts
+
+Every Python script a scriber writes calls `sys.stdout.reconfigure(encoding="utf-8")` and `sys.stderr.reconfigure(encoding="utf-8")` and opens every text file with `encoding="utf-8"`. The PC reviews done_when scripts with `python -I <script>` on a cp1255 console without `-X utf8`, so a script that prints a non-ASCII character fails there even when it passed in the cloud (T-0559, T-0561).
+
+- PC scribers get the rule from `scr task brief` (`scr/brief.py`).
+- The cloud pool does not read `scr/brief.py`: it briefs its scriber subagent from the task's `spec.md`, so the rule must be pasted into the scheduled task "Scriptorium cloud pool" by hand.
+- The Steward runs each done_when script as `python -I` without `-X utf8`, `PYTHONUTF8` and `PYTHONIOENCODING` unset; an encoding error returns the task (`agents/steward.md`, "On submission").
+
 ## Known limits
 
 - One scriber per container (2 vCPU / 7 GB); parallelism = pool sessions.
