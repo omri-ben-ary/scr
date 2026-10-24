@@ -381,6 +381,72 @@ def _runner_jobs(root: Path, keep_finished: int = 12) -> list[dict]:
     return out
 
 
+# root -> (fingerprint, time, verify result): refresh + verify hash every record, doc and event, which on the PC took
+# most of a request's 30+ s (rehearsal of v0.2.1). The page polls every few seconds; the state changes when it is
+# written, and every write appends an event or touches a record, so both are in the fingerprint.
+_VERIFIED: dict[str, tuple[tuple, float, dict]] = {}
+_VERIFY_LOCK = threading.Lock()        # refresh writes files: one at a time, and a waiting request reuses the result
+VERIFY_MAX_AGE_S = 60.0
+
+
+def _fingerprint(root: Path) -> tuple:
+    ev = root / "events" / "events.jsonl"
+    st = ev.stat() if ev.exists() else None
+    tasks = root / "tasks"
+    newest = max((p.stat().st_mtime_ns for p in tasks.glob("*/task.yaml")), default=0) if tasks.is_dir() else 0
+    return (st.st_size if st else 0, st.st_mtime_ns if st else 0, newest)
+
+
+def _verified(root: Path) -> dict:
+    """refresh + verify, again only when the state changed or the last result is older than VERIFY_MAX_AGE_S."""
+    from .cli import refresh
+    with _VERIFY_LOCK:
+        key, now = _fingerprint(root), time.monotonic()
+        hit = _VERIFIED.get(str(root))
+        if hit and hit[0] == key and now - hit[1] < VERIFY_MAX_AGE_S:
+            return hit[2]
+        try:
+            refresh(root, quiet=True)
+        except Exception:  # noqa: BLE001 — a scriber mid-write must not break the page
+            pass
+        v = State(root).verify()
+        _VERIFIED[str(root)] = (_fingerprint(root), time.monotonic(), v)      # refresh may itself have written
+        return v
+
+
+# Is the watcher running? A process listing: on Windows a fresh powershell + Get-CimInstance Win32_Process, several
+# seconds per call, which every /api/state request used to pay. Refreshed in the background at most every
+# WATCHER_CHECK_S; a request returns the last answer (None until the first one is in).
+_WATCHER = {"value": None, "at": 0.0, "busy": False}
+_WATCHER_LOCK = threading.Lock()
+WATCHER_CHECK_S = 30.0
+
+
+def _check_watcher() -> None:
+    from .admin import WATCH_PATTERN
+    from .run import pids_matching
+    try:
+        value = bool(pids_matching(WATCH_PATTERN))
+    except Exception:  # noqa: BLE001
+        value = None
+    with _WATCHER_LOCK:
+        _WATCHER.update(value=value, at=time.monotonic(), busy=False)
+
+
+def watcher_running(block: bool = False) -> bool | None:
+    with _WATCHER_LOCK:
+        stale = time.monotonic() - _WATCHER["at"] >= WATCHER_CHECK_S
+        start = stale and not _WATCHER["busy"]
+        if start:
+            _WATCHER["busy"] = True
+    if start:
+        if block:
+            _check_watcher()
+        else:
+            threading.Thread(target=_check_watcher, daemon=True).start()
+    return _WATCHER["value"]
+
+
 def state(root: Path) -> dict:
     store = Store(root)
     tasks = store.load_all()
@@ -405,12 +471,7 @@ def state(root: Path) -> dict:
         r["session"] = sessions.get(r["id"])
     watch_log = root / "reports" / "steward_watch.log"
     last_tick = datetime.fromtimestamp(watch_log.stat().st_mtime, tz=timezone.utc).isoformat() if watch_log.exists() else None
-    from .cli import refresh
-    try:
-        refresh(root, quiet=True)
-    except Exception:  # noqa: BLE001 — a scriber mid-write must not break the page
-        pass
-    v = State(root).verify()
+    v = _verified(root)
     snap = json.loads(_read(root / "state" / "STATE.json") or "{}")
     from .gitops import Git
     gj = Git(root)
@@ -423,7 +484,7 @@ def state(root: Path) -> dict:
         "journal": {"head": head, "dirty": len(gj.dirty()) if head else 0, "last_failure": last_failure(root)},
         "last_watch_tick": last_tick, "pid": os.getpid(), "paused": paused(root),
         "frozen": frozen_workloads(store),   # T-0272: the header badge
-        "watcher_running": bool(__import__("scr.run", fromlist=["pids_matching"]).pids_matching(__import__("scr.admin", fromlist=["WATCH_PATTERN"]).WATCH_PATTERN)),
+        "watcher_running": watcher_running(),
         "needs": needs,
         "running": running, "ready": ready, "recent": recent,
         "jobs": JOBS.list(),
@@ -688,6 +749,14 @@ def serve_child(root: Path, port: int) -> int:
                 srv.shutdown()
                 return
     threading.Thread(target=watch_code, daemon=True).start()
+
+    def warm():                     # the first page load finds the caches filled (a cold state() took 30+ s on the PC)
+        try:
+            watcher_running(block=True)
+            state(root)
+        except Exception:  # noqa: BLE001 — the request path reports errors; warming is best-effort
+            pass
+    threading.Thread(target=warm, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

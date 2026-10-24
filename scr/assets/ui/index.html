@@ -174,7 +174,7 @@ async function refresh() {
   $('#nRunning').textContent = STATE.running.length; $('#cap').textContent = STATE.concurrency; $('#runN').textContent = STATE.running.length; $('#readyN').textContent = STATE.ready.length;
   $('#nReady').textContent = STATE.ready.length; $('#nNeeds').textContent = STATE.needs.length; $('#needsN').textContent = STATE.needs.length;
   document.title = STATE.needs.length ? `(${STATE.needs.length}) Scriptorium` : 'Scriptorium';   // a pinned tab shows the count (T-0090)
-  $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
+  $('#tick').textContent = STATE.paused ? 'PAUSED' : (STATE.watcher_running == null ? 'checking' : STATE.watcher_running ? (STATE.last_watch_tick ? fmtTs(STATE.last_watch_tick) : 'starting') : 'not running');
   $('#pauseBtn').textContent = STATE.paused ? 'Resume' : 'Pause';
   const frozen = STATE.frozen || [];   // T-0272: "<workload> frozen" while a workload's freeze switch is on
   $('#frozenBadge').hidden = !frozen.length; $('#frozenBadge').textContent = frozen.map(w => `${w} frozen`).join(' · ');

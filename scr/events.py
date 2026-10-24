@@ -71,6 +71,9 @@ class _file_lock:
         return False
 
 
+# events.jsonl -> ((inode, mtime_ns, size), parsed events): read() hands out per-event copies of an unchanged file
+_READ: dict[str, tuple[tuple[int, int, int], tuple[dict, ...]]] = {}
+
 class EventLog:
     def __init__(self, path: Path):
         self.path = path
@@ -78,6 +81,11 @@ class EventLog:
     def read(self) -> list[dict]:
         if not self.path.exists():
             return []
+        st = self.path.stat()
+        key = (st.st_ino, st.st_mtime_ns, st.st_size)
+        hit = _READ.get(str(self.path))
+        if hit and hit[0] == key:          # unchanged since the last read: one UI request used to parse it 14 times
+            return [dict(e) for e in hit[1]]
         out = []
         for i, line in enumerate(self.path.read_text(encoding="utf-8").splitlines()):
             if not line.strip():
@@ -86,7 +94,8 @@ class EventLog:
                 out.append(json.loads(line))
             except json.JSONDecodeError as e:
                 raise ValueError(f"events line {i + 1}: {e}") from e
-        return out
+        _READ[str(self.path)] = (key, tuple(out))
+        return [dict(e) for e in out]
 
     def head(self) -> tuple[str, int]:
         evs = self.read()
