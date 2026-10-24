@@ -1,6 +1,7 @@
 """Reading and writing task records. tasks/<id>-<slug>/task.yaml is the record."""
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass
@@ -11,6 +12,23 @@ import yaml
 
 from .assets import asset_path
 from .canon import H, canon, sha256_bytes
+
+# libyaml's parser when PyYAML was built with it (the Windows and Linux wheels are): the pure-Python one made one UI
+# request parse ~600 records nine times, 30+ s on the PC (rehearsal of v0.2.0)
+_SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+# task.yaml -> (inode, mtime_ns, size, parsed record): a file that did not change is not parsed again; callers get a deep copy
+_PARSED: dict[str, tuple[int, int, int, dict]] = {}
+
+
+def _load_record(f: Path) -> dict:
+    st = f.stat()
+    hit = _PARSED.get(str(f))
+    if hit and hit[:3] == (st.st_ino, st.st_mtime_ns, st.st_size):
+        return copy.deepcopy(hit[3])
+    rec = yaml.load(f.read_text(encoding="utf-8"), Loader=_SafeLoader) or {}
+    if isinstance(rec, dict):
+        _PARSED[str(f)] = (st.st_ino, st.st_mtime_ns, st.st_size, copy.deepcopy(rec))
+    return rec
 
 STATES = [
     "proposed", "triaged", "blocked", "ready", "dispatched", "in_progress",
@@ -131,7 +149,7 @@ class Store:
             if not f.is_file():
                 continue
             try:
-                rec = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+                rec = _load_record(f)
             except yaml.YAMLError as e:
                 rec = {"_error": str(e)}
             if "id" not in rec:
