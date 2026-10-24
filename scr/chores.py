@@ -80,7 +80,9 @@ def check(root: Path, spec) -> bool:
         r = Git(wl.repo).run("ls-remote", "--heads", "origin", arg)
         return r.ok and bool(r.out.strip())
     if kind == "no_dirty_worktrees":
-        from .ops import sweep
+        from .ops import sweep, workload
+        if not Path(workload(root).repo).is_dir():     # a repo it cannot see is not a clean one
+            return False
         return not sweep(root, dry_run=True)
     if kind == "watcher_fresh_minutes":
         p = root / "reports" / "steward_watch.log"

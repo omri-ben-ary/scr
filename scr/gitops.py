@@ -65,10 +65,14 @@ class Git:
         return Git._ident_cache[key]
 
     def run(self, *args: str, timeout: int = 300, retry_on_lock: bool = True) -> Result:
+        if not self.cwd.is_dir():       # a missing workload repo or worktree: Windows raises NotADirectoryError (267) here
+            return Result(128, f"not a directory: {self.cwd}")
         try:
             r = subprocess.run(self._base() + list(args), cwd=self.cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except FileNotFoundError:
             return Result(127, "git not found on PATH")
+        except OSError as e:            # NotADirectoryError and friends: a failed git call, never a crashed tick
+            return Result(128, f"git could not start in {self.cwd}: {e}")
         except subprocess.TimeoutExpired:
             return Result(124, f"git {' '.join(args)} timed out after {timeout}s")
         out = (r.stdout + r.stderr).strip()
@@ -265,6 +269,8 @@ def gh(*args: str, cwd: Path | None = None, timeout: int = 300) -> Result:
         return Result(r.returncode, (r.stdout + r.stderr).strip())
     except FileNotFoundError:
         return Result(127, "gh not on PATH")
+    except OSError as e:
+        return Result(128, f"gh could not start in {cwd}: {e}")
     except subprocess.TimeoutExpired:
         return Result(124, "gh timed out")
 
